@@ -1,0 +1,447 @@
+// test/backend/video.test.js —— 视频后端：probe / overview / zoom / locate / subtitles
+//
+// 全部使用 fixtures/generated 里的合成素材（无第三方媒体）。ffmpeg 不可用时整组跳过；
+// 素材缺失时先跑 node fixtures/generate.mjs。每个用例用独立的 MMGREP_CACHE_DIR，
+// 并检查 ASR 中间文件只落在缓存目录、没有写到用户素材旁边。
+
+import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+
+import { createVideoBackend } from '../../src/backend/video/index.js';
+import { assertFfmpegAvailable } from '../../src/media/ffmpeg.js';
+
+const execFileAsync = promisify(execFile);
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const GENERATED = path.join(ROOT, 'fixtures', 'generated');
+const SCENE = path.join(GENERATED, 'sample-scene.mp4');
+const SUBTITLES = path.join(GENERATED, 'sample-subtitles.mp4');
+const SRT = path.join(GENERATED, 'sample-subtitles.srt');
+const ZOOM = path.join(GENERATED, 'sample-zoom.mp4');
+
+async function hasFfmpeg() {
+  try {
+    await assertFfmpegAvailable();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureFixtures() {
+  try {
+    await Promise.all([SCENE, SUBTITLES, SRT, ZOOM].map((file) => access(file)));
+    return true;
+  } catch {
+    try {
+      await execFileAsync(process.execPath, [path.join(ROOT, 'fixtures', 'generate.mjs')], { cwd: ROOT });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+const ffmpegReady = await hasFfmpeg();
+const fixturesReady = ffmpegReady ? await ensureFixtures() : false;
+const skip = !(ffmpegReady && fixturesReady);
+
+async function withCache(fn) {
+  const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-video-'));
+  const previous = process.env.MMGREP_CACHE_DIR;
+  process.env.MMGREP_CACHE_DIR = path.join(dir, 'cache');
+  try {
+    return await fn(dir);
+  } finally {
+    if (previous === undefined) delete process.env.MMGREP_CACHE_DIR;
+    else process.env.MMGREP_CACHE_DIR = previous;
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+function stubProvider({ text = 'STUB SPOKEN LINE', onCall = null } = {}) {
+  const calls = [];
+  const provider = {
+    id: 'stub',
+    describe: () => ({ id: 'stub', model: 'stub-model', baseUrl: null }),
+    transcribe: async ({ audioPath }) => {
+      calls.push(audioPath);
+      onCall?.(audioPath);
+      return {
+        provider: 'stub',
+        model: 'stub-model',
+        language: 'en',
+        segments: [{ startMs: 0, endMs: 900, text }],
+      };
+    },
+  };
+  return { provider, calls };
+}
+
+function assertPng(buffer) {
+  assert.ok(Buffer.isBuffer(buffer), 'image must be a Buffer');
+  assert.equal(buffer.subarray(1, 4).toString('latin1'), 'PNG', 'image must be a real PNG');
+}
+
+function longestEdge(image) {
+  return Math.max(image.width, image.height);
+}
+
+function assertOverviewShape(result, { cells, images, maxEdge }) {
+  assert.ok(result.images.length >= 1, 'at least one storyboard image');
+  assert.ok(result.images.length <= images, `at most ${images} images`);
+  let producedCells = 0;
+  for (const image of result.images) {
+    assert.ok(image.cells >= 1);
+    assert.ok(image.cells <= cells, `at most ${cells} cells per image`);
+    assert.ok(longestEdge(image) <= maxEdge, `longest edge <= ${maxEdge}`);
+    assert.equal(image.mimeType, 'image/png');
+    assertPng(image.buffer);
+    producedCells += image.cells;
+  }
+  assert.equal(result.segments.length, producedCells, 'one text segment per cell');
+}
+
+test('probe：契约 §4.3 字段、音频体检、字幕与 ASR 能力', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const backend = createVideoBackend({ config: {} });
+    const probe = await backend.probe({ path: SCENE, transcript: 'auto', transcriptFile: null });
+
+    assert.equal(probe.mediaType, 'video');
+    assert.equal(probe.path, SCENE);
+    assert.equal(probe.width, 640);
+    assert.equal(probe.height, 360);
+    assert.ok(probe.durationSec > 11.9 && probe.durationSec < 12.1);
+    assert.equal(probe.durationMs, 12000);
+    assert.ok(Math.abs(probe.fps - 24) < 0.01);
+    assert.equal(probe.rotation, 0);
+    assert.ok(Math.abs(probe.aspect - 16 / 9) < 1e-6);
+    assert.equal(probe.videoCodec, 'h264');
+    assert.match(probe.container, /mp4/);
+    assert.equal(probe.hasAudio, true);
+    assert.equal(probe.audioCodec, 'aac');
+    assert.equal(probe.audioChannels, 1);
+    assert.equal(probe.sampleRateHz, 44100);
+    assert.equal(probe.audioHealth.verdict, 'has-speech');
+    assert.equal(probe.audioHealth.effective, true);
+    assert.equal(probe.pageCount, null);
+    assert.equal(probe.hasTextLayer, null);
+    assert.deepEqual(probe.subtitleTracks, []);
+    assert.equal(probe.audioTracks.length, 1);
+    assert.equal(probe.capabilities.asr.available, false);
+    assert.equal(probe.capabilities.asr.provider, null);
+    assert.equal(probe.capabilities.ocr.available, false);
+    assert.equal(probe.capabilities.transcriptSource, 'none');
+    assert.equal(probe.capabilities.transcriptOrigin, 'none');
+    assert.equal(probe.capabilities.transcriptPath, null);
+    assert.ok(probe.recommended && probe.recommended.mode);
+
+    const sibling = await backend.probe({ path: SUBTITLES, transcript: 'auto', transcriptFile: null });
+    assert.equal(sibling.capabilities.transcriptSource, 'subtitle');
+    assert.equal(sibling.capabilities.transcriptOrigin, 'file');
+    assert.equal(sibling.capabilities.transcriptPath, SRT);
+
+    const stub = stubProvider();
+    const withAsr = createVideoBackend({ config: {}, asrProvider: stub.provider });
+    const asrProbe = await withAsr.probe({ path: SCENE, transcript: 'auto', transcriptFile: null });
+    assert.equal(asrProbe.capabilities.asr.available, true);
+    assert.equal(asrProbe.capabilities.asr.provider, 'stub');
+    assert.equal(asrProbe.capabilities.transcriptSource, 'asr');
+    assert.equal(asrProbe.capabilities.transcriptOrigin, 'asr');
+    assert.equal(stub.calls.length, 0, 'probe must not run ASR');
+  });
+});
+
+test('overview：cells/images/maxEdge 上限、PNG buffer、无转写时只出画面', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const backend = createVideoBackend({ config: {} });
+    const result = await backend.overview({
+      path: SCENE,
+      startMs: 0,
+      endMs: 12000,
+      cells: 4,
+      images: 2,
+      maxEdge: 640,
+      transcript: 'off',
+      transcriptFile: null,
+    });
+    assertOverviewShape(result, { cells: 4, images: 2, maxEdge: 640 });
+    assert.equal(result.images.length, 2, '12s window has enough room for 4 cells x 2 images');
+    assert.equal(result.segments[0].startMs, 0);
+    assert.equal(result.segments.at(-1).endMs, 12000);
+    assert.ok(result.segments.every((segment) => segment.text === ''));
+    assert.ok(result.segments.every((segment) => segment.source === 'none' && segment.origin === 'none'));
+    assert.equal(result.transcript.source, 'none');
+    assert.equal(result.transcript.origin, 'none');
+    assert.ok(result.transcript.reason);
+    assert.ok(result.warnings.includes('transcript-disabled'));
+    assert.ok(result.images.every((image) => longestEdge(image) <= 640));
+  });
+});
+
+test('overview：startMs/endMs 精确覆盖窗口', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const backend = createVideoBackend({ config: {} });
+    const result = await backend.overview({
+      path: SCENE,
+      startMs: 2000,
+      endMs: 8000,
+      cells: 4,
+      images: 1,
+      maxEdge: 640,
+      transcript: 'off',
+      transcriptFile: null,
+    });
+    assertOverviewShape(result, { cells: 4, images: 1, maxEdge: 640 });
+    assert.equal(result.segments[0].startMs, 2000);
+    assert.equal(result.segments.at(-1).endMs, 8000);
+    assert.ok(result.segments.every((segment) => segment.startMs >= 2000 && segment.endMs <= 8000));
+  });
+});
+
+test('overview：字幕优先——sibling 自动发现、显式 transcriptFile 胜出，且不调用 ASR', { skip, timeout: 120000 }, async () => {
+  await withCache(async (dir) => {
+    const stub = stubProvider({ text: 'ASR SHOULD NOT RUN' });
+    const backend = createVideoBackend({ config: {}, asrProvider: stub.provider });
+
+    const sibling = await backend.overview({
+      path: SUBTITLES,
+      startMs: 0,
+      endMs: 12000,
+      cells: 4,
+      images: 2,
+      maxEdge: 640,
+      transcript: 'auto',
+      transcriptFile: null,
+    });
+    assertOverviewShape(sibling, { cells: 4, images: 2, maxEdge: 640 });
+    assert.equal(stub.calls.length, 0, 'ASR must not run when a sibling subtitle exists');
+    assert.equal(sibling.transcript.source, 'subtitle');
+    assert.equal(sibling.transcript.origin, 'file');
+    assert.equal(sibling.transcript.file, SRT);
+    assert.ok(sibling.segments.some((segment) => /FIRST SUBTITLE LINE/.test(segment.text)));
+    assert.ok(sibling.segments.some((segment) => /FOURTH SUBTITLE LINE/.test(segment.text)));
+    assert.ok(sibling.segments.every((segment) => segment.source === 'subtitle' && segment.origin === 'file'));
+
+    const explicit = path.join(dir, 'explicit.srt');
+    await writeFile(explicit, '1\n00:00:00,000 --> 00:00:12,000\nEXPLICIT TRANSCRIPT LINE\n');
+    const explicitResult = await backend.overview({
+      path: SUBTITLES,
+      startMs: 0,
+      endMs: 12000,
+      cells: 2,
+      images: 1,
+      maxEdge: 640,
+      transcript: 'auto',
+      transcriptFile: explicit,
+    });
+    assert.equal(stub.calls.length, 0);
+    assert.equal(explicitResult.transcript.source, 'subtitle');
+    assert.equal(explicitResult.transcript.file, explicit);
+    assert.ok(explicitResult.segments.some((segment) => /EXPLICIT TRANSCRIPT LINE/.test(segment.text)));
+    assert.ok(explicitResult.segments.every((segment) => !/FIRST SUBTITLE LINE/.test(segment.text)));
+  });
+});
+
+test('overview：无字幕时 ASR 兜底，段落标 source/origin=asr，中间文件只在缓存目录', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const stub = stubProvider();
+    const backend = createVideoBackend({ config: {}, asrProvider: stub.provider });
+    const result = await backend.overview({
+      path: SCENE,
+      startMs: 0,
+      endMs: 12000,
+      cells: 4,
+      images: 1,
+      maxEdge: 640,
+      transcript: 'auto',
+      transcriptFile: null,
+    });
+    assertOverviewShape(result, { cells: 4, images: 1, maxEdge: 640 });
+    assert.equal(stub.calls.length, 1, '12s audio fits in one ASR chunk');
+    const cacheRoot = process.env.MMGREP_CACHE_DIR;
+    assert.ok(stub.calls[0].startsWith(cacheRoot), 'ASR temp chunk must live under MMGREP_CACHE_DIR');
+    assert.ok(!stub.calls[0].startsWith(path.dirname(SCENE)), 'nothing may be written next to the input');
+    assert.equal(result.transcript.source, 'asr');
+    assert.equal(result.transcript.origin, 'asr');
+    assert.equal(result.transcript.provider, 'stub');
+    assert.equal(result.transcript.model, 'stub-model');
+    assert.ok(result.segments.every((segment) => segment.source === 'asr' && segment.origin === 'asr'));
+    assert.ok(result.segments.some((segment) => /STUB SPOKEN LINE/.test(segment.text)));
+  });
+});
+
+test('zoom：at 精确帧返回一张 PNG 与 target 时间戳', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const backend = createVideoBackend({ config: {} });
+    const result = await backend.zoom({
+      path: ZOOM,
+      atMs: 1500,
+      atSec: 1.5,
+      selection: 'exact',
+      maxEdge: 640,
+      crop: null,
+    });
+    assert.equal(result.images.length, 1);
+    assertPng(result.images[0].buffer);
+    assert.equal(result.images[0].cells, 1);
+    assert.ok(longestEdge(result.images[0]) <= 640);
+    assert.equal(result.target.kind, 'frame');
+    assert.equal(result.target.selection, 'exact');
+    assert.equal(result.target.atMs, 1500);
+    assert.equal(result.target.fromMs, null);
+    assert.equal(result.target.toMs, null);
+    assert.equal(result.target.page, null);
+    assert.equal(result.target.crop, null);
+  });
+});
+
+test('zoom：start/end 窗口选最清晰帧，target 报告窗口与时刻', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const backend = createVideoBackend({ config: {} });
+    const result = await backend.zoom({
+      path: ZOOM,
+      startMs: 1000,
+      endMs: 3000,
+      selection: 'sharpest',
+      maxEdge: 640,
+      crop: null,
+    });
+    assert.equal(result.images.length, 1);
+    assertPng(result.images[0].buffer);
+    assert.equal(result.target.kind, 'frame');
+    assert.equal(result.target.selection, 'sharpest');
+    assert.equal(result.target.fromMs, 1000);
+    assert.equal(result.target.toMs, 3000);
+    assert.ok(result.target.atMs >= 1000 && result.target.atMs <= 3000);
+    assert.ok(result.target.atSec >= 1 && result.target.atSec <= 3);
+  });
+});
+
+test('zoom：crop 在缩放后裁切，输出尺寸与比例一致', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const backend = createVideoBackend({ config: {} });
+    const crop = { x: 30 / 640, y: 135 / 360, width: 120 / 640, height: 70 / 360 };
+    const result = await backend.zoom({
+      path: ZOOM,
+      atMs: 1500,
+      selection: 'exact',
+      maxEdge: 640,
+      crop,
+    });
+    assert.equal(result.images.length, 1);
+    assertPng(result.images[0].buffer);
+    assert.equal(result.images[0].width, 120);
+    assert.equal(result.images[0].height, 70);
+    assert.deepEqual(result.target.crop, crop);
+  });
+});
+
+test('locate：字幕匹配、来源标注、includeFrame 单帧', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const backend = createVideoBackend({ config: {} });
+    const result = await backend.locate({
+      path: SUBTITLES,
+      query: 'SECOND SUBTITLE',
+      max: 5,
+      startMs: 0,
+      endMs: 12000,
+      transcript: 'auto',
+      transcriptFile: null,
+      includeFrame: true,
+    });
+    assert.ok(result.matches.length >= 1);
+    assert.equal(result.matches[0].rank, 1);
+    assert.equal(result.matches[0].source, 'subtitle');
+    assert.equal(result.matches[0].origin, 'file');
+    assert.ok(result.matches[0].startMs >= 3000 && result.matches[0].startMs < 6000);
+    assert.equal(result.totalSegments, 4);
+    assert.equal(result.transcript.source, 'subtitle');
+    assert.ok(result.frame?.buffer);
+    assertPng(result.frame.buffer);
+    assert.equal(result.frame.atMs, result.matches[0].startMs);
+    assert.ok(longestEdge(result.frame) <= 1600);
+
+    const windowed = await backend.locate({
+      path: SUBTITLES,
+      query: 'SUBTITLE',
+      max: 5,
+      startMs: 6000,
+      endMs: 9000,
+      transcript: 'auto',
+      transcriptFile: null,
+      includeFrame: false,
+    });
+    assert.equal(windowed.totalSegments, 1);
+    assert.ok(windowed.matches.length >= 1);
+    assert.ok(windowed.matches.every((match) => match.startMs >= 6000 && match.endMs <= 9000));
+    assert.ok(windowed.matches.every((match) => /THIRD SUBTITLE LINE/.test(match.text)));
+  });
+});
+
+test('locate：没有任何转写来源 → NO_TRANSCRIPT（契约 §7.5 文案）', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const backend = createVideoBackend({ config: {} });
+    await assert.rejects(
+      () => backend.locate({
+        path: SCENE,
+        query: 'anything',
+        max: 5,
+        startMs: 0,
+        endMs: 12000,
+        transcript: 'auto',
+        transcriptFile: null,
+        includeFrame: false,
+      }),
+      (error) => error.code === 'NO_TRANSCRIPT'
+        && /^no transcript available for this file and no ASR provider is configured \(MMGREP_ASR_PROVIDER="none"\)\./.test(error.message)
+        && /Pass transcriptFile with a local \.srt\/\.vtt file, or configure an ASR provider\./.test(error.message),
+    );
+  });
+});
+
+test('subtitles：sibling 文件、窗口过滤、显式文件；无字幕来源 → NO_TRANSCRIPT（契约 §8.6）', { skip, timeout: 120000 }, async () => {
+  await withCache(async (dir) => {
+    const backend = createVideoBackend({ config: {} });
+    const clipped = await backend.subtitles({
+      path: SUBTITLES,
+      startMs: 3000,
+      endMs: 6000,
+      transcriptFile: null,
+    });
+    assert.equal(clipped.origin, 'file');
+    assert.equal(clipped.sourcePath, SRT);
+    assert.equal(clipped.format, 'srt');
+    assert.equal(clipped.segments.length, 1);
+    assert.equal(clipped.segments[0].index, 1);
+    assert.equal(clipped.segments[0].source, 'subtitle');
+    assert.equal(clipped.segments[0].origin, 'file');
+    assert.match(clipped.segments[0].text, /SECOND SUBTITLE LINE/);
+
+    const explicit = path.join(dir, 'picked.vtt');
+    await writeFile(explicit, 'WEBVTT\n\n00:00:00.000 --> 00:00:12.000\nEXPLICIT VTT LINE\n');
+    const picked = await backend.subtitles({
+      path: SUBTITLES,
+      startMs: 0,
+      endMs: 12000,
+      transcriptFile: explicit,
+    });
+    assert.equal(picked.origin, 'file');
+    assert.equal(picked.sourcePath, explicit);
+    assert.equal(picked.format, 'vtt');
+    assert.ok(picked.segments.some((segment) => /EXPLICIT VTT LINE/.test(segment.text)));
+
+    await assert.rejects(
+      () => backend.subtitles({ path: SCENE, transcriptFile: null }),
+      (error) => error.code === 'NO_TRANSCRIPT'
+        && error.message === `no subtitle source for "${SCENE}": no embedded subtitle track, `
+          + 'no sibling .srt/.vtt/.ass/.ssa file, and no ASR provider configured. '
+          + 'Pass transcriptFile with a local subtitle file.',
+    );
+  });
+});

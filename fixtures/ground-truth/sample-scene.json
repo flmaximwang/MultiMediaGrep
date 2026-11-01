@@ -1,0 +1,214 @@
+{
+  "id": "sample-scene",
+  "kind": "video",
+  "file": "sample-scene.mp4",
+  "generator": "fixtures/generate.mjs",
+  "durationMs": 12000,
+  "width": 640,
+  "height": 360,
+  "fps": 24,
+  "frameCount": 288,
+  "cutsMs": [
+    2000,
+    5000,
+    9000
+  ],
+  "cutFrames": [
+    48,
+    120,
+    216
+  ],
+  "segments": [
+    {
+      "index": 0,
+      "startMs": 0,
+      "endMs": 2000,
+      "startFrame": 0,
+      "endFrame": 48,
+      "text": "SCENE ONE",
+      "bgColor": "#C81E1E",
+      "bgColorRgb": [
+        200,
+        30,
+        30
+      ],
+      "textScale": 5,
+      "textOrigin": {
+        "x": 40,
+        "y": 40
+      },
+      "textPanel": {
+        "x": 30,
+        "y": 30,
+        "width": 435,
+        "height": 103
+      },
+      "textBoxes": [
+        {
+          "text": "SCENE ONE",
+          "x": 40,
+          "y": 40,
+          "width": 265,
+          "height": 35
+        },
+        {
+          "text": "SEGMENT 1 OF 4",
+          "x": 40,
+          "y": 88,
+          "width": 415,
+          "height": 35
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "startMs": 2000,
+      "endMs": 5000,
+      "startFrame": 48,
+      "endFrame": 120,
+      "text": "SCENE TWO",
+      "bgColor": "#1EBE1E",
+      "bgColorRgb": [
+        30,
+        190,
+        30
+      ],
+      "textScale": 5,
+      "textOrigin": {
+        "x": 40,
+        "y": 40
+      },
+      "textPanel": {
+        "x": 30,
+        "y": 30,
+        "width": 435,
+        "height": 103
+      },
+      "textBoxes": [
+        {
+          "text": "SCENE TWO",
+          "x": 40,
+          "y": 40,
+          "width": 265,
+          "height": 35
+        },
+        {
+          "text": "SEGMENT 2 OF 4",
+          "x": 40,
+          "y": 88,
+          "width": 415,
+          "height": 35
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "startMs": 5000,
+      "endMs": 9000,
+      "startFrame": 120,
+      "endFrame": 216,
+      "text": "SCENE THREE",
+      "bgColor": "#1E1EC8",
+      "bgColorRgb": [
+        30,
+        30,
+        200
+      ],
+      "textScale": 5,
+      "textOrigin": {
+        "x": 40,
+        "y": 40
+      },
+      "textPanel": {
+        "x": 30,
+        "y": 30,
+        "width": 435,
+        "height": 103
+      },
+      "textBoxes": [
+        {
+          "text": "SCENE THREE",
+          "x": 40,
+          "y": 40,
+          "width": 325,
+          "height": 35
+        },
+        {
+          "text": "SEGMENT 3 OF 4",
+          "x": 40,
+          "y": 88,
+          "width": 415,
+          "height": 35
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "startMs": 9000,
+      "endMs": 12000,
+      "startFrame": 216,
+      "endFrame": 288,
+      "text": "SCENE FOUR",
+      "bgColor": "#C8BE1E",
+      "bgColorRgb": [
+        200,
+        190,
+        30
+      ],
+      "textScale": 5,
+      "textOrigin": {
+        "x": 40,
+        "y": 40
+      },
+      "textPanel": {
+        "x": 30,
+        "y": 30,
+        "width": 435,
+        "height": 103
+      },
+      "textBoxes": [
+        {
+          "text": "SCENE FOUR",
+          "x": 40,
+          "y": 40,
+          "width": 295,
+          "height": 35
+        },
+        {
+          "text": "SEGMENT 4 OF 4",
+          "x": 40,
+          "y": 88,
+          "width": 415,
+          "height": 35
+        }
+      ]
+    }
+  ],
+  "audio": {
+    "codec": "aac",
+    "sampleRate": 44100,
+    "channels": 1,
+    "volumeJumpsMs": [
+      6000
+    ],
+    "segments": [
+      {
+        "index": 0,
+        "startMs": 0,
+        "endMs": 6000,
+        "toneHz": 440,
+        "peakAmplitude": 0.1,
+        "expectedMeanVolumeDb": -23.01
+      },
+      {
+        "index": 1,
+        "startMs": 6000,
+        "endMs": 12000,
+        "toneHz": 880,
+        "peakAmplitude": 0.7,
+        "expectedMeanVolumeDb": -6.11
+      }
+    ],
+    "loudnessJumpDb": 16.9
+  }
+}

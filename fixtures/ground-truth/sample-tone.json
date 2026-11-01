@@ -1,0 +1,114 @@
+{
+  "id": "sample-tone",
+  "kind": "audio",
+  "file": "sample-tone.wav",
+  "generator": "fixtures/generate.mjs",
+  "format": "wav",
+  "codec": "pcm_s16le",
+  "durationMs": 10000,
+  "sampleRate": 44100,
+  "channels": 2,
+  "tones": {
+    "left": {
+      "hz": 440,
+      "amplitude": 0.5,
+      "expectedRms": 0.35
+    },
+    "right": {
+      "hz": 220,
+      "amplitude": 0.25,
+      "expectedRms": 0.18
+    }
+  },
+  "silences": [
+    {
+      "startMs": 2000,
+      "endMs": 3000,
+      "channels": [
+        "left",
+        "right"
+      ]
+    },
+    {
+      "startMs": 6000,
+      "endMs": 6500,
+      "channels": [
+        "left",
+        "right"
+      ]
+    },
+    {
+      "startMs": 7500,
+      "endMs": 8000,
+      "channels": [
+        "right"
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "startMs": 0,
+      "endMs": 2000,
+      "silent": false,
+      "silentChannels": [],
+      "leftHz": 440,
+      "rightHz": 220
+    },
+    {
+      "startMs": 2000,
+      "endMs": 3000,
+      "silent": true,
+      "silentChannels": [
+        "left",
+        "right"
+      ],
+      "leftHz": null,
+      "rightHz": null
+    },
+    {
+      "startMs": 3000,
+      "endMs": 6000,
+      "silent": false,
+      "silentChannels": [],
+      "leftHz": 440,
+      "rightHz": 220
+    },
+    {
+      "startMs": 6000,
+      "endMs": 6500,
+      "silent": true,
+      "silentChannels": [
+        "left",
+        "right"
+      ],
+      "leftHz": null,
+      "rightHz": null
+    },
+    {
+      "startMs": 6500,
+      "endMs": 7500,
+      "silent": false,
+      "silentChannels": [],
+      "leftHz": 440,
+      "rightHz": 220
+    },
+    {
+      "startMs": 7500,
+      "endMs": 8000,
+      "silent": true,
+      "silentChannels": [
+        "right"
+      ],
+      "leftHz": 440,
+      "rightHz": null
+    },
+    {
+      "startMs": 8000,
+      "endMs": 10000,
+      "silent": false,
+      "silentChannels": [],
+      "leftHz": 440,
+      "rightHz": 220
+    }
+  ]
+}

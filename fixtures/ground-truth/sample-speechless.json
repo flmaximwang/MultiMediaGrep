@@ -1,0 +1,53 @@
+{
+  "id": "sample-speechless",
+  "kind": "audio",
+  "file": "sample-speechless.mp3",
+  "generator": "fixtures/generate.mjs",
+  "format": "mp3",
+  "codec": "mp3",
+  "durationMs": 10000,
+  "durationToleranceMs": 120,
+  "sampleRate": 44100,
+  "channels": 2,
+  "bitrateKbps": 128,
+  "hasSpeech": false,
+  "encoderDelayMs": 26,
+  "note": "Contains tones only - no human voice. ASR ground truth is NOT asserted: cross-platform TTS is not available. Use a stub ASR provider instead.",
+  "tones": {
+    "left": {
+      "hz": 440,
+      "amplitude": 0.5,
+      "expectedRms": 0.35
+    },
+    "right": {
+      "hz": 220,
+      "amplitude": 0.25,
+      "expectedRms": 0.18
+    }
+  },
+  "silences": [
+    {
+      "startMs": 2000,
+      "endMs": 3000,
+      "channels": [
+        "left",
+        "right"
+      ]
+    },
+    {
+      "startMs": 6000,
+      "endMs": 6500,
+      "channels": [
+        "left",
+        "right"
+      ]
+    },
+    {
+      "startMs": 7500,
+      "endMs": 8000,
+      "channels": [
+        "right"
+      ]
+    }
+  ]
+}

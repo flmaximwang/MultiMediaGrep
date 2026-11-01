@@ -1,0 +1,740 @@
+{
+  "id": "sample-text-pdf",
+  "kind": "pdf",
+  "file": "sample-text.pdf",
+  "generator": "fixtures/generate.mjs",
+  "pageCount": 6,
+  "pageWidthPt": 595,
+  "pageHeightPt": 842,
+  "marginPt": 72,
+  "hasTextLayer": true,
+  "fonts": [
+    "Helvetica",
+    "Helvetica-Bold"
+  ],
+  "pages": [
+    {
+      "page": 1,
+      "lines": [
+        {
+          "text": "MULTIMEDIAGREP TEXT FIXTURE",
+          "xPt": 72,
+          "yPt": 770,
+          "font": "F2",
+          "size": 16
+        },
+        {
+          "text": "PAGE 1 OF 6",
+          "xPt": 72,
+          "yPt": 740,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "THIS DOCUMENT HAS A REAL TEXT LAYER.",
+          "xPt": 72,
+          "yPt": 720,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "EACH PAGE CARRIES UNIQUE LINES.",
+          "xPt": 72,
+          "yPt": 700,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "LINE EXTRACTION MUST FIND THESE STRINGS.",
+          "xPt": 72,
+          "yPt": 680,
+          "font": "F1",
+          "size": 11
+        }
+      ],
+      "textOps": [
+        {
+          "text": "MULTIMEDIAGREP TEXT FIXTURE",
+          "xPt": 72,
+          "yPt": 770
+        },
+        {
+          "text": "PAGE 1 OF 6",
+          "xPt": 72,
+          "yPt": 740
+        },
+        {
+          "text": "THIS DOCUMENT HAS A REAL TEXT LAYER.",
+          "xPt": 72,
+          "yPt": 720
+        },
+        {
+          "text": "EACH PAGE CARRIES UNIQUE LINES.",
+          "xPt": 72,
+          "yPt": 700
+        },
+        {
+          "text": "LINE EXTRACTION MUST FIND THESE STRINGS.",
+          "xPt": 72,
+          "yPt": 680
+        }
+      ]
+    },
+    {
+      "page": 2,
+      "lines": [
+        {
+          "text": "PAGE TWO HEADING",
+          "xPt": 72,
+          "yPt": 770,
+          "font": "F2",
+          "size": 16
+        },
+        {
+          "text": "SECOND PAGE OF THE TEXT FIXTURE.",
+          "xPt": 72,
+          "yPt": 740,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "ALPHA BETA GAMMA DELTA.",
+          "xPt": 72,
+          "yPt": 720,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "ONE TWO THREE FOUR FIVE.",
+          "xPt": 72,
+          "yPt": 700,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "THE QUICK BROWN FOX JUMPS.",
+          "xPt": 72,
+          "yPt": 680,
+          "font": "F1",
+          "size": 11
+        }
+      ],
+      "textOps": [
+        {
+          "text": "PAGE TWO HEADING",
+          "xPt": 72,
+          "yPt": 770
+        },
+        {
+          "text": "SECOND PAGE OF THE TEXT FIXTURE.",
+          "xPt": 72,
+          "yPt": 740
+        },
+        {
+          "text": "ALPHA BETA GAMMA DELTA.",
+          "xPt": 72,
+          "yPt": 720
+        },
+        {
+          "text": "ONE TWO THREE FOUR FIVE.",
+          "xPt": 72,
+          "yPt": 700
+        },
+        {
+          "text": "THE QUICK BROWN FOX JUMPS.",
+          "xPt": 72,
+          "yPt": 680
+        }
+      ]
+    },
+    {
+      "page": 3,
+      "lines": [
+        {
+          "text": "PAGE THREE HEADING",
+          "xPt": 72,
+          "yPt": 770,
+          "font": "F2",
+          "size": 16
+        },
+        {
+          "text": "THIRD PAGE OF THE TEXT FIXTURE.",
+          "xPt": 72,
+          "yPt": 740,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "SIX SEVEN EIGHT NINE TEN.",
+          "xPt": 72,
+          "yPt": 720,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "RED GREEN BLUE YELLOW BLACK.",
+          "xPt": 72,
+          "yPt": 700,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "PAGE THREE ENDS HERE.",
+          "xPt": 72,
+          "yPt": 680,
+          "font": "F1",
+          "size": 11
+        }
+      ],
+      "textOps": [
+        {
+          "text": "PAGE THREE HEADING",
+          "xPt": 72,
+          "yPt": 770
+        },
+        {
+          "text": "THIRD PAGE OF THE TEXT FIXTURE.",
+          "xPt": 72,
+          "yPt": 740
+        },
+        {
+          "text": "SIX SEVEN EIGHT NINE TEN.",
+          "xPt": 72,
+          "yPt": 720
+        },
+        {
+          "text": "RED GREEN BLUE YELLOW BLACK.",
+          "xPt": 72,
+          "yPt": 700
+        },
+        {
+          "text": "PAGE THREE ENDS HERE.",
+          "xPt": 72,
+          "yPt": 680
+        }
+      ]
+    },
+    {
+      "page": 4,
+      "lines": [
+        {
+          "text": "PAGE FOUR HEADING",
+          "xPt": 72,
+          "yPt": 770,
+          "font": "F2",
+          "size": 16
+        },
+        {
+          "text": "FOURTH PAGE OF THE TEXT FIXTURE.",
+          "xPt": 72,
+          "yPt": 740,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "ALPHA CHARLIE BRAVO ECHO.",
+          "xPt": 72,
+          "yPt": 720,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "FIXTURES MAKE ASSERTIONS POSSIBLE.",
+          "xPt": 72,
+          "yPt": 700,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "NO IMAGE IS EMBEDDED ON THIS PAGE.",
+          "xPt": 72,
+          "yPt": 680,
+          "font": "F1",
+          "size": 11
+        }
+      ],
+      "textOps": [
+        {
+          "text": "PAGE FOUR HEADING",
+          "xPt": 72,
+          "yPt": 770
+        },
+        {
+          "text": "FOURTH PAGE OF THE TEXT FIXTURE.",
+          "xPt": 72,
+          "yPt": 740
+        },
+        {
+          "text": "ALPHA CHARLIE BRAVO ECHO.",
+          "xPt": 72,
+          "yPt": 720
+        },
+        {
+          "text": "FIXTURES MAKE ASSERTIONS POSSIBLE.",
+          "xPt": 72,
+          "yPt": 700
+        },
+        {
+          "text": "NO IMAGE IS EMBEDDED ON THIS PAGE.",
+          "xPt": 72,
+          "yPt": 680
+        }
+      ]
+    },
+    {
+      "page": 5,
+      "lines": [
+        {
+          "text": "PAGE FIVE HEADING",
+          "xPt": 72,
+          "yPt": 770,
+          "font": "F2",
+          "size": 16
+        },
+        {
+          "text": "FIFTH PAGE OF THE TEXT FIXTURE.",
+          "xPt": 72,
+          "yPt": 740,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "THE TABLE BELOW IS VECTOR GRAPHICS.",
+          "xPt": 72,
+          "yPt": 720,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "CELL CONTENTS ARE KNOWN.",
+          "xPt": 72,
+          "yPt": 700,
+          "font": "F1",
+          "size": 11
+        }
+      ],
+      "textOps": [
+        {
+          "text": "PAGE FIVE HEADING",
+          "xPt": 72,
+          "yPt": 770
+        },
+        {
+          "text": "FIFTH PAGE OF THE TEXT FIXTURE.",
+          "xPt": 72,
+          "yPt": 740
+        },
+        {
+          "text": "THE TABLE BELOW IS VECTOR GRAPHICS.",
+          "xPt": 72,
+          "yPt": 720
+        },
+        {
+          "text": "CELL CONTENTS ARE KNOWN.",
+          "xPt": 72,
+          "yPt": 700
+        },
+        {
+          "text": "COL A",
+          "xPt": 78,
+          "yPt": 634
+        },
+        {
+          "text": "COL B",
+          "xPt": 188,
+          "yPt": 634
+        },
+        {
+          "text": "COL C",
+          "xPt": 298,
+          "yPt": 634
+        },
+        {
+          "text": "COL D",
+          "xPt": 408,
+          "yPt": 634
+        },
+        {
+          "text": "A1",
+          "xPt": 78,
+          "yPt": 610
+        },
+        {
+          "text": "B1",
+          "xPt": 188,
+          "yPt": 610
+        },
+        {
+          "text": "C1",
+          "xPt": 298,
+          "yPt": 610
+        },
+        {
+          "text": "D1",
+          "xPt": 408,
+          "yPt": 610
+        },
+        {
+          "text": "A2",
+          "xPt": 78,
+          "yPt": 586
+        },
+        {
+          "text": "B2",
+          "xPt": 188,
+          "yPt": 586
+        },
+        {
+          "text": "C2",
+          "xPt": 298,
+          "yPt": 586
+        },
+        {
+          "text": "D2",
+          "xPt": 408,
+          "yPt": 586
+        },
+        {
+          "text": "A3",
+          "xPt": 78,
+          "yPt": 562
+        },
+        {
+          "text": "B3",
+          "xPt": 188,
+          "yPt": 562
+        },
+        {
+          "text": "C3",
+          "xPt": 298,
+          "yPt": 562
+        },
+        {
+          "text": "D3",
+          "xPt": 408,
+          "yPt": 562
+        }
+      ]
+    },
+    {
+      "page": 6,
+      "lines": [
+        {
+          "text": "PAGE SIX HEADING",
+          "xPt": 72,
+          "yPt": 770,
+          "font": "F2",
+          "size": 16
+        },
+        {
+          "text": "SIXTH AND LAST PAGE OF THE TEXT FIXTURE.",
+          "xPt": 72,
+          "yPt": 740,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "A SMALLER TABLE FOLLOWS.",
+          "xPt": 72,
+          "yPt": 720,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "END OF DOCUMENT.",
+          "xPt": 72,
+          "yPt": 700,
+          "font": "F1",
+          "size": 11
+        }
+      ],
+      "textOps": [
+        {
+          "text": "PAGE SIX HEADING",
+          "xPt": 72,
+          "yPt": 770
+        },
+        {
+          "text": "SIXTH AND LAST PAGE OF THE TEXT FIXTURE.",
+          "xPt": 72,
+          "yPt": 740
+        },
+        {
+          "text": "A SMALLER TABLE FOLLOWS.",
+          "xPt": 72,
+          "yPt": 720
+        },
+        {
+          "text": "END OF DOCUMENT.",
+          "xPt": 72,
+          "yPt": 700
+        },
+        {
+          "text": "KEY",
+          "xPt": 78,
+          "yPt": 634
+        },
+        {
+          "text": "VALUE",
+          "xPt": 218,
+          "yPt": 634
+        },
+        {
+          "text": "ALPHA",
+          "xPt": 78,
+          "yPt": 610
+        },
+        {
+          "text": "ONE",
+          "xPt": 218,
+          "yPt": 610
+        },
+        {
+          "text": "BETA",
+          "xPt": 78,
+          "yPt": 586
+        },
+        {
+          "text": "TWO",
+          "xPt": 218,
+          "yPt": 586
+        }
+      ]
+    }
+  ],
+  "tables": [
+    {
+      "page": 5,
+      "originXPt": 72,
+      "topYPt": 650,
+      "columnWidthPt": 110,
+      "rowHeightPt": 24,
+      "columnXPt": [
+        72,
+        182,
+        292,
+        402
+      ],
+      "rowYPt": [
+        650,
+        626,
+        602,
+        578
+      ],
+      "header": [
+        "COL A",
+        "COL B",
+        "COL C",
+        "COL D"
+      ],
+      "rows": [
+        [
+          "A1",
+          "B1",
+          "C1",
+          "D1"
+        ],
+        [
+          "A2",
+          "B2",
+          "C2",
+          "D2"
+        ],
+        [
+          "A3",
+          "B3",
+          "C3",
+          "D3"
+        ]
+      ],
+      "cells": [
+        {
+          "row": 0,
+          "col": 0,
+          "text": "COL A",
+          "xPt": 78,
+          "yPt": 634
+        },
+        {
+          "row": 0,
+          "col": 1,
+          "text": "COL B",
+          "xPt": 188,
+          "yPt": 634
+        },
+        {
+          "row": 0,
+          "col": 2,
+          "text": "COL C",
+          "xPt": 298,
+          "yPt": 634
+        },
+        {
+          "row": 0,
+          "col": 3,
+          "text": "COL D",
+          "xPt": 408,
+          "yPt": 634
+        },
+        {
+          "row": 1,
+          "col": 0,
+          "text": "A1",
+          "xPt": 78,
+          "yPt": 610
+        },
+        {
+          "row": 1,
+          "col": 1,
+          "text": "B1",
+          "xPt": 188,
+          "yPt": 610
+        },
+        {
+          "row": 1,
+          "col": 2,
+          "text": "C1",
+          "xPt": 298,
+          "yPt": 610
+        },
+        {
+          "row": 1,
+          "col": 3,
+          "text": "D1",
+          "xPt": 408,
+          "yPt": 610
+        },
+        {
+          "row": 2,
+          "col": 0,
+          "text": "A2",
+          "xPt": 78,
+          "yPt": 586
+        },
+        {
+          "row": 2,
+          "col": 1,
+          "text": "B2",
+          "xPt": 188,
+          "yPt": 586
+        },
+        {
+          "row": 2,
+          "col": 2,
+          "text": "C2",
+          "xPt": 298,
+          "yPt": 586
+        },
+        {
+          "row": 2,
+          "col": 3,
+          "text": "D2",
+          "xPt": 408,
+          "yPt": 586
+        },
+        {
+          "row": 3,
+          "col": 0,
+          "text": "A3",
+          "xPt": 78,
+          "yPt": 562
+        },
+        {
+          "row": 3,
+          "col": 1,
+          "text": "B3",
+          "xPt": 188,
+          "yPt": 562
+        },
+        {
+          "row": 3,
+          "col": 2,
+          "text": "C3",
+          "xPt": 298,
+          "yPt": 562
+        },
+        {
+          "row": 3,
+          "col": 3,
+          "text": "D3",
+          "xPt": 408,
+          "yPt": 562
+        }
+      ]
+    },
+    {
+      "page": 6,
+      "originXPt": 72,
+      "topYPt": 650,
+      "columnWidthPt": 140,
+      "rowHeightPt": 24,
+      "columnXPt": [
+        72,
+        212
+      ],
+      "rowYPt": [
+        650,
+        626,
+        602
+      ],
+      "header": [
+        "KEY",
+        "VALUE"
+      ],
+      "rows": [
+        [
+          "ALPHA",
+          "ONE"
+        ],
+        [
+          "BETA",
+          "TWO"
+        ]
+      ],
+      "cells": [
+        {
+          "row": 0,
+          "col": 0,
+          "text": "KEY",
+          "xPt": 78,
+          "yPt": 634
+        },
+        {
+          "row": 0,
+          "col": 1,
+          "text": "VALUE",
+          "xPt": 218,
+          "yPt": 634
+        },
+        {
+          "row": 1,
+          "col": 0,
+          "text": "ALPHA",
+          "xPt": 78,
+          "yPt": 610
+        },
+        {
+          "row": 1,
+          "col": 1,
+          "text": "ONE",
+          "xPt": 218,
+          "yPt": 610
+        },
+        {
+          "row": 2,
+          "col": 0,
+          "text": "BETA",
+          "xPt": 78,
+          "yPt": 586
+        },
+        {
+          "row": 2,
+          "col": 1,
+          "text": "TWO",
+          "xPt": 218,
+          "yPt": 586
+        }
+      ]
+    }
+  ]
+}

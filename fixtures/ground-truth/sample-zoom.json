@@ -1,0 +1,139 @@
+{
+  "id": "sample-zoom",
+  "kind": "video",
+  "file": "sample-zoom.mp4",
+  "generator": "fixtures/generate.mjs",
+  "durationMs": 8000,
+  "width": 640,
+  "height": 360,
+  "fps": 24,
+  "frameCount": 192,
+  "static": true,
+  "background": "#F5F5F5",
+  "colorChart": {
+    "x": 20,
+    "y": 20,
+    "width": 595,
+    "height": 90,
+    "swatches": [
+      {
+        "index": 0,
+        "x": 20,
+        "y": 20,
+        "width": 70,
+        "height": 90,
+        "color": "#E6194B"
+      },
+      {
+        "index": 1,
+        "x": 95,
+        "y": 20,
+        "width": 70,
+        "height": 90,
+        "color": "#3CB44B"
+      },
+      {
+        "index": 2,
+        "x": 170,
+        "y": 20,
+        "width": 70,
+        "height": 90,
+        "color": "#FFE119"
+      },
+      {
+        "index": 3,
+        "x": 245,
+        "y": 20,
+        "width": 70,
+        "height": 90,
+        "color": "#3CB44B"
+      },
+      {
+        "index": 4,
+        "x": 320,
+        "y": 20,
+        "width": 70,
+        "height": 90,
+        "color": "#0082C8"
+      },
+      {
+        "index": 5,
+        "x": 395,
+        "y": 20,
+        "width": 70,
+        "height": 90,
+        "color": "#F58230"
+      },
+      {
+        "index": 6,
+        "x": 470,
+        "y": 20,
+        "width": 70,
+        "height": 90,
+        "color": "#911EB4"
+      },
+      {
+        "index": 7,
+        "x": 545,
+        "y": 20,
+        "width": 70,
+        "height": 90,
+        "color": "#464646"
+      }
+    ]
+  },
+  "regions": [
+    {
+      "id": "number",
+      "text": "42",
+      "scale": 8,
+      "origin": {
+        "x": 40,
+        "y": 145
+      },
+      "box": {
+        "x": 40,
+        "y": 145,
+        "width": 88,
+        "height": 56
+      }
+    },
+    {
+      "id": "caption",
+      "text": "CROP TARGET ALPHA",
+      "scale": 3,
+      "origin": {
+        "x": 40,
+        "y": 252
+      },
+      "box": {
+        "x": 40,
+        "y": 252,
+        "width": 303,
+        "height": 21
+      }
+    }
+  ],
+  "crops": [
+    {
+      "id": "number",
+      "rect": {
+        "x": 30,
+        "y": 135,
+        "width": 120,
+        "height": 70
+      },
+      "expectedText": "42"
+    },
+    {
+      "id": "caption",
+      "rect": {
+        "x": 30,
+        "y": 245,
+        "width": 320,
+        "height": 34
+      },
+      "expectedText": "CROP TARGET ALPHA"
+    }
+  ]
+}

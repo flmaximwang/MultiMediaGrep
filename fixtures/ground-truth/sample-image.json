@@ -1,0 +1,75 @@
+{
+  "id": "sample-image",
+  "kind": "image",
+  "file": "sample-image.png",
+  "generator": "fixtures/generate.mjs",
+  "widthPx": 1240,
+  "heightPx": 1754,
+  "format": "png",
+  "hasTextLayer": true,
+  "lines": [
+    {
+      "text": "IMAGE DOCUMENT FIXTURE",
+      "box": {
+        "x": 106,
+        "y": 120,
+        "width": 780,
+        "height": 42
+      }
+    },
+    {
+      "text": "THIS IS A SINGLE PAGE IMAGE FILE.",
+      "box": {
+        "x": 100,
+        "y": 260,
+        "width": 585,
+        "height": 21
+      }
+    },
+    {
+      "text": "USED TO TEST THE IMAGE DOCUMENT BACKEND.",
+      "box": {
+        "x": 100,
+        "y": 330,
+        "width": 711,
+        "height": 21
+      }
+    },
+    {
+      "text": "OCR TEXT SHOULD MATCH THE LINES BELOW.",
+      "box": {
+        "x": 100,
+        "y": 400,
+        "width": 675,
+        "height": 21
+      }
+    },
+    {
+      "text": "ALPHA BRAVO CHARLIE DELTA ECHO.",
+      "box": {
+        "x": 100,
+        "y": 470,
+        "width": 549,
+        "height": 21
+      }
+    },
+    {
+      "text": "SECTION TWO",
+      "box": {
+        "x": 100,
+        "y": 620,
+        "width": 260,
+        "height": 28
+      }
+    },
+    {
+      "text": "THE FIXTURE IMAGE IS 1240 BY 1754 PIXELS.",
+      "box": {
+        "x": 100,
+        "y": 700,
+        "width": 729,
+        "height": 21
+      }
+    }
+  ]
+}

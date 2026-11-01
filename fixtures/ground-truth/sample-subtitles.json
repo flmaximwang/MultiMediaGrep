@@ -1,0 +1,88 @@
+{
+  "id": "sample-subtitles",
+  "kind": "video",
+  "file": "sample-subtitles.mp4",
+  "srtFile": "sample-subtitles.srt",
+  "generator": "fixtures/generate.mjs",
+  "durationMs": 12000,
+  "width": 640,
+  "height": 360,
+  "fps": 24,
+  "frameCount": 288,
+  "subtitleBackground": "#121218",
+  "subtitleBand": {
+    "x": 0,
+    "y": 240,
+    "width": 640,
+    "height": 80
+  },
+  "subtitleScale": 4,
+  "subtitleOrigin": {
+    "x": 40,
+    "y": 268
+  },
+  "headerText": "SUBTITLE FIXTURE",
+  "headerOrigin": {
+    "x": 40,
+    "y": 40
+  },
+  "headerScale": 4,
+  "cues": [
+    {
+      "index": 1,
+      "startMs": 500,
+      "endMs": 3000,
+      "startTime": "00:00:00,500",
+      "endTime": "00:00:03,000",
+      "text": "FIRST SUBTITLE LINE",
+      "textBox": {
+        "x": 40,
+        "y": 268,
+        "width": 452,
+        "height": 28
+      }
+    },
+    {
+      "index": 2,
+      "startMs": 3000,
+      "endMs": 6000,
+      "startTime": "00:00:03,000",
+      "endTime": "00:00:06,000",
+      "text": "SECOND SUBTITLE LINE",
+      "textBox": {
+        "x": 40,
+        "y": 268,
+        "width": 476,
+        "height": 28
+      }
+    },
+    {
+      "index": 3,
+      "startMs": 6000,
+      "endMs": 9000,
+      "startTime": "00:00:06,000",
+      "endTime": "00:00:09,000",
+      "text": "THIRD SUBTITLE LINE",
+      "textBox": {
+        "x": 40,
+        "y": 268,
+        "width": 452,
+        "height": 28
+      }
+    },
+    {
+      "index": 4,
+      "startMs": 9000,
+      "endMs": 11500,
+      "startTime": "00:00:09,000",
+      "endTime": "00:00:11,500",
+      "text": "FOURTH SUBTITLE LINE",
+      "textBox": {
+        "x": 40,
+        "y": 268,
+        "width": 476,
+        "height": 28
+      }
+    }
+  ]
+}
