@@ -214,7 +214,7 @@ test('listTools：4 个工具、描述带中文触发词、schema 完整', async
       }
 
       assert.deepEqual(Object.keys(byName.media_overview.inputSchema.properties).sort(), [
-        'cells', 'end', 'envelope', 'images', 'maxEdge', 'ocr', 'pages', 'path', 'segment', 'start', 'subtitle', 'transcript',
+        'cells', 'end', 'envelope', 'images', 'maxEdge', 'ocr', 'pages', 'path', 'segment', 'start', 'subtitle', 'transcript', 'view',
       ]);
       assert.deepEqual(Object.keys(byName.media_zoom.inputSchema.properties).sort(), [
         'at', 'crop', 'end', 'maxEdge', 'page', 'path', 'start',

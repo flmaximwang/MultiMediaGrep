@@ -160,7 +160,8 @@ test('pages:"4-6"：长页被 skim 时 4/5/6 三页都出现，超长单元带 �
 
 test('不传 pages：28k+ 字符的整份文档走 skim，且不再宣称「每一页」', { skip, timeout: 120000 }, async () => {
   await withServer(24000, async (client) => {
-    const result = await overview(client, {});
+    // 9z5.33：view:"auto" 会先用 6 个页面标题生成目录；这里测的是 .32 的 skim 层本身。
+    const result = await overview(client, { view: 'text' });
     const text = result.content[0].text;
     const data = result.structuredContent;
 

@@ -85,7 +85,11 @@ export function createPdfSupport({ runCommand = run } = {}) {
         : (await isAvailable('qpdf'))
           ? 'qpdf'
           : null;
-    return { rasterizer, textExtractor, info };
+    // PDF 书签（outline）只有 qpdf 能一次读出「标题 + 物理页 + 页标签」：
+    // mutool show outline 只给 /Title 与命名目标，解析目标还要逐条 mutool resolve，
+    // 且拿不到 /PageLabels；pdftotext / pdfinfo 完全不读 outline。
+    const outlineReader = (await isAvailable('qpdf')) ? 'qpdf' : null;
+    return { rasterizer, textExtractor, info, outlineReader };
   }
 
   /**
@@ -347,12 +351,174 @@ export function createPdfSupport({ runCommand = run } = {}) {
     return outPath;
   }
 
-  return { resolveTools, readMetadata, extractText, extractTextLayers, sampleHasText, renderPage };
+  /**
+   * 读取 PDF 书签（outline / bookmarks）。
+   *
+   * 用 `qpdf --json --json-key=outlines --json-key=pages`：一次调用同时得到
+   *   - 书签树的标题与 `/Dest` 解析后的**物理页序号**（`destpageposfrom1`，1-based，
+   *     与 media_overview 的 `pages` 参数同一口径）；
+   *   - 每页的打印标签（`pages[].label`，PDF /PageLabels 定义时才有，如 "xii" / "37"）。
+   *
+   * 失败不抛错：probe 把原因写进 outline.reason。缺 qpdf 时说清缺什么。
+   *
+   * @returns {Promise<{
+   *   reader: string|null,
+   *   entries: Array<{level: number, title: string, page: number|null, label: string|null}>,
+   *   total: number,
+   *   reason: string|null,
+   * }>}
+   */
+  async function readOutline(filePath, { signal } = {}) {
+    const { outlineReader } = await resolveTools();
+    if (!outlineReader) {
+      return {
+        reader: null,
+        entries: [],
+        total: 0,
+        reason: 'PDF bookmarks cannot be read: qpdf is not installed (pdftotext / pdfinfo do not read outlines).',
+      };
+    }
+    try {
+      const { stdout } = await runCommand(
+        'qpdf',
+        ['--json', '--json-key=outlines', '--json-key=pages', filePath],
+        { signal, timeoutMs: PDF_TIMEOUT_MS },
+      );
+      const entries = parseQpdfOutlineJson(JSON.parse(String(stdout)));
+      if (entries.length === 0) {
+        return { reader: 'qpdf', entries: [], total: 0, reason: 'this PDF has no bookmarks (no outline).' };
+      }
+      return { reader: 'qpdf', entries, total: entries.length, reason: null };
+    } catch (error) {
+      if (error instanceof ToolError && error.code === 'TOOL_NOT_FOUND') {
+        return {
+          reader: null,
+          entries: [],
+          total: 0,
+          reason: 'PDF bookmarks cannot be read: qpdf is not installed (pdftotext / pdfinfo do not read outlines).',
+        };
+      }
+      return {
+        reader: 'qpdf',
+        entries: [],
+        total: 0,
+        reason: `PDF bookmarks could not be read: ${error?.message ?? error}`,
+      };
+    }
+  }
+
+  return { resolveTools, readMetadata, extractText, extractTextLayers, sampleHasText, renderPage, readOutline };
 }
 
 /* ------------------------------------------------------------------ *
  * 纯函数：输出解析与文本整理
  * ------------------------------------------------------------------ */
+
+/** 整数 → 小写罗马数字（PDF /PageLabels 的 /S /r；1 → i，1990 → mcmxc） */
+export function romanNumeral(value) {
+  let n = Math.max(0, Math.trunc(Number(value) || 0));
+  if (n <= 0) return '';
+  const table = [
+    [1000, 'm'], [900, 'cm'], [500, 'd'], [400, 'cd'], [100, 'c'], [90, 'xc'],
+    [50, 'l'], [40, 'xl'], [10, 'x'], [9, 'ix'], [5, 'v'], [4, 'iv'], [1, 'i'],
+  ];
+  let out = '';
+  for (const [amount, glyph] of table) {
+    while (n >= amount) {
+      out += glyph;
+      n -= amount;
+    }
+  }
+  return out;
+}
+
+/** 整数 → 字母序号（PDF /PageLabels 的 /S /a；1 → a，27 → aa） */
+export function alphabeticNumeral(value) {
+  let n = Math.max(0, Math.trunc(Number(value) || 0));
+  if (n <= 0) return '';
+  let out = '';
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    out = String.fromCharCode(97 + rem) + out;
+    n = Math.floor((n - 1) / 26);
+  }
+  return out;
+}
+
+/**
+ * qpdf 的 pages[].label（一张 /PageLabels 字典，/St 已按页递增）→ 打印页标签。
+ * qpdf 给的是字典而不是算好的字符串（例如 {"/S": "/r", "/St": 2} → "ii"）。
+ */
+export function pageLabelFromQpdf(label) {
+  if (typeof label === 'string') return label.length > 0 ? label : null;
+  if (!label || typeof label !== 'object') return null;
+  const style = String(label['/S'] ?? '').replace(/^\//, '');
+  const prefix = String(label['/P'] ?? '');
+  const start = Number.isInteger(label['/St']) && label['/St'] > 0 ? label['/St'] : 1;
+  let body;
+  switch (style) {
+    case 'D':
+      body = String(start);
+      break;
+    case 'R':
+      body = romanNumeral(start).toUpperCase();
+      break;
+    case 'r':
+      body = romanNumeral(start);
+      break;
+    case 'A':
+      body = alphabeticNumeral(start).toUpperCase();
+      break;
+    case 'a':
+      body = alphabeticNumeral(start);
+      break;
+    default:
+      body = '';
+  }
+  const labelText = `${prefix}${body}`;
+  return labelText.length > 0 ? labelText : null;
+}
+
+/**
+ * qpdf --json 的 {pages, outlines} → 扁平书签列表。
+ *
+ * qpdf 已把 `/Dest` 的页对象解析成 `destpageposfrom1`（物理页，1-based），
+ * `pages[].label` 是 /PageLabels 字典（没定义时为 null），这里换算成打印标签
+ * （"xii" / "37"）。书签树用 kids 嵌套；层级从 1 开始，按文档顺序深度优先展开。
+ *
+ * @param {object} parsed qpdf --json 的输出
+ * @returns {Array<{level: number, title: string, page: number|null, label: string|null}>}
+ */
+export function parseQpdfOutlineJson(parsed) {
+  const pages = Array.isArray(parsed?.pages) ? parsed.pages : [];
+  /** @type {Map<number, string|null>} */
+  const labels = new Map();
+  for (const page of pages) {
+    const physical = Number(page?.pageposfrom1);
+    if (!Number.isInteger(physical) || physical < 1) continue;
+    labels.set(physical, pageLabelFromQpdf(page?.label));
+  }
+
+  const entries = [];
+  const walk = (nodes, level) => {
+    if (!Array.isArray(nodes)) return;
+    for (const node of nodes) {
+      if (!node || typeof node !== 'object') continue;
+      const title = String(node.title ?? '').replace(/[\r\n]+/g, ' ').trim();
+      const page = Number(node.destpageposfrom1);
+      const physical = Number.isInteger(page) && page >= 1 ? page : null;
+      entries.push({
+        level,
+        title,
+        page: physical,
+        label: physical !== null ? (labels.get(physical) ?? null) : null,
+      });
+      if (Array.isArray(node.kids) && node.kids.length > 0) walk(node.kids, level + 1);
+    }
+  };
+  walk(parsed?.outlines, 1);
+  return entries;
+}
 
 /**
  * 文字层采样页：**首页 / 中间页 / 末页**，按这个顺序去重。

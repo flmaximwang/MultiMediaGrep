@@ -103,6 +103,7 @@ flowchart TD
 | `segment`（秒） | ✅ | ✅ | ❌ | `segment is not applicable to document media.` |
 | `pages` | ❌ | ❌ | ✅ | `pages is not applicable to video media. Use "start" and "end" (seconds) instead.` |
 | `ocr` | ❌ | ❌ | ✅ | `ocr is not applicable to video media. Only documents have a page text layer or page images to OCR; video and audio use subtitles/transcript instead.` |
+| `view` | ✅ | ✅ | ✅ | —（三种媒体的目录规则相同：PDF 书签 / 章节；视频/录音没有章节时不生成目录） |
 | `query` | ✅ | ✅ | ✅ | — |
 | `max` | ✅ | ✅ | ✅ | — |
 | `includeFrame` | ✅ | ❌ | ✅ | `includeFrame is not applicable to audio media. There are no frames to show.` |
@@ -353,6 +354,13 @@ For audio it also reports a quick health check — average level, speech ratio a
 call on it. A recording that is effectively silent is reported as such and is never sent to ASR
 (no hallucinated transcript).
 
+It also reports the file's own outline when it has one: PDF bookmarks (each entry carries the
+PHYSICAL page number — the same 1-based page numbers media_overview accepts — and, when the PDF
+defines page labels, the printed label too, e.g. "xii") and chapter markers in video/audio files
+(title + start/end timestamps). The text output shows at most 2 levels / 60 entries; the full
+outline is in structuredContent.outline. Use it to pick a range instead of reading the whole
+file. (内置目录：PDF 书签带物理页与打印页标签；视频/音频列出章节时间戳。文本最多 2 层 / 60 条)
+
 This server never downloads anything and never calls an LLM: you always pass a local absolute
 path, and it only prepares images and text for your own model to look at.
 ```
@@ -391,6 +399,18 @@ path, and it only prepares images and text for your own model to look at.
 | `audioHealth` | object \| null | 音频体检结果（video/audio 才有；见 §4.3.1） | — |
 | `pageCount` | integer \| null | 总页数（document） | 页 |
 | `hasTextLayer` | boolean \| null | 是否已有文字层（document；**采样**首页/中间页/末页的结论，见 §4.3.2；本机没有文字抽取器时为 `null` = 判不出来） | — |
+| `outline` | object \| null | 内置目录（9z5.33）：PDF 书签或视频/录音章节；没有目录时 `available = false` 且 `reason` 写明原因。stub 后端 / 没有目录概念的后端可能为 `null` | — |
+| `outline.available` | boolean | 是否有内置目录 | — |
+| `outline.source` | `"pdf-bookmarks"` \| `"chapters"` \| null | 目录来源 | — |
+| `outline.total` | integer | 完整目录的条目总数（不是 probe 文本展示的条数） | 条 |
+| `outline.entries[]` | array | **完整**目录，不截断（probe 文本最多 2 层 / 60 条） | — |
+| `outline.entries[].title` | string | 条目标题 | — |
+| `outline.entries[].level` | integer | 书签层级，从 1 开始（PDF 书签才有） | — |
+| `outline.entries[].page` | integer \| null | **物理**页码（与 `pages` 参数同一口径；PDF 书签才有） | 页 |
+| `outline.entries[].label` | string \| null | 打印页标签（PDF 定义了 `/PageLabels` 时才有，如 `"xii"`、`"37"`） | — |
+| `outline.entries[].startMs` / `endMs` | integer | 章节起止（video/audio） | ms |
+| `outline.entries[].startSec` / `endSec` | number | 同上，秒 | s |
+| `outline.reason` | string \| null | 没有目录 / 读不了目录的人话原因（如 qpdf 未安装、文件没有章节） | — |
 | `subtitleTracks` | array | 内嵌字幕轨 | — |
 | `subtitleTracks[].index` | integer | 轨道序号 | — |
 | `subtitleTracks[].language` | string \| null | 语言标签（BCP-47，可能为 null） | — |
@@ -533,6 +553,30 @@ text layer: looks unreliable (96% of word tokens are isolated single letters; 34
 - `transcript source:` 是实际会走的来源：`text`（原生文字层 / 纯文本）、`ocr`（只有 OCR）、`mixed`（文字层与 OCR 都可用，逐页路由可能混合）、`none`。
 - 旧输出的 `ocr: unavailable` 与 `transcript source: ocr` 不会再同时出现：前者描述角色可用性，后者描述实际文字来源，二者不是一回事。
 
+**内置目录（9z5.33）**——PDF 书签 / 视频章节存在时，probe 在 `transcript` 行之后列出目录：
+
+```
+outline: 24 PDF bookmarks — use the outline to pick a range
+- Engineered human Argonaute 2 for targeted C-to-U RNA base editing  — page 1
+  - Loop-inducing gRNAs enable RNA editing by AGO2–APOBEC3A (A3A) fusions  — page 2 (label "ii")
+  ...
+  +N more (full outline in structuredContent.outline)
+How to read: use the outline to pick a range, e.g. media_overview({ path, pages: "1-5" }).
+```
+
+视频 / 录音的章节用时间戳，提示改成 `start` / `end`：
+
+```
+outline: 4 chapters — use the outline to pick a range
+- Opening  00:00.000-00:02.000
+- Build Up  00:02.000-00:05.000
+How to read: use the outline to pick a range, e.g. media_overview({ path, start: 0, end: 2 }).
+```
+
+- 文本最多 **2 层 / 60 条**，其余写 `+N more`；完整目录永远在 `structuredContent.outline`（overview 还写进 `manifest.json`）。
+- PDF 条目给**物理页码**（`pages` 参数接受的就是物理页）；PDF 定义了 `/PageLabels` 时再给打印标签：`— page 4 (label "ii")`。读取用 qpdf（`pdftotext` / `pdfinfo` 读不了 outline）；qpdf 未安装时输出 `outline: none — PDF bookmarks cannot be read: qpdf is not installed (...)`，不会静默省略。
+- 没有书签的 PDF 输出 `outline: none — this PDF has no bookmarks (no outline).`；视频/录音没有章节时输出 `chapters: none — ...`。
+
 ### 4.5 错误行为
 
 - `path` 校验见 §2.4。
@@ -605,11 +649,26 @@ drops a whole page silently: pages that could not be represented are listed, and
 over-long unit is truncated with a trailing "…[+N chars]". Read content.md when you need the
 complete text.
 
+VIEW — the view parameter controls the inline text (default "auto"). Many files carry a real
+outline: PDF bookmarks, or chapter markers in video/audio. (1) "auto": if the requested range
+fits, you get the full text; if it does not fit and the file has an outline, the outline comes
+first (page numbers for PDFs, timestamps for chapters) and the rest of the budget goes to the
+text preview; if there is no outline, you get the normal skim/sampled preview. A document
+without bookmarks gets an outline GENERATED FROM ITS HEADINGS when the range has at least 5
+headings, labelled "outline: generated from headings" (best-effort). (2) "outline": return only
+the outline — generated from headings for a document without bookmarks; for video/audio without
+chapters you get an explicit "no chapters" message and NOTHING is generated, because this server
+never invents an outline from content. In that case read the overview (or a start/end window)
+and write your own outline from the time-aligned text and storyboard grids. (3) "text": ignore
+the outline and force the text pipeline. The full outline is always in structuredContent.outline
+and, for an overview that writes an export, in manifest.json.
+(目录：view:auto 放不下时先出目录；view:outline 只出目录；view:text 只出文本。视频/音频没有章节时不生成目录)
+
 Always call media_probe first: it tells you how long the file is, whether a subtitle source
-exists, and which transcript source applies, for free. Long media must be narrowed with
-start/end (video, audio) or pages (document) — one giant grid of a two-hour film gives you
-illegible cells and spoils the ending. Follow the continuation hint in the result to page
-through the rest.
+exists, which transcript source applies, and whether the file carries a built-in outline
+(PDF bookmarks / chapters), for free. Long media must be narrowed with start/end (video, audio)
+or pages (document) — one giant grid of a two-hour film gives you illegible cells and spoils the
+ending. Follow the continuation hint in the result to page through the rest.
 ```
 
 ### 5.2 参数
@@ -624,6 +683,7 @@ through the rest.
 | `segment` | integer | ❌ | `300` | video, audio | 只给 `start` 不给 `end` 时的窗口长度（秒，30–3600） |
 | `pages` | string | ❌ | 全文 | document | 页码范围，如 `"3-10,15"` |
 | `ocr` | `"auto"` \| `"force"` | ❌ | `"auto"` | document | 页文字的获取方式。`"auto"`：有文字层就用文字层，只有没文字层的页走 OCR；`"force"`：请求的页**无论有没有文字层**都交给 OCR provider 重新识别，结果 `textOrigin = "ocr"`、页标 `(ocr)`，并单独缓存（不覆盖 auto 结果）。用在 probe 说 `text layer: looks unreliable` 时。需要已配置 OCR provider（`MMGREP_OCR_PROVIDER`），否则报 `PROVIDER_NOT_CONFIGURED`；video / audio 传它报 `INVALID_ARGUMENT` |
+| `view` | `"auto"` \| `"outline"` \| `"text"` | ❌ | `"auto"` | 全部 | 内联文字的内容。`"auto"`：请求范围放得下就给全文；放不下且有目录（内置 PDF 书签 / 章节，或文档 blocks 里 ≥5 个 heading）时先出目录，余量给文本预览；没有目录时走 skim / 抽样。`"outline"`：只出目录（文档无书签时从 heading 生成；视频/录音无章节时只给「无章节」说明，不生成内容）。`"text"`：忽略目录，强制走文本管线。完整目录始终在 `structuredContent.outline` 与 `manifest.json` |
 | `cells` | integer | ❌ | video `9` / document `6` | video, document | 每张拼图的格数（video=镜头格，document=页缩略图），1–16 |
 | `images` | integer | ❌ | `2` | video, document, audio（仅 `0`） | 返回几张拼图，`0`–`4`；`0` = 零像素纯文本模式（不出图，只回文字，`budget` 全零） |
 | `maxEdge` | integer | ❌ | `1280` | video, document | 单张图最长边（px），上限 1600 |
@@ -638,6 +698,8 @@ through the rest.
 |---|---|---|---|
 | `mediaType` | string | 媒体类型 | — |
 | `path` | string | 绝对路径 | — |
+| `view` | `"auto"` \| `"outline"` \| `"text"` | 本次调用的 `view`（缺省为 `auto`） | — |
+| `outline` | object | 本次的完整目录（PDF 书签 / 章节 / 从 heading 生成）；`available=false` 时 `entries=[]` 且 `reason` 说明原因。字段同 §4.3 的 `outline`，另加 `generated`（是否由 heading 生成） | — |
 | `window.startMs` / `window.endMs` | integer | 本次覆盖的时间窗 | ms |
 | `window.startSec` / `window.endSec` | number | 同上，秒 | s |
 | `window.pages` | integer[] \| null | 本次覆盖的页码（document） | 页 |
@@ -674,8 +736,8 @@ through the rest.
 | `fullText.manifestJson` | string | `manifest.json` 绝对路径 | — |
 | `fullText.documentJson` | string \| null | `document.json` 绝对路径（cangjie 契约产物；不产出时为 null） | — |
 | `fullTextReason` | string \| null | 全文落盘失败的人话原因（`fullText = null` 时给出） | — |
-| `truncated` | boolean | 内联清单是否是预览（`whole` 以外的 skim / sampled 都是预览，不是全文） | — |
-| `preview.mode` | `"whole"` \| `"skim"` \| `"sampled"` | `whole` = 请求范围整体内联（完整）；`skim` = 文档按契约 v2 blocks 速读（全部 heading + 段首句）；`sampled` = 没有 blocks 时的完整单元等距抽样 | — |
+| `truncated` | boolean | 内联清单是否是预览（`whole` 以外的 skim / sampled / outline 都是预览，不是全文） | — |
+| `preview.mode` | `"whole"` \| `"skim"` \| `"sampled"` \| `"outline"` | `whole` = 请求范围整体内联（完整）；`skim` = 文档按契约 v2 blocks 速读（全部 heading + 段首句）；`sampled` = 完整单元等距抽样；`outline` = `view:"outline"` 只出目录（没有目录时给「无目录 / 无章节」说明） | — |
 | `preview.units` | integer | 实际内联的单元数（skim 模式下 heading / 段首句 / 表格占位各算一个；其它模式文档 = 句子，视频/录音 = 转写段落） | 条 |
 | `preview.totalUnits` | integer | 请求范围内的句子总数（文档；skim 与 sampled 同口径，逐页标注里的 N 也是它）。视频/录音为转写段落总数 | 条 |
 | `preview.skimUnits` | integer | skim 模式下可用的 skim 单元总数（heading + 段首句 + 表格占位）；其它模式不出现 | 条 |
@@ -683,6 +745,9 @@ through the rest.
 | `preview.sampled` | boolean | skim 模式下是否有 skim 单元被抽样掉；其它模式不出现 | — |
 | `preview.headingsSampled` | boolean | skim 模式下是否对 heading 本身做了抽样（只有全部 heading 都放不下时才为 `true`） | — |
 | `preview.notRepresented` | integer[] | 没有被内联任何单元的页码（文档；其它媒体为空数组） | 页 |
+| `preview.outlineSource` | `"pdf-bookmarks"` \| `"chapters"` \| `"headings"` \| `"none"` | 本次目录来源（有目录时出现） | — |
+| `preview.outlineInlined` | integer | 实际写进内联文本的目录条目数（目录放不下时小于总数；`view:"outline"` 时也受上限约束） | 条 |
+| `preview.outlineTotal` | integer | 目录条目总数（完整目录在 `structuredContent.outline`） | 条 |
 | `continuation` | object \| null | 续读提示 | — |
 | `continuation.nextStartMs` / `nextStartSec` | integer / number | 下一段起点（video/audio） | ms / s |
 | `continuation.nextPage` | integer | 下一批起始页（document） | 页 |
@@ -790,6 +855,27 @@ OCR 的核对 note **只在真的有 OCR 页时出现**，不再无条件写给�
 note: complete text of pages 1-2 (nothing omitted).
 full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
+
+**目录优先（9z5.33）**——放不下且有目录时，`view:"auto"` 先给目录，余量才给文本；`view:"outline"` 只给目录：
+
+```
+<overview path="/abs/book.pdf" type="document" pages="1-28" source="text" />
+outline: 24 PDF bookmarks — full outline in structuredContent.outline and manifest.json
+- Engineered human Argonaute 2 ...  — page 1
+  - Loop-inducing gRNAs ...  — page 2
+  ...
+hint: pick a range with pages, e.g. media_overview({ path, pages: "1-5" }).
+[page 1  ] (text)  「……」
+...
+preview: skim — ...
+note: complete text ... (只有 tier 1 才允许说完整)
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
+```
+
+- 有目录时 `preview.outlineSource` / `outlineInlined` / `outlineTotal` 说明目录内联了多少条。
+- 文档目录来自 heading 时头部标 `outline: generated from headings`（best-effort；builtin 启发式 blocks 可能把结构判错）。
+- 视频/录音有章节时用 `start`/`end` 提示；没有章节时 `view:"outline"` 只回一句「no chapters」，**不生成**任何目录内容。
+- `view:"text"` 跳过目录；`view:"auto"` 在请求范围整体放得下时也给全文（tier 1 优先于目录）。
 
 **文档预览的三层（9z5.32）**：whole（整体放得下）→ skim（契约 v2 blocks 可用时）→ sampled（没有 blocks 的旧路径，或 skim 也放不下时）。视频 / 录音**没有** skim，直接 whole → sampled。
 
@@ -1311,6 +1397,16 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
   },
   "window": { "startMs": 0, "endMs": 600000, "startSec": 0, "endSec": 600 },
   "pages": null,
+  "outline": {
+    "available": true,
+    "source": "pdf-bookmarks",
+    "generated": false,
+    "total": 24,
+    "entries": [
+      { "level": 1, "title": "1. Introduction", "page": 1, "label": null }
+    ],
+    "reason": null
+  },
   "transcript": {
     "source": "asr",
     "origin": "asr",
@@ -1353,6 +1449,7 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
 | `document.version_id` | 内容版本 ID = `sha256:<hex>`，**内容变了就变** |
 | `document.element_count` | `document.json` 里的 element 数量 |
 | `counts` | 各类产物计数：`segments`（转写段落）、`elements`（document.json 元素）、`images`（图片数）、`pages`（页数，document 才有） |
+| `outline` | **完整**内置目录（PDF 书签 / 视频章节），字段与 §5.3 `structuredContent.outline` 相同；从 heading 生成的目录也写在这里（`source: "headings"`、`generated: true`）。没有目录时是 `available: false` 的对象，`reason` 说明原因 |
 | `source.mediaType` | **真实**来源媒体类型（`video`/`audio`/`document`）。这是本项目自己的口径，与 cangjie 的 `media_type` 枚举不是一回事（见 §9.4 的偏差说明） |
 | `source.sha256` | 源文件内容哈希，即缓存主键 |
 
@@ -1610,6 +1707,10 @@ READING ORDER
    output of a bad OCR pass: call media_overview({ path, ocr: "force" }) to re-recognize the
    requested pages with the OCR provider (this needs MMGREP_OCR_PROVIDER configured). Forced
    pages are tagged "ocr" and cached separately from the default "auto".
+   The probe also shows the file's own outline when it has one: PDF bookmarks (PHYSICAL page
+   numbers — the same 1-based numbers media_overview accepts — plus the printed page label
+   when the PDF defines one) and chapter markers in video/audio files (title + start/end
+   timestamps). Use it to pick a range instead of reading the whole file.
 2. media_overview — the main read. Video: numbered storyboard grids plus a time-aligned text
    index. Audio: a timestamped transcript. Document: page thumbnails plus page text.
    The full text of the requested range is written to disk, and the result text ends with a
@@ -1625,6 +1726,13 @@ READING ORDER
    fit — is sampled evenly from complete units, with a "preview: sampled ..." line naming what
    was inlined and the pages/ranges not represented. In a skim that does not fit, all headings
    are kept and sentences are sampled; only when even the headings do not fit are they sampled.
+   A file's own outline (PDF bookmarks / video-audio chapters) is another starting point.
+   With view "auto" (default), a range that fits still returns the full text; when it does not
+   fit and an outline exists, the outline comes first and the rest of the budget goes to the
+   text preview. A document without bookmarks gets an outline generated from its headings
+   (at least 5), labelled "outline: generated from headings". view "outline" returns only the
+   outline; for video/audio without chapters it says "no chapters" and generates nothing —
+   write your own outline from the overview in that case. view "text" forces the text pipeline.
 3. media_zoom — only for parts that matter. One frame of a video (at, or a start/end window)
    or one page of a document, optionally cropped.
 4. media_locate — "where was X said" (timestamp) or "on which page" (page number). Text only
@@ -1745,7 +1853,7 @@ provider 无法保证原字符时必须返回 `textOrigin = "ocr"` / `"unknown"`
 |---|---|---|---|---|
 | `MMGREP_MAX_IMAGE_TOKENS` | integer | `4000` | 单次调用的图片 token 软预算（§10.3） | 用默认值。自动模式保证不超；显式模式超出只警告 |
 | `MMGREP_MAX_IMAGE_EDGE` | integer | `1600` | 单张图最长边的全局上限（§10.2） | 用默认值。请求超过它 → `BUDGET_EXCEEDED` |
-| `MMGREP_MAX_TEXT_INLINE_CHARS` | integer | `24000` | 内联文本预览的字符上限（含 header / notes / `full text:` 行）。超出时：文档有契约 v2 blocks 先走 skim（全部 heading + 段首句，每页 `[page N · skim: X of Y sentences]`），skim 仍超出时 heading 全保留、句子等距抽样；没有 blocks 或视频/录音按完整单元等距抽样。两种情况都写明未覆盖范围。HTTP 模式下可被请求头 `x-mmgrep-max-text-inline-chars` 按客户端覆盖（硬上限 `200000`） | 用默认值。**全文永远落盘，不受此限制** |
+| `MMGREP_MAX_TEXT_INLINE_CHARS` | integer | `24000` | 内联文本预览的字符上限（含 header / notes / `full text:` 行）。超出时：有内置目录（PDF 书签 / 章节）或文档 blocks 里 ≥5 个 heading 时，`view:"auto"` 先出目录（最多占一半预算），余量再走文档 skim（全部 heading + 段首句，每页 `[page N · skim: X of Y sentences]`）/ 完整单元等距抽样；没有目录时直接 skim / 抽样。`view:"outline"` 只出目录。两种情况都写明未覆盖范围。HTTP 模式下可被请求头 `x-mmgrep-max-text-inline-chars` 按客户端覆盖（硬上限 `200000`） | 用默认值。**全文永远落盘，不受此限制** |
 | `MMGREP_MAX_CONCURRENCY` | integer | `2` | 单次调用内并行跑的 ffmpeg / 渲染任务数 | 用默认值。机器弱时调成 `1` |
 | `MMGREP_AUDIO_MIN_DBFS` | number | `-35` | 音频体检：判定「有有效声音」的平均音量下限（dBFS）。低于它 → `too-quiet`，**不跑 ASR** | 用默认值。录音确实偏小声时调低（如 `-45`） |
 | `MMGREP_AUDIO_MIN_SPEECH_RATIO` | number | `0.05` | 音频体检：判定「有有效声音」的非静音时长占比下限（0–1） | 用默认值。与 `MMGREP_AUDIO_MIN_DBFS` 是 **或** 的关系，任一不满足即判 `too-quiet` |

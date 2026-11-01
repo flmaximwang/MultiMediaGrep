@@ -187,9 +187,11 @@ async function withClient(workspace, backends, fn) {
   }
 }
 
+// 9z5.33：view:"auto" 在文档有 >= 5 个 heading 时会先出目录；本文件测的是
+// .32 的 skim 层本身，所以显式用 view:"text" 走文本管线。
 const overview = (client, workspace, args = {}) => client.callTool({
   name: 'media_overview',
-  arguments: { path: workspace.pdf, images: 0, ...args },
+  arguments: { path: workspace.pdf, images: 0, view: 'text', ...args },
 });
 
 /* ------------------------------------------------------------------ *

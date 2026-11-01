@@ -1,0 +1,33 @@
+{
+  "id": "sample-chapters",
+  "kind": "video",
+  "file": "sample-chapters.mp4",
+  "generator": "fixtures/generate.mjs",
+  "derivedFrom": "sample-scene.mp4",
+  "durationMs": 12000,
+  "width": 640,
+  "height": 360,
+  "fps": 24,
+  "chapters": [
+    {
+      "title": "Opening",
+      "startMs": 0,
+      "endMs": 2000
+    },
+    {
+      "title": "Build Up",
+      "startMs": 2000,
+      "endMs": 5000
+    },
+    {
+      "title": "Main Section",
+      "startMs": 5000,
+      "endMs": 9000
+    },
+    {
+      "title": "Wrap Up",
+      "startMs": 9000,
+      "endMs": 12000
+    }
+  ]
+}

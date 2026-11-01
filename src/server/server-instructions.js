@@ -17,6 +17,10 @@ READING ORDER
    output of a bad OCR pass: call media_overview({ path, ocr: "force" }) to re-recognize the
    requested pages with the OCR provider (this needs MMGREP_OCR_PROVIDER configured). Forced
    pages are tagged "ocr" and cached separately from the default "auto".
+   The probe also shows the file's own outline when it has one: PDF bookmarks (PHYSICAL page
+   numbers — the same 1-based numbers media_overview accepts — plus the printed page label
+   when the PDF defines one) and chapter markers in video/audio files (title + start/end
+   timestamps). Use it to pick a range instead of reading the whole file.
 2. media_overview — the main read. Video: numbered storyboard grids plus a time-aligned text
    index. Audio: a timestamped transcript. Document: page thumbnails plus page text.
    The full text of the requested range is written to disk, and the result text ends with a
@@ -32,6 +36,13 @@ READING ORDER
    fit — is sampled evenly from complete units, with a "preview: sampled ..." line naming what
    was inlined and the pages/ranges not represented. In a skim that does not fit, all headings
    are kept and sentences are sampled; only when even the headings do not fit are they sampled.
+   A file's own outline (PDF bookmarks / video-audio chapters) is another starting point.
+   With view "auto" (default), a range that fits still returns the full text; when it does not
+   fit and an outline exists, the outline comes first and the rest of the budget goes to the
+   text preview. A document without bookmarks gets an outline generated from its headings
+   (at least 5), labelled "outline: generated from headings". view "outline" returns only the
+   outline; for video/audio without chapters it says "no chapters" and generates nothing —
+   write your own outline from the overview in that case. view "text" forces the text pipeline.
 3. media_zoom — only for parts that matter. One frame of a video (at, or a start/end window)
    or one page of a document, optionally cropped.
 4. media_locate — "where was X said" (timestamp) or "on which page" (page number). Text only
