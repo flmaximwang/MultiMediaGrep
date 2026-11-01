@@ -27,6 +27,7 @@ import {
   validatePath,
   validateTimeRange,
 } from '../media/interface.js';
+import { splitSentences } from '../media/sentences.js';
 import { guardToolHandler } from './errors.js';
 import {
   DEFAULT_MAX_IMAGE_TOKENS,
@@ -72,10 +73,9 @@ export const OVERVIEW_DESCRIPTION = `Build an overview of a local media file so 
 
 What you get depends on the media:
 - video    : one or more numbered storyboard grids (each cell carries its cell number) plus a
-             time-aligned text index of every cell
+             time-aligned text index of the cells
 - audio    : a timestamped transcript, segment by segment
-- document : a grid of page thumbnails plus the text of each page, when a document parser is
-             configured
+- document : a grid of page thumbnails plus page text, when a document parser is configured
 
 Pass images: 0 for a text-only, zero-pixel overview: no grid is rendered and no frame is
 decoded (a video costs no ffmpeg work at all), so you get only the transcript — or the page
@@ -95,10 +95,21 @@ The storyboard grid is for FINDING things, not for reading them: cells are small
 inside a cell is usually unreadable. To read text on screen, call media_zoom on that moment
 and read the cropped single frame.
 
-The full text is NOT inlined. It is written to disk and the returned paths point at it:
-content.md (readable), segments.jsonl (one segment per line, machine-readable), manifest.json
-(what was produced and how). Read those files section by section and summarise them in
-chunks yourself — do not ask for the same range again just to get more inline text.
+The full text is NOT inlined. It is written to disk, and the text of the result ends with a line
+like "full text: /abs/path/content.md (segments.jsonl, manifest.json in the same directory)".
+That absolute path is what you read: content.md is the readable full text, segments.jsonl has
+one segment per line, manifest.json records what was produced and how. Read those files section
+by section and summarise them in chunks yourself — do not ask for the same range again just to
+get more inline text. If the export could not be written, the line reads
+"full text: NOT written — <reason>" instead.
+
+The inline text is a PREVIEW. It is complete when the requested range fits (the result says
+"complete text ... nothing omitted"); otherwise it is SAMPLED from complete units — document
+sentences, video/audio transcript segments — and the result carries a line like
+"preview: sampled 84 of 312 sentences across pages 1-28; not represented: 2-6, 8-12". Sampling
+never drops a whole page silently: every requested page gets at least one unit when the budget
+allows, pages that could not be represented are listed, and a single over-long unit is
+truncated with a trailing "…[+N chars]". Read content.md when you need the complete text.
 
 Always call media_probe first: it tells you how long the file is, whether a subtitle source
 exists, and which transcript source applies, for free. Long media must be narrowed with
@@ -593,27 +604,400 @@ function padLabel(label, width = 9) {
   return label.padEnd(width);
 }
 
-/**
- * 内联清单的长度上限（MMGREP_MAX_TEXT_INLINE_CHARS）：在段落/格边界截断。
- * 全文始终落盘，不受这个上限影响（契约 §12.5）。
+/* ---------------- 内联预览（契约 §12.5，9z5.20） ----------------
+ *
+ * 内联上限（MMGREP_MAX_TEXT_INLINE_CHARS）之内只放**预览**，全文始终落盘：
+ *   tier 1 whole  请求范围整体放得下 → 原样全量返回；
+ *   tier 2 skim   标题 + 段首句（9z5.32 实现，这里只留钩子）；
+ *   tier 3 sample 按**完整单元**（文档 = 句子，视频/录音 = 转写段落）等距抽样。
+ * 旧实现按「行」截断且一超限就 break：文档一页一行，于是超限页和它后面的所有页
+ * 一起消失，而文本末尾还宣称「包含每一页」。这里改成按单元抽样的原因是：
+ * 单个超长单元可以硬截断（…[+N chars]），但绝不静默丢掉整页。
  */
-function truncateLines(headerLines, bodyLines, maxChars) {
-  const limit = Number.isFinite(maxChars) && maxChars > 0 ? maxChars : DEFAULT_MAX_TEXT_INLINE_CHARS;
-  const kept = [];
-  let length = 0;
-  for (const line of [...headerLines, ...bodyLines]) {
-    const addition = kept.length === 0 ? line.length : line.length + 1;
-    if (length + addition > limit) break;
-    kept.push(line);
-    length += addition;
+
+/** 单个预览单元的硬上限：min(正文预算 / 4, 2000) 字符 */
+const PREVIEW_UNIT_MAX_CHARS = 2000;
+/** 给预览说明（抽样数 / 未覆盖范围 / 截断提示）预留的字符数，先留再分配正文 */
+const PREVIEW_NOTE_RESERVE = 420;
+/** not represented 页码区间串的最大长度；超了压缩成 "+ N more ranges" */
+const PREVIEW_RANGE_LIST_MAX_CHARS = 140;
+
+function inlineCharLimit(value) {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : DEFAULT_MAX_TEXT_INLINE_CHARS;
+}
+
+/** 单元硬截断：尾部标 …[+N chars]（表格、参考文献、无标点 CJK 会踩到） */
+function capUnitText(text, cap) {
+  const value = String(text ?? '');
+  if (!Number.isFinite(cap) || cap <= 0 || value.length <= cap) {
+    return { text: value, truncated: false };
   }
-  const dropped = headerLines.length + bodyLines.length - kept.length;
-  return {
-    text: kept.join('\n'),
-    truncated: dropped > 0,
-    keptCount: Math.max(0, kept.length - headerLines.length),
-    dropped,
+  return { text: `${value.slice(0, cap)}…[+${value.length - cap} chars]`, truncated: true };
+}
+
+/**
+ * 预览单元：文档把每页正文切成句子；视频/录音一个转写段落就是一个单元。
+ * `order` 是单元在全文里的位置，用来在渲染时判断相邻单元之间有没有省略。
+ */
+function buildPreviewUnits(mediaType, segments) {
+  if (mediaType !== 'document') {
+    return segments.map((segment, index) => ({
+      order: index,
+      page: null,
+      source: segment.source ?? 'none',
+      origin: segment.origin ?? 'none',
+      text: String(segment.text ?? ''),
+      segment,
+    }));
+  }
+  const units = [];
+  for (const segment of segments) {
+    const page = segment.page ?? segment.index;
+    for (const sentence of splitSentences(segment.text)) {
+      units.push({
+        order: units.length,
+        page,
+        source: segment.source ?? 'none',
+        origin: segment.origin ?? 'none',
+        text: sentence,
+        segment,
+      });
+    }
+  }
+  return units;
+}
+
+/** 正文渲染：文档按页聚合（一页一行），视频/录音一行一个单元，省略处插 … */
+function renderPreviewBody({ mediaType, units, textOnly }) {
+  if (units.length === 0) return '';
+  if (mediaType === 'document') {
+    const byPage = new Map();
+    for (const unit of units) {
+      if (!byPage.has(unit.page)) byPage.set(unit.page, []);
+      byPage.get(unit.page).push(unit);
+    }
+    const lines = [];
+    for (const [page, list] of byPage) {
+      const parts = [];
+      list.forEach((unit, index) => {
+        if (index > 0 && unit.order !== list[index - 1].order + 1) parts.push('…');
+        parts.push(quoteBySource(unit.renderText, unit.source));
+      });
+      const source = list[0].source ?? 'none';
+      lines.push(`${padLabel(`[page ${page}`)}] (${source})  ${parts.join(' ')}`.trimEnd());
+    }
+    return lines.join('\n');
+  }
+  const lines = [];
+  units.forEach((unit, index) => {
+    if (index > 0 && unit.order !== units[index - 1].order + 1) lines.push('…');
+    lines.push(formatOverviewSegmentLine({ ...unit.segment, text: unit.renderText }, mediaType, textOnly));
+  });
+  return lines.join('\n');
+}
+
+/** 升序索引里等距取 m 个（含首尾）；m >= n 时全取 */
+function evenlySpacedIndices(n, m) {
+  if (m >= n) return Array.from({ length: n }, (_, i) => i);
+  if (m <= 1) return [0];
+  const picked = new Set();
+  for (let i = 0; i < m; i += 1) picked.add(Math.round((i * (n - 1)) / (m - 1)));
+  return [...picked].sort((a, b) => a - b);
+}
+
+/** 升序页码 → 压缩区间 ["2-6", "8"] */
+function compressPageRanges(numbers) {
+  const sorted = [...new Set(numbers)].sort((a, b) => a - b);
+  if (sorted.length === 0) return [];
+  const ranges = [];
+  let start = sorted[0];
+  let prev = sorted[0];
+  for (let i = 1; i < sorted.length; i += 1) {
+    if (sorted[i] === prev + 1) {
+      prev = sorted[i];
+      continue;
+    }
+    ranges.push(start === prev ? `${start}` : `${start}-${prev}`);
+    start = sorted[i];
+    prev = sorted[i];
+  }
+  ranges.push(start === prev ? `${start}` : `${start}-${prev}`);
+  return ranges;
+}
+
+/** 压缩区间串；太长时只列前几段，其余写成 "+ N more ranges"（9z5.20 要求） */
+function formatRangeList(numbers, maxChars = PREVIEW_RANGE_LIST_MAX_CHARS) {
+  const ranges = compressPageRanges(numbers);
+  let out = '';
+  for (let i = 0; i < ranges.length; i += 1) {
+    const piece = `${out ? ', ' : ''}${ranges[i]}`;
+    if (out && out.length + piece.length > maxChars) {
+      return `${out}, + ${ranges.length - i} more ranges`;
+    }
+    out += piece;
+  }
+  return out;
+}
+
+function pagesLabel(pages) {
+  if (!Array.isArray(pages) || pages.length === 0) return 'the requested pages';
+  if (pages.length === 1) return `page ${pages[0]}`;
+  return `pages ${formatPageRangeLabel(pages)}`;
+}
+
+/** tier 1 才允许说「完整」；非 tier 1 必须说清抽样与未覆盖范围 */
+function buildCompletenessNote({ mediaType, pages }) {
+  if (mediaType === 'document') return `note: complete text of ${pagesLabel(pages)} (nothing omitted).`;
+  return 'note: complete text of this window (nothing omitted).';
+}
+
+function buildPreviewNote({ mediaType, preview, pages, window, cap, anyTruncated }) {
+  const tail = anyTruncated ? `; units longer than ${cap} chars end with …[+N chars]` : '';
+  if (mediaType === 'document') {
+    const coverage = preview.notRepresented.length > 0
+      ? `not represented: ${formatRangeList(preview.notRepresented)}`
+      : 'every requested page is represented';
+    return `preview: sampled ${preview.units} of ${preview.totalUnits} sentences across ${pagesLabel(pages)}; ${coverage}${tail}.`;
+  }
+  const windowLabel = window
+    ? `${fixed2(window.startSec)}-${fixed2(window.endSec)} s`
+    : 'this window';
+  const coverage = preview.units >= 2 ? '; first and last are included' : '';
+  return `preview: sampled ${preview.units} of ${preview.totalUnits} segments across ${windowLabel}${coverage}${tail}.`;
+}
+
+/** 文档抽样：先保证「每页至少一个单元」；预算不够就等距选页并列出未覆盖页 */
+function selectDocumentUnits(units, requestedPages, target) {
+  const cap = Math.max(1, Math.min(Math.floor(target / 4), PREVIEW_UNIT_MAX_CHARS));
+  const capped = units.map((unit) => {
+    const { text, truncated } = capUnitText(unit.text, cap);
+    return { ...unit, renderText: text, unitTruncated: truncated };
+  });
+
+  const byPage = new Map();
+  for (const unit of capped) {
+    if (unit.page === null || unit.page === undefined) continue;
+    if (!byPage.has(unit.page)) byPage.set(unit.page, []);
+    byPage.get(unit.page).push(unit);
+  }
+  const requested = Array.isArray(requestedPages) && requestedPages.length > 0
+    ? requestedPages
+    : [...byPage.keys()].sort((a, b) => a - b);
+  const pagesWithUnits = requested.filter((page) => (byPage.get(page)?.length ?? 0) > 0);
+  if (pagesWithUnits.length === 0) {
+    return { units: [], cap, notRepresented: [], anyTruncated: false };
+  }
+
+  const pageCost = (page) => {
+    const first = byPage.get(page)[0];
+    return 10 + String(page).length + first.renderText.length + 4 + 1;
   };
+  const costForPageCount = (m) => evenlySpacedIndices(pagesWithUnits.length, m)
+    .reduce((sum, index) => sum + pageCost(pagesWithUnits[index]), 0);
+
+  let pageCount = 1;
+  if (costForPageCount(pagesWithUnits.length) <= target) {
+    pageCount = pagesWithUnits.length;
+  } else {
+    let lo = 1;
+    let hi = pagesWithUnits.length;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (costForPageCount(mid) <= target) lo = mid;
+      else hi = mid - 1;
+    }
+    pageCount = lo;
+  }
+
+  const selectedPages = evenlySpacedIndices(pagesWithUnits.length, pageCount)
+    .map((index) => pagesWithUnits[index]);
+  const selectedOrders = new Set();
+  const cursors = new Map();
+  let spent = costForPageCount(pageCount);
+  for (const page of selectedPages) {
+    selectedOrders.add(byPage.get(page)[0].order);
+    cursors.set(page, 1);
+  }
+
+  // 剩余预算按「每页第 r 个单元」逐轮补充，保持页内均匀，直到预算用完
+  let progressed = true;
+  while (progressed) {
+    progressed = false;
+    for (const page of selectedPages) {
+      const list = byPage.get(page);
+      let cursor = cursors.get(page) ?? 0;
+      while (cursor < list.length) {
+        const delta = list[cursor].renderText.length + 4;
+        if (spent + delta > target) break;
+        selectedOrders.add(list[cursor].order);
+        spent += delta;
+        cursor += 1;
+        progressed = true;
+      }
+      cursors.set(page, cursor);
+    }
+  }
+
+  const selected = capped.filter((unit) => selectedOrders.has(unit.order));
+  const represented = new Set(selected.map((unit) => unit.page));
+  return {
+    units: selected,
+    cap,
+    // 包括「整页没有文字」的页：它们同样没有出现在预览里（agent 可以据此去 zoom 看画面）
+    notRepresented: requested.filter((page) => !represented.has(page)),
+    anyTruncated: selected.some((unit) => unit.unitTruncated),
+  };
+}
+
+/** 视频/录音抽样：等距选 m 个单元（含首尾），剩余预算按顺序补齐 */
+function selectTimeUnits(units, target) {
+  const cap = Math.max(1, Math.min(Math.floor(target / 4), PREVIEW_UNIT_MAX_CHARS));
+  const capped = units.map((unit) => {
+    const { text, truncated } = capUnitText(unit.text, cap);
+    return { ...unit, renderText: text, unitTruncated: truncated };
+  });
+  const n = capped.length;
+  if (n === 0) return { units: [], cap, notRepresented: [], anyTruncated: false };
+
+  // 只做成本估算：真实长度由调用方渲染后再核（见 planOverviewPreview 的重试）
+  const unitCost = (unit) => unit.renderText.length + 32;
+  const costForCount = (m) => evenlySpacedIndices(n, m)
+    .reduce((sum, index) => sum + unitCost(capped[index]) + 3, 0);
+
+  let count = 1;
+  if (costForCount(n) <= target) {
+    count = n;
+  } else {
+    let lo = 1;
+    let hi = n;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (costForCount(mid) <= target) lo = mid;
+      else hi = mid - 1;
+    }
+    count = lo;
+  }
+
+  const selected = new Set(evenlySpacedIndices(n, count));
+  let spent = costForCount(count);
+  for (let index = 0; index < n; index += 1) {
+    if (selected.has(index)) continue;
+    const cost = unitCost(capped[index]) + 3;
+    if (spent + cost > target) continue;
+    selected.add(index);
+    spent += cost;
+  }
+  const picked = [...selected].sort((a, b) => a - b).map((index) => capped[index]);
+  return {
+    units: picked,
+    cap,
+    notRepresented: [],
+    anyTruncated: picked.some((unit) => unit.unitTruncated),
+  };
+}
+
+/**
+ * 预览装配：tier 1 whole 放得下就全量；否则抽样。
+ * capacity = 上限减去 header / 固定 notes / full text 行之后的正文余量。
+ */
+function planOverviewPreview({ mediaType, segments, pages, window, textOnly, capacity }) {
+  const units = buildPreviewUnits(mediaType, segments);
+  const totalUnits = units.length;
+  // 没有任何可内联的文字（扫描件、无字幕的视频……）：预览是空的，不编也不抽样
+  if (totalUnits === 0) {
+    return {
+      mode: 'whole',
+      bodyText: '',
+      units: [],
+      preview: { mode: 'whole', units: 0, totalUnits: 0, notRepresented: [] },
+      note: null,
+    };
+  }
+  const wholeUnits = units.map((unit) => ({ ...unit, renderText: unit.text, unitTruncated: false }));
+  const wholeBody = renderPreviewBody({ mediaType, units: wholeUnits, textOnly });
+  const wholeNote = buildCompletenessNote({ mediaType, pages });
+  const wholeNeeded = (wholeBody ? wholeBody.length + 1 : 0) + (wholeNote ? wholeNote.length + 1 : 0);
+  if (wholeNeeded <= capacity) {
+    return {
+      mode: 'whole',
+      bodyText: wholeBody,
+      units: wholeUnits,
+      preview: { mode: 'whole', units: totalUnits, totalUnits, notRepresented: [] },
+      note: wholeNote,
+    };
+  }
+
+  // 先给说明预留空间，再把余量交给正文；渲染后按实际长度回退重试。
+  let target = Math.max(1, capacity - PREVIEW_NOTE_RESERVE);
+  let fallback = null;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const selection = mediaType === 'document'
+      ? selectDocumentUnits(units, pages, target)
+      : selectTimeUnits(units, target);
+    const bodyText = renderPreviewBody({ mediaType, units: selection.units, textOnly });
+    const preview = {
+      mode: 'sampled',
+      units: selection.units.length,
+      totalUnits,
+      notRepresented: selection.notRepresented,
+    };
+    const note = buildPreviewNote({
+      mediaType,
+      preview,
+      pages,
+      window,
+      cap: selection.cap,
+      anyTruncated: selection.anyTruncated,
+    });
+    const needed = (bodyText ? bodyText.length + 1 : 0) + (note ? note.length + 1 : 0);
+    const result = { mode: 'sampled', bodyText, units: selection.units, preview, note };
+    if (needed <= capacity) return result;
+    fallback = result;
+    if (target <= 1) break;
+    target = Math.max(1, target - (needed - capacity) - 40);
+  }
+  // 上限小到连说明都放不下：交给 clampInlineText 收尾，保证硬性质
+  return fallback ?? {
+    mode: 'sampled',
+    bodyText: '',
+    units: [],
+    preview: { mode: 'sampled', units: 0, totalUnits, notRepresented: [] },
+    note: null,
+  };
+}
+
+/** 最后一道保险：任何情况下 text 长度 <= 上限（极端小上限时截断并标注） */
+function clampInlineText(text, limit) {
+  if (typeof text !== 'string' || text.length <= limit) return text;
+  if (limit <= 0) return '';
+  let keep = Math.max(0, limit - 20);
+  let marker = `…[+${text.length - keep} chars]`;
+  while (keep > 0 && keep + marker.length > limit) {
+    keep = Math.max(0, keep - (keep + marker.length - limit));
+    marker = `…[+${Math.max(0, text.length - keep)} chars]`;
+  }
+  return keep > 0 ? `${text.slice(0, keep)}${marker}` : text.slice(0, limit);
+}
+
+/** 预览单元 → structuredContent.segments：只放**实际内联**的单元 */
+function unitsToInlineSegments(units, mediaType) {
+  return units.map((unit) => {
+    if (mediaType === 'document') {
+      return {
+        index: unit.order + 1,
+        startMs: null,
+        endMs: null,
+        startSec: null,
+        endSec: null,
+        text: unit.renderText,
+        source: unit.source,
+        origin: unit.origin,
+        page: unit.page,
+        speaker: unit.segment?.speaker ?? null,
+      };
+    }
+    return { ...unit.segment, text: unit.renderText };
+  });
 }
 
 function formatOverviewSegmentLine(segment, mediaType, textOnly = false) {
@@ -699,6 +1083,7 @@ function formatProbeText(result) {
 
 function formatOverviewText({
   mediaType, base, window, pages, durationSec, segments, transcript, imageDescriptors, textOnly, budget, hasAudio,
+  fullTextNote = null, continuationNote = null,
 }) {
   const lines = [];
   const attrs = [`path="${base.path}"`, `type="${mediaType}"`];
@@ -739,37 +1124,53 @@ function formatOverviewText({
     lines.push(`transcript: NONE (${transcript.reason ?? 'no transcript source is available for this file'})`);
   }
 
-  const bodyLines = segments.map((segment) => formatOverviewSegmentLine(segment, mediaType, textOnly));
-  const truncated = truncateLines(lines, bodyLines, budget.maxInlineChars);
-  const notes = [];
+  const bodyNotes = [];
   if (imageDescriptors.length > 0) {
-    notes.push(`cost: ${imageDescriptors.length} image(s) x ~${budget.perImageTokens ?? '-'} = ~${budget.estimatedTokens} vision tokens · transcript from ${transcript.source}${transcript.file ? ` (${transcript.file})` : ''}`);
+    bodyNotes.push(`cost: ${imageDescriptors.length} image(s) x ~${budget.perImageTokens ?? '-'} = ~${budget.estimatedTokens} vision tokens · transcript from ${transcript.source}${transcript.file ? ` (${transcript.file})` : ''}`);
   }
   if (mediaType === 'video') {
     if (textOnly) {
-      notes.push('note: text-only mode (images: 0) — no storyboard grid was rendered and no frame was decoded; the list below is the transcript of this window.');
-      notes.push('note: to see the picture, call media_zoom({ path, at }) for a single frame.');
+      // 不再无条件宣称「下面是这个窗口的转写」——抽样时这句话是错的。
+      bodyNotes.push('note: text-only mode (images: 0) — no storyboard grid was rendered and no frame was decoded.');
+      bodyNotes.push('note: to see the picture, call media_zoom({ path, at }) for a single frame.');
     } else {
-      notes.push('note: the grids are for locating. To read text on screen, media_zoom({ path, at }) and read the cropped single frame.');
+      bodyNotes.push('note: the grids are for locating. To read text on screen, media_zoom({ path, at }) and read the cropped single frame.');
     }
     if (transcript.source === 'asr') {
-      notes.push('note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not quote these lines as the speaker\'s exact words.');
+      bodyNotes.push('note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not quote these lines as the speaker\'s exact words.');
     }
   } else if (mediaType === 'audio') {
     if (transcript.source === 'asr') {
-      notes.push('note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not quote these lines as the speaker\'s exact words.');
+      bodyNotes.push('note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not quote these lines as the speaker\'s exact words.');
     } else if (transcript.source === 'subtitle') {
-      notes.push('note: source is subtitle — the author\'s own words, safe to quote.');
+      bodyNotes.push('note: source is subtitle — the author\'s own words, safe to quote.');
     }
   } else if (mediaType === 'document') {
     if (textOnly) {
-      notes.push('note: text-only mode (images: 0) — no page thumbnail was rendered; the list below is the text of every requested page.');
+      bodyNotes.push('note: text-only mode (images: 0) — no page thumbnail was rendered.');
     }
-    notes.push('note: page text comes from OCR of the rendered pages — verify names and numbers against the page image via media_zoom({ path, page }).');
+    bodyNotes.push('note: page text comes from OCR of the rendered pages — verify names and numbers against the page image via media_zoom({ path, page }).');
   }
-  if (budget.warning) notes.push(`budget: ${budget.warning}`);
-  const text = [truncated.text, ...notes].filter(Boolean).join('\n');
-  return { text, truncated: truncated.truncated, keptCount: truncated.keptCount };
+  if (budget.warning) bodyNotes.push(`budget: ${budget.warning}`);
+
+  // 全文落盘路径 / 续读提示也进 text content（9z5.22），并计入内联上限。
+  const headText = lines.join('\n');
+  const tailNotes = [fullTextNote, continuationNote].filter(Boolean);
+  const limit = inlineCharLimit(budget.maxInlineChars);
+  const fixedLength = headText.length
+    + [...bodyNotes, ...tailNotes].reduce((sum, note) => sum + note.length + 1, 0);
+  const capacity = limit - fixedLength - 1;
+
+  const plan = planOverviewPreview({ mediaType, segments, pages, window, textOnly, capacity });
+  const notes = [plan.note, ...bodyNotes, ...tailNotes].filter(Boolean);
+  const text = [headText, plan.bodyText, ...notes].filter(Boolean).join('\n');
+  return {
+    // 最后一道保险：任何输入下 text 长度都不超过 MMGREP_MAX_TEXT_INLINE_CHARS
+    text: clampInlineText(text, limit),
+    truncated: plan.preview.mode !== 'whole',
+    inlineSegments: unitsToInlineSegments(plan.units, mediaType),
+    preview: plan.preview,
+  };
 }
 
 function cellSizeLabel(imageDescriptors) {
@@ -844,8 +1245,12 @@ function formatLocateText({ query, matches, totalSegments, mediaType }) {
   return lines.join('\n');
 }
 
-/** 续读提示（契约 §5.3 的 continuation） */
-function buildContinuation({ mediaType, window, durationMs, pages, pageCount, truncated, lastSegment }) {
+/**
+ * 续读提示（契约 §5.3 的 continuation）：只表达「请求范围之外还有内容」。
+ * 抽样（9z5.20）之后不存在「内联到哪就从哪续」的概念了，所以不再用 lastSegment
+ * 推算下一个起点；文档仍按页码翻页。
+ */
+function buildContinuation({ mediaType, window, durationMs, pages, pageCount }) {
   if (mediaType === 'document') {
     if (!Array.isArray(pages) || pages.length === 0 || pageCount === null || pageCount === undefined) return null;
     const lastPage = pages[pages.length - 1];
@@ -858,14 +1263,9 @@ function buildContinuation({ mediaType, window, durationMs, pages, pageCount, tr
     };
   }
   const duration = numberOrNull(durationMs);
-  let nextStartMs = null;
-  if (truncated && lastSegment) {
-    nextStartMs = lastSegment.endMs ?? lastSegment.startMs;
-  } else if (window && window.endMs !== null && window.endMs !== undefined) {
-    if (duration === null || window.endMs < duration) nextStartMs = window.endMs;
-  }
-  if (nextStartMs === null) return null;
-  if (duration !== null && nextStartMs >= duration) return null;
+  if (!window || window.endMs === null || window.endMs === undefined) return null;
+  if (duration !== null && window.endMs >= duration) return null;
+  const nextStartMs = window.endMs;
   return {
     nextStartMs,
     nextStartSec: nextStartMs / 1000,
@@ -1127,6 +1527,21 @@ async function handleOverview(args, call) {
     durationSec,
     pageCount,
   });
+  // 落盘成功与否都要在 text content 里说明（.22）：只放 structuredContent 的话，
+  // 依赖文本通道的宿主永远看不到路径。
+  const fullTextNote = exported.ok
+    ? exported.note
+    : `full text: NOT written — ${exported.reason}`;
+
+  // 续读提示只依赖请求范围（不再依赖内联截断到哪），所以可以在格式化之前算好，
+  // 并作为固定 notes 计入内联上限。
+  const continuation = buildContinuation({
+    mediaType,
+    window,
+    durationMs: numberOrNull(probe.durationMs) ?? (durationSec !== null ? Math.round(durationSec * 1000) : null),
+    pages,
+    pageCount,
+  });
 
   const text = formatOverviewText({
     mediaType,
@@ -1144,18 +1559,8 @@ async function handleOverview(args, call) {
       perImageTokens: plan?.perImageTokens ?? null,
     },
     hasAudio: probe.hasAudio ?? mediaType !== 'document',
-  });
-
-  // 内联清单只包含前 N 条，结构化返回与文本保持一致（contract §5.3：节选）
-  const inlineSegments = segments.slice(0, text.keptCount);
-  const continuation = buildContinuation({
-    mediaType,
-    window,
-    durationMs: numberOrNull(probe.durationMs) ?? (durationSec !== null ? Math.round(durationSec * 1000) : null),
-    pages,
-    pageCount,
-    truncated: text.truncated,
-    lastSegment: inlineSegments[inlineSegments.length - 1] ?? null,
+    fullTextNote,
+    continuationNote: continuation?.note ?? null,
   });
 
   const structuredContent = {
@@ -1170,16 +1575,22 @@ async function handleOverview(args, call) {
       clipped: window?.clipped ?? false,
     },
     images: descriptors,
-    segments: inlineSegments,
+    // 只放**实际内联**的单元（抽样后就是被抽到的那些；全文在 content.md / segments.jsonl）
+    segments: text.inlineSegments,
     transcript,
     pages: mediaType === 'document' ? buildPageTexts(segments) : null,
-    fullText: {
-      dir: exported.outDir,
-      contentMd: exported.contentPath,
-      segmentsJsonl: exported.segmentsPath,
-      manifestJson: exported.manifestPath,
-    },
+    fullText: exported.ok
+      ? {
+        dir: exported.outDir,
+        contentMd: exported.contentPath,
+        segmentsJsonl: exported.segmentsPath,
+        manifestJson: exported.manifestPath,
+      }
+      : null,
+    fullTextReason: exported.ok ? null : exported.reason,
     truncated: text.truncated,
+    // 预览是 whole（全量）还是 sampled（抽样），以及覆盖了哪些页
+    preview: text.preview,
     continuation,
     budget,
   };
@@ -1253,6 +1664,7 @@ async function persistOverview({ call, base, mediaType, segments, transcript, wi
 
   const key = `sha256:${sha256}`;
   let outDir;
+  let fallbackDir = false;
   if (cache?.prepareDir) {
     try {
       outDir = await cache.prepareDir(key);
@@ -1260,47 +1672,59 @@ async function persistOverview({ call, base, mediaType, segments, transcript, wi
       logger?.warn?.(`could not prepare the cache directory: ${error?.message ?? error}`);
     }
   }
-  if (!outDir) outDir = path.join(os.tmpdir(), 'multimediagrep', sha256);
+  if (!outDir) {
+    outDir = path.join(os.tmpdir(), 'multimediagrep', sha256);
+    fallbackDir = true;
+  }
 
-  const exported = await exportAnalysis({
-    outDir,
-    source: {
-      path: base.path,
-      mediaType,
-      sizeBytes: base.sizeBytes,
-      modifiedMs: base.modifiedMs,
-      sha256,
-      durationSec,
-      pageCount,
-    },
-    mediaType: cangjieMediaType(mediaType, base.path),
-    segments,
-    transcript: {
-      source: transcript.source,
-      origin: transcript.origin,
-      language: transcript.language,
+  let exported;
+  try {
+    exported = await exportAnalysis({
+      outDir,
+      source: {
+        path: base.path,
+        mediaType,
+        sizeBytes: base.sizeBytes,
+        modifiedMs: base.modifiedMs,
+        sha256,
+        durationSec,
+        pageCount,
+      },
+      mediaType: cangjieMediaType(mediaType, base.path),
+      segments,
+      transcript: {
+        source: transcript.source,
+        origin: transcript.origin,
+        language: transcript.language,
+        provider: transcript.provider,
+        model: transcript.model,
+        file: transcript.file,
+      },
+      overview: {
+        images: descriptors.map((d) => ({
+          index: d.index,
+          width: d.width,
+          height: d.height,
+          cells: d.cells,
+          mimeType: d.mimeType,
+          bytes: d.bytes,
+          estimatedTokens: d.estimatedTokens,
+        })),
+        estimatedTokens: budget.estimatedTokens,
+      },
+      window: window ? { startMs: window.startMs, endMs: window.endMs } : null,
+      pages,
       provider: transcript.provider,
-      model: transcript.model,
-      file: transcript.file,
-    },
-    overview: {
-      images: descriptors.map((d) => ({
-        index: d.index,
-        width: d.width,
-        height: d.height,
-        cells: d.cells,
-        mimeType: d.mimeType,
-        bytes: d.bytes,
-        estimatedTokens: d.estimatedTokens,
-      })),
-      estimatedTokens: budget.estimatedTokens,
-    },
-    window: window ? { startMs: window.startMs, endMs: window.endMs } : null,
-    pages,
-    provider: transcript.provider,
-    warnings,
-    tool: 'media_overview',
-  });
+      warnings,
+      tool: 'media_overview',
+    });
+  } catch (error) {
+    // 落盘失败不能让整个 overview 调用失败：inline 预览仍然有用，
+    // 但必须在 text content 里把「没写成 + 原因」说清楚（.22）。
+    const reason = error?.message ?? String(error);
+    logger?.warn?.(`could not write the full text export: ${reason}`);
+    return { ok: false, reason };
+  }
 
   if (cache?.register) {
     try {
@@ -1309,7 +1733,15 @@ async function persistOverview({ call, base, mediaType, segments, transcript, wi
       logger?.debug?.(`could not register the export entry in the cache: ${error?.message ?? error}`);
     }
   }
-  return exported;
+  const noteSuffix = fallbackDir
+    ? '; the cache directory was unavailable, so this copy went to the OS temp directory and may be cleaned up'
+    : '';
+  return {
+    ok: true,
+    ...exported,
+    fallbackDir,
+    note: `full text: ${exported.contentPath} (segments.jsonl, manifest.json in the same directory${noteSuffix})`,
+  };
 }
 
 /** 没有 cache 模块时的兜底哈希（流式，不把整个视频读进内存） */

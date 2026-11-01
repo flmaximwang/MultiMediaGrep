@@ -186,8 +186,10 @@ test('document：probe / overview pages / zoom / locate / 扫描件降级', { sk
     assert.notEqual(overview.isError, true);
     const ov = overview.structuredContent;
     assert.deepEqual(ov.window.pages, [1, 2]);
-    assert.equal(ov.segments.length, 2);
-    assert.equal(ov.segments[0].page, 1);
+    // 9z5.20：结构化 segments = 实际内联的**单元**（文档 = 句子），不再是「一页一条」。
+    assert.deepEqual([...new Set(ov.segments.map((segment) => segment.page))], [1, 2]);
+    assert.equal(ov.preview.mode, 'whole');
+    assert.equal(ov.preview.totalUnits, ov.segments.length);
     assert.match(ov.segments[0].text, /MULTIMEDIAGREP TEXT FIXTURE/);
     assert.equal(ov.images.length, 1);
     const contentMd = await readFile(ov.fullText.contentMd, 'utf8');
