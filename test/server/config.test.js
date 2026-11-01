@@ -276,6 +276,20 @@ test('多 provider 的 key 互不串用，且不出现在 describeConfig / warni
   }
 });
 
+test('MMGREP_TYPESET_SKIP_SIMPLE：默认 true；false 关闭；非法值回落并 warning', () => {
+  assert.equal(loadConfig({}).typeset.skipSimple, true);
+  assert.equal(loadConfig({ MMGREP_TYPESET_SKIP_SIMPLE: 'false' }).typeset.skipSimple, false);
+  assert.equal(loadConfig({ MMGREP_TYPESET_SKIP_SIMPLE: 'off' }).typeset.skipSimple, false);
+  assert.equal(loadConfig({ MMGREP_TYPESET_SKIP_SIMPLE: '1' }).typeset.skipSimple, true);
+
+  const invalid = loadConfig({ MMGREP_TYPESET_SKIP_SIMPLE: 'maybe' });
+  assert.equal(invalid.typeset.skipSimple, true);
+  assert.ok(invalid.warnings.some((warning) => warning.includes('MMGREP_TYPESET_SKIP_SIMPLE')));
+
+  const described = describeConfig(loadConfig({ MMGREP_TYPESET_SKIP_SIMPLE: '0' }));
+  assert.equal(described.typeset.skipSimple, false);
+});
+
 test('createLogger：只写注入的 stream，格式稳定', () => {
   const lines = [];
   const stream = { write: (line) => lines.push(line.trimEnd()) };

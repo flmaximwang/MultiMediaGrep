@@ -869,6 +869,240 @@ function generateSampleTextPdf(outDir) {
 }
 
 // ---------------------------------------------------------------------------
+// 5c. sample-twocolumn.pdf  (two-column reading order + heuristic blocks)
+//
+// The fixture is synthetic on purpose (no real paper enters the repo):
+//   page 1: full-width title + abstract, then a two-column body;
+//   page 2: two-column section headings ("2. Results", "2.1 ...") and
+//           "Fig. N" / "Table N" captions;
+//   page 3: single-column control with a vector table (must not be reflowed).
+//
+// pdftotext -layout emits page 1/2 body lines as "left text <spaces> right
+// text"; the ground truth records which lines belong to which column so the
+// reflow tests can assert left-then-right order without crossing columns.
+// ---------------------------------------------------------------------------
+
+const TWOCOL_MARGIN_PT = 42;
+const TWOCOL_COLUMN_WIDTH_PT = 240;
+const TWOCOL_GUTTER_PT = 30;
+const TWOCOL_LEFT_X_PT = TWOCOL_MARGIN_PT;
+const TWOCOL_RIGHT_X_PT = TWOCOL_LEFT_X_PT + TWOCOL_COLUMN_WIDTH_PT + TWOCOL_GUTTER_PT;
+const TWOCOL_BODY_SIZE = 9;
+const TWOCOL_LEADING_PT = 12;
+
+const TWOCOL_PAGE1 = {
+  title: 'TWO-COLUMN REFLOW FIXTURE',
+  abstract:
+    'ABSTRACT: This synthetic paper exercises reading-order reflow for the builtin typeset provider.',
+  leftParagraphs: [[
+    'Programmable small RNA-protein complexes such as',
+    'CRISPR-Cas enable a single protein to serve as a',
+    'flexible scaffold for targeting. Despite their',
+    'flexibility, these systems are limited by off-target',
+    'activity and unknown interactions with regulatory',
+    'machinery. Genome mining and protein engineering',
+    'continue to produce smaller variants, but delivery',
+    'remains the dominant barrier for translation.',
+  ]],
+  rightParagraphs: [[
+    'To address these limitations, we developed a',
+    'modular platform that couples engineered guide RNAs',
+    'with a compact effector domain. The resulting',
+    'complexes retain programmable targeting while',
+    'reducing unintended interactions in primary cells.',
+    'In this study we characterize the platform across',
+    'multiple cell types and report improved specificity',
+    'without detectable off-target editing.',
+  ]],
+};
+
+const TWOCOL_PAGE2 = {
+  // null = an empty row on this side; the other column may still have text.
+  leftRows: [
+    '2. Results', null,
+    '2.1 Reflow quality', null,
+    'The reflowed page keeps the left column',
+    'contiguous before the right column begins.',
+    'Each sentence stays inside its own column.',
+    null, null,
+    'Fig. 1. Reading order after gutter reflow.',
+  ],
+  rightRows: [
+    '2.2 Block heuristics', null,
+    'Short numbered lines become headings and',
+    'lines beginning with Fig. or Table become',
+    'captions in the typeset output.',
+    null, null,
+    'Table 1. Heuristic block types.',
+  ],
+  leftParagraphs: [
+    ['The reflowed page keeps the left column', 'contiguous before the right column begins.', 'Each sentence stays inside its own column.'],
+  ],
+  rightParagraphs: [
+    ['Short numbered lines become headings and', 'lines beginning with Fig. or Table become', 'captions in the typeset output.'],
+  ],
+};
+
+const TWOCOL_PAGE3 = {
+  lines: [
+    '3. Conclusion', null,
+    'A single-column page must not be reflowed. The',
+    'table below keeps its layout and cell contents.',
+  ],
+  table: {
+    header: ['KEY', 'VALUE', 'NOTE'],
+    rows: [
+      ['ALPHA', 'ONE', 'FIRST'],
+      ['BETA', 'TWO', 'SECOND'],
+      ['GAMMA', 'THREE', 'THIRD'],
+    ],
+  },
+};
+
+/** One column of text ops; null rows advance the vertical position (blank line). */
+function twoColumnOps(rows, x, topY) {
+  const ops = [];
+  rows.forEach((text, index) => {
+    if (text === null) return;
+    ops.push(pdfTextOp(x, topY - index * TWOCOL_LEADING_PT, text, { font: 'F1', size: TWOCOL_BODY_SIZE }));
+  });
+  return ops;
+}
+
+function twoColumnPageOps(page) {
+  const ops = [];
+  const topY = PDF_HEIGHT - 120;
+  ops.push(...twoColumnOps(page.leftRows, TWOCOL_LEFT_X_PT, topY));
+  ops.push(...twoColumnOps(page.rightRows, TWOCOL_RIGHT_X_PT, topY));
+  return ops;
+}
+
+function generateSampleTwoColumnPdf(outDir) {
+  // Page 1: title + abstract (full width) over a two-column body.
+  const page1Ops = [
+    pdfTextOp(170, PDF_HEIGHT - 60, TWOCOL_PAGE1.title, { font: 'F2', size: 15 }),
+    pdfTextOp(42, PDF_HEIGHT - 88, TWOCOL_PAGE1.abstract, { font: 'F1', size: 9 }),
+  ];
+  const bodyTopY = PDF_HEIGHT - 120;
+  for (const paragraph of TWOCOL_PAGE1.leftParagraphs) {
+    page1Ops.push(...twoColumnOps(paragraph, TWOCOL_LEFT_X_PT, bodyTopY));
+  }
+  for (const paragraph of TWOCOL_PAGE1.rightParagraphs) {
+    page1Ops.push(...twoColumnOps(paragraph, TWOCOL_RIGHT_X_PT, bodyTopY));
+  }
+
+  // Page 2: headings / captions inside the columns.
+  const page2Ops = twoColumnPageOps(TWOCOL_PAGE2);
+
+  // Page 3: single-column control page with a vector table.
+  const page3Ops = [];
+  const page3TopY = PDF_HEIGHT - 72;
+  TWOCOL_PAGE3.lines.forEach((text, index) => {
+    if (text === null) return;
+    page3Ops.push(pdfTextOp(TWOCOL_MARGIN_PT, page3TopY - index * 12, text, { font: 'F1', size: 11 }));
+  });
+  const tableTopY = page3TopY - TWOCOL_PAGE3.lines.length * 12 - 20;
+  const tableColumnWidth = 140;
+  const tableRowHeight = 24;
+  const table = buildTableOps({
+    header: TWOCOL_PAGE3.table.header,
+    rows: TWOCOL_PAGE3.table.rows,
+    originX: TWOCOL_MARGIN_PT,
+    topY: tableTopY,
+    columnWidth: tableColumnWidth,
+    rowHeight: tableRowHeight,
+  });
+  page3Ops.push(...table.ops);
+
+  const pdf = buildPDF({
+    pages: [
+      { kind: 'text', width: PDF_WIDTH, height: PDF_HEIGHT, ops: page1Ops, fonts: ['F1', 'F2'] },
+      { kind: 'text', width: PDF_WIDTH, height: PDF_HEIGHT, ops: page2Ops, fonts: ['F1', 'F2'] },
+      { kind: 'text', width: PDF_WIDTH, height: PDF_HEIGHT, ops: page3Ops, fonts: ['F1', 'F2'] },
+    ],
+  });
+  writeFile(outDir, 'sample-twocolumn.pdf', pdf);
+
+  const page1Left = TWOCOL_PAGE1.leftParagraphs.flat();
+  const page1Right = TWOCOL_PAGE1.rightParagraphs.flat();
+  const page2Blocks = [
+    { type: 'heading', level: 1, text: '2. Results' },
+    { type: 'heading', level: 2, text: '2.1 Reflow quality' },
+    { type: 'paragraph', text: TWOCOL_PAGE2.leftParagraphs[0].join('\n') },
+    { type: 'caption', text: 'Fig. 1. Reading order after gutter reflow.' },
+    { type: 'heading', level: 2, text: '2.2 Block heuristics' },
+    { type: 'paragraph', text: TWOCOL_PAGE2.rightParagraphs[0].join('\n') },
+    { type: 'caption', text: 'Table 1. Heuristic block types.' },
+  ];
+
+  return {
+    id: 'sample-twocolumn-pdf',
+    kind: 'pdf',
+    file: 'sample-twocolumn.pdf',
+    generator: 'fixtures/generate.mjs',
+    pageCount: 3,
+    pageWidthPt: PDF_WIDTH,
+    pageHeightPt: PDF_HEIGHT,
+    hasTextLayer: true,
+    fonts: ['Helvetica', 'Helvetica-Bold'],
+    layout: {
+      marginPt: TWOCOL_MARGIN_PT,
+      columnWidthPt: TWOCOL_COLUMN_WIDTH_PT,
+      gutterPt: TWOCOL_GUTTER_PT,
+      leftColumnXPt: TWOCOL_LEFT_X_PT,
+      rightColumnXPt: TWOCOL_RIGHT_X_PT,
+    },
+    pages: [
+      {
+        page: 1,
+        layout: 'two-column',
+        title: TWOCOL_PAGE1.title,
+        abstract: TWOCOL_PAGE1.abstract,
+        leftLines: page1Left,
+        rightLines: page1Right,
+        leftParagraphs: TWOCOL_PAGE1.leftParagraphs,
+        rightParagraphs: TWOCOL_PAGE1.rightParagraphs,
+        expectedBlocks: [
+          { type: 'heading', level: 1, text: TWOCOL_PAGE1.title },
+          { type: 'paragraph', text: TWOCOL_PAGE1.abstract },
+          { type: 'paragraph', text: page1Left.join('\n') },
+          { type: 'paragraph', text: page1Right.join('\n') },
+        ],
+      },
+      {
+        page: 2,
+        layout: 'two-column',
+        leftRows: TWOCOL_PAGE2.leftRows,
+        rightRows: TWOCOL_PAGE2.rightRows,
+        leftParagraphs: TWOCOL_PAGE2.leftParagraphs,
+        rightParagraphs: TWOCOL_PAGE2.rightParagraphs,
+        headings: [{ level: 1, text: '2. Results' }, { level: 2, text: '2.1 Reflow quality' }, { level: 2, text: '2.2 Block heuristics' }],
+        captions: ['Fig. 1. Reading order after gutter reflow.', 'Table 1. Heuristic block types.'],
+        expectedBlocks: page2Blocks,
+      },
+      {
+        page: 3,
+        layout: 'single-column',
+        lines: TWOCOL_PAGE3.lines.filter((text) => text !== null),
+        headings: [{ level: 1, text: '3. Conclusion' }],
+        table: {
+          page: 3,
+          originXPt: table.originX,
+          topYPt: table.topY,
+          columnWidthPt: table.columnWidth,
+          rowHeightPt: table.rowHeight,
+          columnXPt: table.columnX,
+          rowYPt: table.rowY,
+          header: table.header,
+          rows: table.rows,
+          cells: table.cells,
+        },
+      },
+    ],
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 5b. sample-longpage.pdf  (one page far above the 24k-char inline limit)
 //
 // 预览管线（9z5.20）必须能处理「单页正文超过内联上限」：不能把整页丢掉，
@@ -1348,6 +1582,7 @@ async function main() {
   groundTruths.push(generateSampleZoom(outDir));
   groundTruths.push(...generateSampleTone(outDir));
   groundTruths.push(generateSampleTextPdf(outDir));
+  groundTruths.push(generateSampleTwoColumnPdf(outDir));
   groundTruths.push(generateSampleLongPagePdf(outDir));
   groundTruths.push(generateSampleScannedPdf(outDir));
   groundTruths.push(generateSampleImage(outDir));

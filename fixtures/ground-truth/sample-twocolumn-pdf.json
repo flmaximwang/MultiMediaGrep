@@ -1,0 +1,324 @@
+{
+  "id": "sample-twocolumn-pdf",
+  "kind": "pdf",
+  "file": "sample-twocolumn.pdf",
+  "generator": "fixtures/generate.mjs",
+  "pageCount": 3,
+  "pageWidthPt": 595,
+  "pageHeightPt": 842,
+  "hasTextLayer": true,
+  "fonts": [
+    "Helvetica",
+    "Helvetica-Bold"
+  ],
+  "layout": {
+    "marginPt": 42,
+    "columnWidthPt": 240,
+    "gutterPt": 30,
+    "leftColumnXPt": 42,
+    "rightColumnXPt": 312
+  },
+  "pages": [
+    {
+      "page": 1,
+      "layout": "two-column",
+      "title": "TWO-COLUMN REFLOW FIXTURE",
+      "abstract": "ABSTRACT: This synthetic paper exercises reading-order reflow for the builtin typeset provider.",
+      "leftLines": [
+        "Programmable small RNA-protein complexes such as",
+        "CRISPR-Cas enable a single protein to serve as a",
+        "flexible scaffold for targeting. Despite their",
+        "flexibility, these systems are limited by off-target",
+        "activity and unknown interactions with regulatory",
+        "machinery. Genome mining and protein engineering",
+        "continue to produce smaller variants, but delivery",
+        "remains the dominant barrier for translation."
+      ],
+      "rightLines": [
+        "To address these limitations, we developed a",
+        "modular platform that couples engineered guide RNAs",
+        "with a compact effector domain. The resulting",
+        "complexes retain programmable targeting while",
+        "reducing unintended interactions in primary cells.",
+        "In this study we characterize the platform across",
+        "multiple cell types and report improved specificity",
+        "without detectable off-target editing."
+      ],
+      "leftParagraphs": [
+        [
+          "Programmable small RNA-protein complexes such as",
+          "CRISPR-Cas enable a single protein to serve as a",
+          "flexible scaffold for targeting. Despite their",
+          "flexibility, these systems are limited by off-target",
+          "activity and unknown interactions with regulatory",
+          "machinery. Genome mining and protein engineering",
+          "continue to produce smaller variants, but delivery",
+          "remains the dominant barrier for translation."
+        ]
+      ],
+      "rightParagraphs": [
+        [
+          "To address these limitations, we developed a",
+          "modular platform that couples engineered guide RNAs",
+          "with a compact effector domain. The resulting",
+          "complexes retain programmable targeting while",
+          "reducing unintended interactions in primary cells.",
+          "In this study we characterize the platform across",
+          "multiple cell types and report improved specificity",
+          "without detectable off-target editing."
+        ]
+      ],
+      "expectedBlocks": [
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "TWO-COLUMN REFLOW FIXTURE"
+        },
+        {
+          "type": "paragraph",
+          "text": "ABSTRACT: This synthetic paper exercises reading-order reflow for the builtin typeset provider."
+        },
+        {
+          "type": "paragraph",
+          "text": "Programmable small RNA-protein complexes such as\nCRISPR-Cas enable a single protein to serve as a\nflexible scaffold for targeting. Despite their\nflexibility, these systems are limited by off-target\nactivity and unknown interactions with regulatory\nmachinery. Genome mining and protein engineering\ncontinue to produce smaller variants, but delivery\nremains the dominant barrier for translation."
+        },
+        {
+          "type": "paragraph",
+          "text": "To address these limitations, we developed a\nmodular platform that couples engineered guide RNAs\nwith a compact effector domain. The resulting\ncomplexes retain programmable targeting while\nreducing unintended interactions in primary cells.\nIn this study we characterize the platform across\nmultiple cell types and report improved specificity\nwithout detectable off-target editing."
+        }
+      ]
+    },
+    {
+      "page": 2,
+      "layout": "two-column",
+      "leftRows": [
+        "2. Results",
+        null,
+        "2.1 Reflow quality",
+        null,
+        "The reflowed page keeps the left column",
+        "contiguous before the right column begins.",
+        "Each sentence stays inside its own column.",
+        null,
+        null,
+        "Fig. 1. Reading order after gutter reflow."
+      ],
+      "rightRows": [
+        "2.2 Block heuristics",
+        null,
+        "Short numbered lines become headings and",
+        "lines beginning with Fig. or Table become",
+        "captions in the typeset output.",
+        null,
+        null,
+        "Table 1. Heuristic block types."
+      ],
+      "leftParagraphs": [
+        [
+          "The reflowed page keeps the left column",
+          "contiguous before the right column begins.",
+          "Each sentence stays inside its own column."
+        ]
+      ],
+      "rightParagraphs": [
+        [
+          "Short numbered lines become headings and",
+          "lines beginning with Fig. or Table become",
+          "captions in the typeset output."
+        ]
+      ],
+      "headings": [
+        {
+          "level": 1,
+          "text": "2. Results"
+        },
+        {
+          "level": 2,
+          "text": "2.1 Reflow quality"
+        },
+        {
+          "level": 2,
+          "text": "2.2 Block heuristics"
+        }
+      ],
+      "captions": [
+        "Fig. 1. Reading order after gutter reflow.",
+        "Table 1. Heuristic block types."
+      ],
+      "expectedBlocks": [
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "2. Results"
+        },
+        {
+          "type": "heading",
+          "level": 2,
+          "text": "2.1 Reflow quality"
+        },
+        {
+          "type": "paragraph",
+          "text": "The reflowed page keeps the left column\ncontiguous before the right column begins.\nEach sentence stays inside its own column."
+        },
+        {
+          "type": "caption",
+          "text": "Fig. 1. Reading order after gutter reflow."
+        },
+        {
+          "type": "heading",
+          "level": 2,
+          "text": "2.2 Block heuristics"
+        },
+        {
+          "type": "paragraph",
+          "text": "Short numbered lines become headings and\nlines beginning with Fig. or Table become\ncaptions in the typeset output."
+        },
+        {
+          "type": "caption",
+          "text": "Table 1. Heuristic block types."
+        }
+      ]
+    },
+    {
+      "page": 3,
+      "layout": "single-column",
+      "lines": [
+        "3. Conclusion",
+        "A single-column page must not be reflowed. The",
+        "table below keeps its layout and cell contents."
+      ],
+      "headings": [
+        {
+          "level": 1,
+          "text": "3. Conclusion"
+        }
+      ],
+      "table": {
+        "page": 3,
+        "originXPt": 42,
+        "topYPt": 702,
+        "columnWidthPt": 140,
+        "rowHeightPt": 24,
+        "columnXPt": [
+          42,
+          182,
+          322
+        ],
+        "rowYPt": [
+          702,
+          678,
+          654,
+          630
+        ],
+        "header": [
+          "KEY",
+          "VALUE",
+          "NOTE"
+        ],
+        "rows": [
+          [
+            "ALPHA",
+            "ONE",
+            "FIRST"
+          ],
+          [
+            "BETA",
+            "TWO",
+            "SECOND"
+          ],
+          [
+            "GAMMA",
+            "THREE",
+            "THIRD"
+          ]
+        ],
+        "cells": [
+          {
+            "row": 0,
+            "col": 0,
+            "text": "KEY",
+            "xPt": 48,
+            "yPt": 686
+          },
+          {
+            "row": 0,
+            "col": 1,
+            "text": "VALUE",
+            "xPt": 188,
+            "yPt": 686
+          },
+          {
+            "row": 0,
+            "col": 2,
+            "text": "NOTE",
+            "xPt": 328,
+            "yPt": 686
+          },
+          {
+            "row": 1,
+            "col": 0,
+            "text": "ALPHA",
+            "xPt": 48,
+            "yPt": 662
+          },
+          {
+            "row": 1,
+            "col": 1,
+            "text": "ONE",
+            "xPt": 188,
+            "yPt": 662
+          },
+          {
+            "row": 1,
+            "col": 2,
+            "text": "FIRST",
+            "xPt": 328,
+            "yPt": 662
+          },
+          {
+            "row": 2,
+            "col": 0,
+            "text": "BETA",
+            "xPt": 48,
+            "yPt": 638
+          },
+          {
+            "row": 2,
+            "col": 1,
+            "text": "TWO",
+            "xPt": 188,
+            "yPt": 638
+          },
+          {
+            "row": 2,
+            "col": 2,
+            "text": "SECOND",
+            "xPt": 328,
+            "yPt": 638
+          },
+          {
+            "row": 3,
+            "col": 0,
+            "text": "GAMMA",
+            "xPt": 48,
+            "yPt": 614
+          },
+          {
+            "row": 3,
+            "col": 1,
+            "text": "THREE",
+            "xPt": 188,
+            "yPt": 614
+          },
+          {
+            "row": 3,
+            "col": 2,
+            "text": "THIRD",
+            "xPt": 328,
+            "yPt": 614
+          }
+        ]
+      }
+    }
+  ]
+}
