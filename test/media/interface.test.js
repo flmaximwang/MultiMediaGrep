@@ -95,16 +95,15 @@ test('createDispatcher：按媒体类型分派，不适用的方法明确报错'
     overview: async () => `${name}:overview`,
     zoom: async () => `${name}:zoom`,
     locate: async () => `${name}:locate`,
-    subtitles: async () => `${name}:subtitles`,
   });
   const d = createDispatcher({ video: backend('video'), audio: backend('audio'), document: backend('document') });
   assert.equal(await d.call('video', 'overview', {}, {}), 'video:overview');
   assert.equal(await d.call('audio', 'probe', {}, {}), 'audio:probe');
   assert.equal(await d.call('document', 'zoom', {}, {}), 'document:zoom');
-  assert.equal(await d.call('audio', 'subtitles', {}, {}), 'audio:subtitles');
+  assert.equal(await d.call('video', 'locate', {}, {}), 'video:locate');
   await assert.rejects(() => d.call('audio', 'zoom', {}, {}), (e) => e.code === 'INVALID_ARGUMENT' && /not applicable to audio/.test(e.message));
-  await assert.rejects(() => d.call('document', 'subtitles', {}, {}), (e) => e.code === 'INVALID_ARGUMENT');
+  await assert.rejects(() => d.call('audio', 'subtitles', {}, {}), (e) => e.code === 'INVALID_ARGUMENT' && /unknown method/.test(e.message));
   await assert.rejects(() => d.call('video', 'nope', {}, {}), (e) => e.code === 'INVALID_ARGUMENT' && /unknown method/.test(e.message));
-  assert.deepEqual(METHOD_MATRIX.audio, ['probe', 'overview', 'locate', 'subtitles']);
+  assert.deepEqual(METHOD_MATRIX.audio, ['probe', 'overview', 'locate']);
   assert.ok(calls.length === 0);
 });

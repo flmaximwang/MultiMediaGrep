@@ -1,4 +1,4 @@
-// test/server/tools.test.js —— 5 个工具的参数校验、分派、返回信封与错误模型
+// test/server/tools.test.js —— 4 个工具的参数校验、分派、返回信封与错误模型
 //
 // 用本地 stub 后端（不碰 ffmpeg / 网络），通过 InMemoryTransport 走完整 MCP 协议：
 // listTools / callTool / notifications/progress 都是真实的 SDK 行为。
@@ -156,20 +156,6 @@ function makeBackend(kind, overrides = {}) {
         warnings: [],
       };
     },
-    async subtitles(input) {
-      calls.push({ method: 'subtitles', input });
-      return {
-        segments: [
-          { startMs: 1200, endMs: 4560, text: '第一行字幕', source: 'subtitle', origin: 'file' },
-          { startMs: 4560, endMs: 8100, text: '第二行字幕', source: 'subtitle', origin: 'file' },
-        ],
-        origin: 'file',
-        sourcePath: '/abs/a.zh.srt',
-        format: 'srt',
-        language: 'zh',
-        warnings: [],
-      };
-    },
   };
   return Object.assign(backend, overrides);
 }
@@ -202,13 +188,13 @@ function errorCode(result) {
  * 工具目录
  * ------------------------------------------------------------------ */
 
-test('listTools：5 个工具、描述带中文触发词、schema 完整', async () => {
+test('listTools：4 个工具、描述带中文触发词、schema 完整', async () => {
   const workspace = await makeWorkspace();
   try {
     await withClient(workspace, async (client) => {
       const listed = await client.listTools();
       assert.deepEqual(listed.tools.map((tool) => tool.name), [
-        'media_probe', 'media_overview', 'media_zoom', 'media_locate', 'video_subtitles',
+        'media_probe', 'media_overview', 'media_zoom', 'media_locate',
       ]);
       const byName = Object.fromEntries(listed.tools.map((tool) => [tool.name, tool]));
 
@@ -216,7 +202,6 @@ test('listTools：5 个工具、描述带中文触发词、schema 完整', async
       assert.match(byName.media_overview.description, /生成媒体总览/);
       assert.match(byName.media_zoom.description, /取本地视频/);
       assert.match(byName.media_locate.description, /定位：/);
-      assert.match(byName.video_subtitles.description, /读取本地字幕/);
 
       for (const tool of listed.tools) {
         assert.equal(tool.inputSchema.type, 'object');
@@ -1004,49 +989,34 @@ test('media_locate：零匹配不是错误（后端返回空数组）', async ()
 });
 
 /* ------------------------------------------------------------------ *
- * video_subtitles
+ * media_overview：字幕来源选择
  * ------------------------------------------------------------------ */
 
-test('video_subtitles：字幕段落、时间窗、document 不适用', async () => {
+test('media_overview：subtitle 与 transcript 参数原样转发给后端', async () => {
   const workspace = await makeWorkspace();
   try {
+    const backends = stubBackends();
     await withClient(workspace, async (client) => {
-      const result = await client.callTool({
-        name: 'video_subtitles', arguments: { path: workspace.files.video },
+      const byFile = await client.callTool({
+        name: 'media_overview',
+        arguments: {
+          path: workspace.files.video, images: 0, transcript: 'subtitle', subtitle: '/abs/a.zh.srt',
+        },
       });
-      assert.notEqual(result.isError, true);
-      const data = result.structuredContent;
-      assert.equal(data.source, 'subtitle');
-      assert.equal(data.origin, 'file');
-      assert.equal(data.format, 'srt');
-      assert.equal(data.language, 'zh');
-      assert.equal(data.segmentCount, 2);
-      assert.equal(data.segments[0].startMs, 1200);
-      assert.equal(data.segments[0].endSec, 4.56);
-      assert.match(result.content[0].text, /^<subtitles path=".*a\.mp4" source="subtitle" origin="file" file="\/abs\/a\.zh\.srt" format="srt" language="zh" segments="2" \/>/);
-      assert.match(result.content[0].text, /\[1\s+\] 00:01\.200-00:04\.560  \(subtitle\)  「第一行字幕」/);
-
-      const pages = await client.callTool({
-        name: 'video_subtitles', arguments: { path: workspace.files.video, pages: '1-3' },
-      });
-      assert.equal(pages.structuredContent.error.message, 'pages is not applicable to video media. Use "start" and "end" (seconds) instead.');
-
-      const document = await client.callTool({
-        name: 'video_subtitles', arguments: { path: workspace.files.document },
-      });
-      assert.equal(errorCode(document), 'INVALID_ARGUMENT');
-      assert.match(document.content[0].text, /video_subtitles is not applicable to document media/);
-
-      const withSubtitle = await client.callTool({
-        name: 'video_subtitles', arguments: { path: workspace.files.video, subtitle: '/abs/a.zh.srt' },
-      });
-      assert.notEqual(withSubtitle.isError, true, 'subtitle is forwarded to the backend');
+      assert.notEqual(byFile.isError, true, 'subtitle is forwarded to the backend');
 
       const numeric = await client.callTool({
-        name: 'video_subtitles', arguments: { path: workspace.files.video, subtitle: 2 },
+        name: 'media_overview',
+        arguments: { path: workspace.files.video, images: 0, transcript: 'subtitle', subtitle: 2 },
       });
       assert.notEqual(numeric.isError, true);
-    });
+
+      const calls = backends.video.calls.filter((call) => call.method === 'overview');
+      assert.equal(calls[0].input.subtitle, '/abs/a.zh.srt');
+      assert.equal(calls[0].input.transcript, 'subtitle');
+      assert.equal(calls[0].input.images, 0);
+      assert.equal(calls[1].input.subtitle, 2);
+    }, { backends });
   } finally {
     await workspace.cleanup();
   }

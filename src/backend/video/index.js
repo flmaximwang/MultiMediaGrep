@@ -6,13 +6,11 @@
 //              images: 0 时走零像素纯文本模式：不扫镜头、不抽帧，只回转写段落
 //   zoom      单帧特写（at 精确帧 / start+end 选最清晰帧，crop 在缩放后裁）
 //   locate    在转写里找短语，返回时间码；可选附带最佳匹配处的一帧
-//   subtitles 只读已有字幕，绝不跑 ASR
 //
 // 约定见 docs/mcp-contract.md §4–§8。这里不调用任何 LLM，也不下载任何东西。
 
 import { ToolError } from '../../media/interface.js';
 import { matchSegments, splitIntoSentences } from '../../media/match.js';
-import { resolveSubtitleSource } from '../../media/transcript.js';
 import { getAudioHealth, probeVideoMedia, readVideoInfo } from './probe.js';
 import { resolveTranscript } from './transcript.js';
 import { composeOverviewImages, detectCuts } from './storyboard.js';
@@ -327,53 +325,7 @@ export function createVideoBackend(ctx = {}) {
     };
   }
 
-  /** 契约 §8：只用已有字幕，不跑 ASR；完全没有字幕来源 → NO_TRANSCRIPT */
-  async function subtitles(input, callCtx = backendCtx()) {
-    const c = callCtx;
-    const media = await readVideoInfo(input, c);
-    const warnings = [];
-    const subtitle = await resolveSubtitleSource({
-      mediaPath: input.path,
-      subtitle: input.subtitle,
-      streams: media.streams,
-      signal: c.signal,
-      warnings,
-    });
-    if (!subtitle) {
-      throw new ToolError(
-        'NO_TRANSCRIPT',
-        `no subtitle source for "${input.path}": no embedded subtitle track, no sibling .srt/.vtt/.ass/.ssa file, `
-          + 'and no ASR provider configured. Pass subtitle with a local subtitle file, a track index, or a language code.',
-      );
-    }
-    mergeWarnings(warnings, subtitle.warnings);
-
-    let segments = subtitle.segments.map((segment, i) => ({
-      ...segment,
-      index: i + 1,
-      source: 'subtitle',
-      origin: subtitle.origin,
-    }));
-    const startMs = Number.isInteger(input.startMs) ? input.startMs : null;
-    const endMs = Number.isInteger(input.endMs) ? input.endMs : null;
-    if (startMs !== null || endMs !== null) {
-      segments = segments.filter((segment) => overlapsWindow(segment, startMs, endMs));
-    }
-    segments = segments.map((segment, i) => ({ ...segment, index: i + 1 }));
-
-    return {
-      mediaType: 'video',
-      path: input.path,
-      segments,
-      origin: subtitle.origin,
-      sourcePath: subtitle.sourcePath ?? null,
-      format: subtitle.format ?? null,
-      language: subtitle.language ?? null,
-      warnings,
-    };
-  }
-
-  return { probe, overview, zoom, locate, subtitles };
+  return { probe, overview, zoom, locate };
 }
 
 export default createVideoBackend;

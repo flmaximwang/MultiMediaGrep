@@ -1,9 +1,9 @@
-// src/server/tools.js —— 5 个 MCP 工具的定义与 handler
+// src/server/tools.js —— 4 个 MCP 工具的定义与 handler
 //
 // 分工（重要）：
 //   - 本文件负责**参数校验 + 分派 + 结果信封**（content blocks / structuredContent / 文本清单）。
 //   - 真正的媒体处理（取帧、转写、栅格化）由 src/backend/<type>/ 负责，见 backends.js。
-//   - 工具描述逐字来自 docs/mcp-contract.md §4.1 / §5.1 / §6.1 / §7.1 / §8.1，不要改写。
+//   - 工具描述逐字来自 docs/mcp-contract.md §4.1 / §5.1 / §6.1 / §7.1，不要改写。
 //
 // 校验一律复用 src/media/interface.js：validatePath / parsePages / validateTimeRange / validateCrop。
 
@@ -43,7 +43,7 @@ import {
 } from './images.js';
 
 /* ------------------------------------------------------------------ *
- * 工具描述（契约 §4.1–§8.1，逐字复制）
+ * 工具描述（契约 §4.1–§7.1，逐字复制）
  * ------------------------------------------------------------------ */
 
 export const PROBE_DESCRIPTION = `Inspect a local media file — video, audio recording, or document — and report what it is:
@@ -144,19 +144,6 @@ says so instead of guessing. Use media_overview if you only need the visuals.
 Each match is tagged with its source. A match whose source is "asr" came from machine
 transcription, so the wording may be wrong (names, numbers, jargon) — do not present it as the
 speaker's exact words.`;
-
-export const SUBTITLES_DESCRIPTION = `Read subtitles for a local media file and return them as timestamped segments.
-(读取本地字幕文件或视频内嵌字幕轨，解析成带时间轴的段落列表。)
-
-Two sources, in this order: an explicit subtitle selection (a local .srt, .vtt, .ass or .ssa file,
-a track index, or a language code), or the subtitle track embedded in the container. Auto-discovery
-also picks up a sibling file with the same base name in the same directory (a.srt next to a.mp4)
-when neither of the above is available — the source and the exact path are always reported back,
-never silently.
-
-No image and no pixels spent: the result is text with millisecond and second timestamps.
-Use media_locate to search inside the subtitles. Use media_overview if you also want to see
-what is on screen.`;
 
 /* ------------------------------------------------------------------ *
  * 参数 schema
@@ -289,13 +276,6 @@ export const TOOL_SHAPES = Object.freeze({
     segment: SEGMENT_PARAM,
     pages: PAGES_PARAM,
     includeFrame: INCLUDE_FRAME_PARAM,
-  },
-  video_subtitles: {
-    path: PATH_PARAM,
-    subtitle: SUBTITLE_PARAM,
-    start: START_PARAM,
-    end: END_PARAM,
-    pages: PAGES_PARAM,
   },
 });
 
@@ -602,11 +582,6 @@ function resolveTranscriptInfo(result, segments) {
  * 文本格式化（契约 §4.4 / §5.4 / §6.4 / §7.4 / §8.4）
  * ------------------------------------------------------------------ */
 
-function wrapText(text) {
-  const value = String(text ?? '');
-  return value ? `「${value}」` : '';
-}
-
 /** ASR 是机器转写：不加引号，避免看起来像原话（契约 §2.5 的硬约束） */
 function quoteBySource(text, source) {
   const value = String(text ?? '');
@@ -866,23 +841,6 @@ function formatLocateText({ query, matches, totalSegments, mediaType }) {
   lines.push(mediaType === 'document'
     ? 'Feed any of these pages to media_zoom({ path, page }) — no need to re-read the whole file.'
     : 'Feed any of these windows to media_zoom({ path, start, end }) — no need to re-read the whole file.');
-  return lines.join('\n');
-}
-
-function formatSubtitlesText({ base, sourcePath, format, language, origin, segments }) {
-  const attrs = [
-    `path="${base.path}"`,
-    'source="subtitle"',
-    `origin="${origin}"`,
-    sourcePath ? `file="${sourcePath}"` : null,
-    format ? `format="${format}"` : null,
-    language ? `language="${language}"` : null,
-    `segments="${segments.length}"`,
-  ].filter(Boolean);
-  const lines = [`<subtitles ${attrs.join(' ')} />`];
-  for (const segment of segments) {
-    lines.push(`${padLabel(`[${segment.index}`, 4)}] ${rangeLabel(segment.startMs, segment.endMs)}  (subtitle)  ${wrapText(segment.text)}`.trimEnd());
-  }
   return lines.join('\n');
 }
 
@@ -1635,76 +1593,16 @@ function normalizeMatches(rawMatches, pageCount) {
   });
 }
 
-async function handleSubtitles(args, call) {
-  const base = await resolveMedia(args);
-  if (base.mediaType === 'document') {
-    throw new ToolError(
-      'INVALID_ARGUMENT',
-      'video_subtitles is not applicable to document media. Documents have a page text layer, not a transcript.',
-    );
-  }
-  checkApplicability(args, base.mediaType);
-  checkMethod(base.mediaType, 'subtitles');
-
-  // 只有给了时间窗才需要 duration 做裁剪；没给就不额外 probe。
-  let durationSec = null;
-  if (args.start !== undefined || args.end !== undefined) {
-    const probe = await internalProbe(base, {}, call);
-    durationSec = numberOrNull(probe.durationSec);
-  }
-  const window = computeTimeWindow(args, durationSec);
-
-  const input = {
-    ...baseInput(base),
-    subtitle: args.subtitle ?? null,
-    startMs: window.startMs,
-    endMs: window.endMs,
-    startSec: window.startSec,
-    endSec: window.endSec,
-    clipped: window.clipped,
-  };
-  const result = (await call.dispatcher.call(base.mediaType, 'subtitles', input, call.backendCtx)) ?? {};
-  const segments = normalizeSegmentsSafe(result.segments);
-  const origin = result.origin ?? segments[0]?.origin ?? 'embedded';
-  const sourcePath = result.sourcePath ?? null;
-  const format = result.format ?? null;
-  const language = result.language ?? null;
-  const warnings = Array.isArray(result.warnings) ? result.warnings : [];
-
-  const text = formatSubtitlesText({ base, sourcePath, format, language, origin, segments });
-  const capped = truncateLines([], text.split('\n'), call.config?.text?.maxInlineChars);
-
-  const structuredContent = {
-    mediaType: base.mediaType,
-    path: base.path,
-    source: 'subtitle',
-    origin,
-    sourcePath,
-    format,
-    language,
-    segmentCount: segments.length,
-    segments,
-    ...(capped.truncated ? { truncated: true } : {}),
-    ...(warnings.length > 0 ? { warnings } : {}),
-  };
-
-  return {
-    content: [{ type: 'text', text: capped.text }],
-    structuredContent,
-  };
-}
-
 /* ------------------------------------------------------------------ *
  * 注册
  * ------------------------------------------------------------------ */
 
-/** 5 个工具的定义表（顺序即注册顺序） */
+/** 4 个工具的定义表（顺序即注册顺序） */
 export const TOOL_DEFINITIONS = Object.freeze([
   { name: 'media_probe', title: 'Probe media', description: PROBE_DESCRIPTION, shape: TOOL_SHAPES.media_probe, handler: handleProbe },
   { name: 'media_overview', title: 'Overview', description: OVERVIEW_DESCRIPTION, shape: TOOL_SHAPES.media_overview, handler: handleOverview },
   { name: 'media_zoom', title: 'Zoom', description: ZOOM_DESCRIPTION, shape: TOOL_SHAPES.media_zoom, handler: handleZoom },
   { name: 'media_locate', title: 'Locate', description: LOCATE_DESCRIPTION, shape: TOOL_SHAPES.media_locate, handler: handleLocate },
-  { name: 'video_subtitles', title: 'Subtitles', description: SUBTITLES_DESCRIPTION, shape: TOOL_SHAPES.video_subtitles, handler: handleSubtitles },
 ]);
 
 /**
@@ -1768,7 +1666,7 @@ export function createCallContext(runtime, extra, toolName) {
 }
 
 /**
- * 把 5 个工具注册到 McpServer。
+ * 把 4 个工具注册到 McpServer。
  *
  * @param {import('@modelcontextprotocol/sdk/server/mcp.js').McpServer} server
  * @param {object} runtime { config, logger, cache, asrProvider, docProvider, backends, dispatcher }

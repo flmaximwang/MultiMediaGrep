@@ -1,6 +1,6 @@
 # 视频后端
 
-`createVideoBackend(ctx)` 返回 `{ probe, overview, zoom, locate, subtitles }`，接口与字段见
+`createVideoBackend(ctx)` 返回 `{ probe, overview, zoom, locate }`，接口与字段见
 `docs/mcp-contract.md` §4–§8。这里不调用 LLM、不联网、不下载；所有临时文件只写
 `MMGREP_CACHE_DIR`（默认 `~/.cache/multimediagrep`）。
 
@@ -8,7 +8,7 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `index.js` | 五个工具入口、窗口校验、NO_TRANSCRIPT 文案 |
+| `index.js` | 四个工具入口、窗口校验、NO_TRANSCRIPT 文案 |
 | `probe.js` | ffprobe 读流信息；只解码音频流做 audioHealth（带进程内缓存） |
 | `transcript.js` | 转写来源解析：显式字幕选择 → 内嵌轨 → 同名字幕 → ASR 兜底 |
 | `storyboard.js` | 镜头切点、格范围、宫格拼图 |

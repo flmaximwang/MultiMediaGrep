@@ -1,7 +1,6 @@
 // src/backend/audio/index.js —— 录音后端
-// 职责：probe（含音频体检）/ overview（字幕或 ASR → 带时间轴的段落列表）/ locate（短语→时间码）/
-//       subtitles（只读已有字幕，不跑 ASR，契约 §8）。
-// 字幕来源判定、音频体检、切片与合并的约定见 docs/mcp-contract.md §4.3.1、§7、§8。
+// 职责：probe（含音频体检）/ overview（字幕或 ASR → 带时间轴的段落列表）/ locate（短语→时间码）。
+// 字幕来源判定、音频体检、切片与合并的约定见 docs/mcp-contract.md §4.3.1、§7、§8.5。
 
 import { mkdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
@@ -442,44 +441,7 @@ export function createAudioBackend(ctx = {}) {
     };
   }
 
-  /** 契约 §8：只读已有字幕，不跑 ASR；没有任何字幕来源就报 NO_TRANSCRIPT */
-  async function subtitles(input, callCtx = backendCtx()) {
-    const c = callCtx;
-    const info = await ffprobeJson(input.path, { signal: c.signal });
-    const warnings = [];
-    const subtitle = await resolveSubtitleSource({
-      mediaPath: input.path,
-      subtitle: input.subtitle,
-      streams: info?.streams ?? [],
-      signal: c.signal,
-      warnings,
-    });
-    if (!subtitle) {
-      throw new ToolError(
-        'NO_TRANSCRIPT',
-        `no subtitle source for "${input.path}": no embedded subtitle track, no sibling .srt/.vtt/.ass/.ssa file, `
-          + 'and no ASR provider configured. Pass subtitle with a local subtitle file, a track index, or a language code.',
-      );
-    }
-    let segments = subtitle.segments.map((s) => ({ ...s, source: 'subtitle', origin: subtitle.origin }));
-    const startMs = input.startMs ?? null;
-    const endMs = input.endMs ?? null;
-    if (startMs !== null || endMs !== null) {
-      segments = segments.filter((s) => inWindow(s, startMs, endMs));
-    }
-    return {
-      mediaType: 'audio',
-      path: input.path,
-      segments,
-      origin: subtitle.origin,
-      sourcePath: subtitle.sourcePath,
-      format: subtitle.format,
-      language: subtitle.language,
-      warnings: [...new Set([...warnings, ...subtitle.warnings])],
-    };
-  }
-
-  return { probe, overview, locate, subtitles };
+  return { probe, overview, locate };
 }
 
 export default createAudioBackend;

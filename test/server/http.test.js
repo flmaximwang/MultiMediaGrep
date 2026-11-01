@@ -31,7 +31,7 @@ const JSON_HEADERS = {
   accept: 'application/json, text/event-stream',
 };
 
-const TOOL_NAMES = ['media_probe', 'media_overview', 'media_zoom', 'media_locate', 'video_subtitles'];
+const TOOL_NAMES = ['media_probe', 'media_overview', 'media_zoom', 'media_locate'];
 
 /* ------------------------------------------------------------------ *
  * 夹具
@@ -210,7 +210,7 @@ async function listFiles(dir) {
  * 用例
  * ------------------------------------------------------------------ */
 
-test('http：initialize 之后 tools/list 返回 5 个工具', async () => {
+test('http：initialize 之后 tools/list 返回 4 个工具', async () => {
   await withHttpServer({}, async ({ endpoint }) => {
     const init = await rpc(endpoint, {
       jsonrpc: '2.0',
@@ -284,7 +284,7 @@ test('http：配了令牌就必须带对 Authorization 头', async () => {
 
     const right = await rpc(endpoint, message, { authorization: `Bearer ${token}` });
     assert.equal(right.status, 200);
-    assert.equal(right.json.result.tools.length, 5);
+    assert.equal(right.json.result.tools.length, 4);
 
     // 令牌**不认** query string：带了也没用
     const viaQuery = await fetch(`${endpoint.url}?token=${encodeURIComponent(token)}`, {
@@ -328,7 +328,7 @@ test('http：非 ASCII 令牌经真实 HTTP 头（UTF-8 字节）端到端通过
 
     const right = await rawRpc(endpoint, message, Buffer.from(token, 'utf8'));
     assert.equal(right.status, 200);
-    assert.equal(JSON.parse(right.text).result.tools.length, 5);
+    assert.equal(JSON.parse(right.text).result.tools.length, 4);
 
     const wrong = await rawRpc(endpoint, message, Buffer.from('测试令牌-错误', 'utf8'));
     assert.equal(wrong.status, 401);
@@ -557,7 +557,7 @@ test('http：逐请求凭据 —— 同一端点两个请求各用各的 provide
         'x-mmgrep-elevenlabs-model': 'sentinel-elevenlabs-model',
       });
       assert.equal(first.status, 200);
-      assert.equal(first.json.result.tools.length, 5);
+      assert.equal(first.json.result.tools.length, 4);
 
       const second = await rpc(endpoint, { ...list, id: 2 }, {
         'x-mmgrep-asr-provider': 'openai-compatible',
