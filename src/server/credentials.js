@@ -24,6 +24,8 @@
 import { ToolError } from '../media/interface.js';
 import {
   DEFAULT_MAX_TEXT_INLINE_CHARS,
+  DOC_ROLE_ENV,
+  DOC_ROLE_PROVIDERS,
   MAX_TEXT_INLINE_CHARS_HARD_CAP,
   PROVIDER_ENV,
 } from './config.js';
@@ -36,8 +38,13 @@ function headerName(envName) {
 /**
  * 请求头表。结构刻意与 PROVIDER_ENV 对齐：
  *   REQUEST_HEADERS[kind].provider          provider 选择头
- *   REQUEST_HEADERS[kind].genericApiKey     旧的「共用」key 头（兜底，带弃用语义）
+ *   REQUEST_HEADERS[kind].genericApiKey     旧的「共用」key 头（仅 ASR 仍有；文档角色已删除）
  *   REQUEST_HEADERS[kind].providers[id]     该 provider 专属的 apiKey / baseUrl / model 头
+ *
+ * 文档 provider 有两个角色（契约 v2）：ocr / typeset。两个角色共用 MinerU 的
+ * 凭据头（x-mmgrep-mineru-*），但各自有独立的 provider 选择头：
+ *   x-mmgrep-ocr-provider     ↔ MMGREP_OCR_PROVIDER
+ *   x-mmgrep-typeset-provider ↔ MMGREP_TYPESET_PROVIDER
  *
  * 全部小写：Node 的 req.headers 键本来就是小写，比较时不用再做大小写归一。
  * 这张表由 PROVIDER_ENV 生成，provider 增删时不会和配置层漂移。
@@ -58,9 +65,26 @@ function buildKindHeaders(kind) {
   });
 }
 
+/** 文档角色头：只有 provider 选择头 + 外部 provider 的凭据头（没有通用 key 头）。 */
+function buildDocRoleHeaders(role) {
+  const providers = {};
+  for (const [providerId, spec] of Object.entries(PROVIDER_ENV.doc)) {
+    providers[providerId] = Object.freeze({
+      apiKey: headerName(spec.apiKey),
+      baseUrl: headerName(spec.baseUrl),
+      model: headerName(spec.model),
+    });
+  }
+  return Object.freeze({
+    provider: headerName(DOC_ROLE_ENV[role]),
+    providers: Object.freeze(providers),
+  });
+}
+
 export const REQUEST_HEADERS = Object.freeze({
   asr: buildKindHeaders('asr'),
-  doc: buildKindHeaders('doc'),
+  ocr: buildDocRoleHeaders('ocr'),
+  typeset: buildDocRoleHeaders('typeset'),
 });
 
 /**
@@ -68,16 +92,18 @@ export const REQUEST_HEADERS = Object.freeze({
  * 用于「这个请求到底带没带凭据」与「该屏蔽哪些值」。
  */
 function collectHeaderNames() {
-  const names = [];
-  for (const kind of ['asr', 'doc']) {
+  const names = new Set();
+  for (const kind of ['asr', 'ocr', 'typeset']) {
     const spec = REQUEST_HEADERS[kind];
-    names.push(spec.provider);
+    names.add(spec.provider);
     for (const provider of Object.values(spec.providers)) {
-      names.push(provider.apiKey, provider.baseUrl, provider.model);
+      names.add(provider.apiKey);
+      names.add(provider.baseUrl);
+      names.add(provider.model);
     }
-    names.push(spec.genericApiKey);
+    if (spec.genericApiKey) names.add(spec.genericApiKey);
   }
-  return Object.freeze(names);
+  return Object.freeze([...names]);
 }
 
 export const CREDENTIAL_HEADERS = collectHeaderNames();
@@ -172,10 +198,10 @@ function unsupportedProvider(kind, header) {
 const DEFAULT_FIELD = Object.freeze({ baseUrl: 'defaultBaseUrl', model: 'defaultModel' });
 
 /**
- * 解析一个 provider 分组（asr / doc）。
+ * 解析 ASR provider 分组（文档 provider 走 resolveDocRole：它有两个角色）。
  *
- * @param {'asr'|'doc'} kind
- * @param {object} baseSection baseConfig.asr / baseConfig.doc
+ * @param {'asr'} kind
+ * @param {object} baseSection baseConfig.asr
  * @param {object} headers 已归一化（小写键）的头对象
  * @param {object} env 服务器环境变量
  * @returns {{section: object, used: object}}
@@ -267,6 +293,104 @@ function resolveSection(kind, baseSection, headers, env) {
 }
 
 /**
+ * 解析一个文档角色（ocr / typeset）的请求级配置。
+ *
+ * 优先级：角色 provider 头 > baseConfig 里的角色 provider；选定外部 provider
+ * （MinerU）后，凭据逐字段按「专属头 > env > baseConfig（仅当 provider 相同）>
+ * 内置默认值」取值。builtin / none 不需要凭据。
+ *
+ * @param {'ocr'|'typeset'} role
+ * @param {object} baseSection baseConfig.ocr / baseConfig.typeset
+ * @param {object} headers 已归一化（小写键）的头对象
+ * @param {object} env 服务器环境变量
+ * @returns {{section: object, used: object}}
+ */
+function resolveDocRole(role, baseSection, headers, env) {
+  const headerSpec = REQUEST_HEADERS[role];
+  const base = baseSection ?? {};
+  const defaultProvider = role === 'typeset' ? 'builtin' : 'none';
+  const baseProvider = String(base.provider ?? defaultProvider).trim().toLowerCase();
+
+  const used = { provider: null, apiKey: null, baseUrl: null, model: null };
+  const providerHeaderValue = readHeader(headers, headerSpec.provider);
+  let provider = baseProvider;
+  if (providerHeaderValue !== undefined) {
+    const normalizedId = providerHeaderValue.toLowerCase();
+    if (!DOC_ROLE_PROVIDERS[role].includes(normalizedId)) {
+      throw new ToolError(
+        'INVALID_ARGUMENT',
+        `${headerSpec.provider} is not a supported ${role} provider. `
+          + `Allowed values: ${DOC_ROLE_PROVIDERS[role].join(', ')}.`,
+      );
+    }
+    provider = normalizedId;
+    used.provider = headerSpec.provider;
+  }
+
+  // builtin / none：没有外部凭据可覆盖。
+  if (provider === 'none' || provider === 'builtin') {
+    return {
+      section: {
+        ...base,
+        provider,
+        apiKey: '',
+        apiKeySource: null,
+        baseUrl: base.baseUrl ?? '',
+        model: base.model ?? '',
+      },
+      used,
+    };
+  }
+
+  const envSpec = PROVIDER_ENV.doc[provider];
+  const providerHeaders = headerSpec.providers[provider];
+  const sameAsBase = baseProvider === provider;
+
+  const pick = (field) => {
+    const fromHeader = readHeader(headers, providerHeaders[field]);
+    if (fromHeader !== undefined) {
+      used[field] = providerHeaders[field];
+      return { value: fromHeader, source: providerHeaders[field] };
+    }
+
+    const envValue = readEnv(env, envSpec[field]);
+    if (envValue !== undefined) return { value: envValue, source: envSpec[field] };
+
+    if (sameAsBase) {
+      const baseValue = base[field];
+      if (field === 'apiKey') {
+        return {
+          value: typeof baseValue === 'string' ? baseValue : '',
+          source: base.apiKeySource ?? null,
+        };
+      }
+      if (typeof baseValue === 'string' && baseValue !== '') {
+        return { value: baseValue, source: null };
+      }
+    }
+
+    if (field === 'apiKey') return { value: '', source: null };
+    return { value: envSpec[DEFAULT_FIELD[field]], source: null };
+  };
+
+  const apiKey = pick('apiKey');
+  const baseUrl = pick('baseUrl');
+  const model = pick('model');
+
+  return {
+    section: {
+      ...base,
+      provider,
+      apiKey: apiKey.value,
+      apiKeySource: apiKey.source,
+      baseUrl: baseUrl.value,
+      model: model.value,
+    },
+    used,
+  };
+}
+
+/**
  * 解析请求级内联文本上限。优先级：请求头 > baseConfig（env / 默认 24000）。
  *
  * 与 provider 头不同，这个头**不合法也不报错**：配置类设置配错只记 warning 并回落到
@@ -319,19 +443,22 @@ export function resolveConfigForRequest(baseConfig, headers = {}, env = process.
   const overridesHeaderNames = presentCredentialHeaders(normalized);
 
   const asr = resolveSection('asr', baseConfig?.asr, normalized, env);
-  const doc = resolveSection('doc', baseConfig?.doc, normalized, env);
+  const ocr = resolveDocRole('ocr', baseConfig?.ocr, normalized, env);
+  const typeset = resolveDocRole('typeset', baseConfig?.typeset, normalized, env);
   const maxInlineChars = resolveMaxTextInlineChars(baseConfig?.text, normalized, logger);
 
   const config = {
     ...baseConfig,
     asr: Object.freeze({ ...(baseConfig?.asr ?? {}), ...asr.section }),
-    doc: Object.freeze({ ...(baseConfig?.doc ?? {}), ...doc.section }),
+    ocr: Object.freeze({ ...(baseConfig?.ocr ?? {}), ...ocr.section }),
+    typeset: Object.freeze({ ...(baseConfig?.typeset ?? {}), ...typeset.section }),
     text: Object.freeze({ ...(baseConfig?.text ?? {}), maxInlineChars: maxInlineChars.value }),
     requestOverrides: Object.freeze({
       // 只有名字：任何值都不许出现在这里（它可能被 handler / 调试端点序列化）。
       present: Object.freeze(overridesHeaderNames),
       asr: Object.freeze(asr.used),
-      doc: Object.freeze(doc.used),
+      ocr: Object.freeze(ocr.used),
+      typeset: Object.freeze(typeset.used),
       text: Object.freeze({ maxInlineChars: maxInlineChars.used }),
     }),
   };

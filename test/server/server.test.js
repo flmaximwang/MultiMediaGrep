@@ -51,7 +51,7 @@ async function withStdioClient(fn) {
       MMGREP_CACHE_DIR: path.join(dir, 'cache'),
       MMGREP_LOG_LEVEL: 'info',
       MMGREP_ASR_PROVIDER: 'none',
-      MMGREP_DOC_PROVIDER: 'none',
+      MMGREP_OCR_PROVIDER: 'none',
     },
     stderr: 'pipe',
   });
@@ -131,7 +131,7 @@ test('stdio：SIGTERM 后进程正常退出', { timeout: 30000 }, async () => {
       MMGREP_CACHE_DIR: path.join(dir, 'cache'),
       MMGREP_LOG_LEVEL: 'error',
       MMGREP_ASR_PROVIDER: 'none',
-      MMGREP_DOC_PROVIDER: 'none',
+      MMGREP_OCR_PROVIDER: 'none',
     },
     stderr: 'pipe',
   });

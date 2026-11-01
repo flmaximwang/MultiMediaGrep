@@ -139,11 +139,12 @@ function assertImagesWithinBudget(images, { cells, images: maxImages, maxEdge })
   assert.ok(totalCells <= cells * maxImages, 'total cells within the call budget');
 }
 
-function stubDocProvider({ fail = null, texts = () => '' } = {}) {
+function stubDocProvider({ fail = null, texts = () => '', id = 'stub', roles = null } = {}) {
   const calls = [];
   const provider = {
-    id: 'stub',
-    describe: () => ({ id: 'stub', model: 'stub-v1', baseUrl: null }),
+    id,
+    ...(roles ? { roles } : {}),
+    describe: () => ({ id, model: 'stub-v1', baseUrl: null }),
     async parse(input) {
       calls.push(input);
       if (fail) throw fail;
@@ -152,9 +153,20 @@ function stubDocProvider({ fail = null, texts = () => '' } = {}) {
           ? Array.from({ length: input.pages.to - input.pages.from + 1 }, (_, i) => input.pages.from + i)
           : []);
       return {
-        provider: 'stub',
+        provider: id,
         model: 'stub-v1',
-        pages: requested.map((page) => ({ page, text: texts(page) })),
+        pages: requested.map((page) => {
+          const text = texts(page);
+          const textOrigin = input.ocrMode === 'force'
+            ? 'ocr'
+            : (input.role === 'typeset' ? 'textlayer' : 'ocr');
+          return {
+            page,
+            textOrigin,
+            blocks: text ? [{ type: 'paragraph', text }] : [],
+            text,
+          };
+        }),
       };
     },
   };
@@ -243,7 +255,8 @@ test('probe：文本 PDF 的契约字段、文字层与 OCR 能力', { skip: ski
     assert.equal(probe.capabilities.asr.provider, null);
     assert.equal(probe.capabilities.ocr.available, false);
     assert.equal(probe.capabilities.ocr.provider, null);
-    assert.match(probe.capabilities.ocr.reason, /No document parser is configured/);
+    assert.match(probe.capabilities.ocr.reason, /No OCR provider is configured/);
+    assert.equal(probe.capabilities.typeset.available, false);
     assert.equal(probe.capabilities.transcriptSource, 'ocr');
     assert.equal(probe.capabilities.transcriptOrigin, 'ocr');
     assert.equal(probe.capabilities.transcriptPath, null);
@@ -437,7 +450,7 @@ test('overview：stub provider OCR 段落映射；provider 失败时降级不报
 }, async () => {
   await withCache(async () => {
     const stub = stubDocProvider({ texts: scanText });
-    const backend = createDocumentBackend({ docProvider: stub.provider, config: {} });
+    const backend = createDocumentBackend({ ocrProvider: stub.provider, config: {} });
     const result = await backend.overview({
       path: SCANNED_PDF,
       pages: [1, 2],
@@ -455,15 +468,19 @@ test('overview：stub provider OCR 段落映射；provider 失败时降级不报
     assert.equal(result.transcript.provider, 'stub');
     assert.equal(result.transcript.model, 'stub-v1');
     assert.deepEqual(stub.calls[0].pages, { from: 1, to: 2 });
+    assert.equal(stub.calls[0].role, 'ocr');
+    assert.equal(stub.calls[0].ocrMode, 'auto');
     for (const segment of result.segments) {
       assert.equal(segment.source, 'ocr');
       assert.equal(segment.origin, 'ocr');
+      assert.equal(segment.textOrigin, 'ocr');
+      assert.ok(segment.blocks.length > 0);
     }
 
     const failing = stubDocProvider({
       fail: new Error('stub OCR unavailable (Authorization: Bearer sk-supersecret123456789)'),
     });
-    const degradedBackend = createDocumentBackend({ docProvider: failing.provider, config: {} });
+    const degradedBackend = createDocumentBackend({ ocrProvider: failing.provider, config: {} });
     const degraded = await degradedBackend.overview({
       path: SCANNED_PDF,
       pages: [1],
@@ -475,8 +492,8 @@ test('overview：stub provider OCR 段落映射；provider 失败时降级不报
     assertImagesWithinBudget(degraded.images, { cells: 1, images: 1, maxEdge: 500 });
     assert.equal(degraded.segments[0].text, '');
     assert.equal(degraded.transcript.source, 'none');
-    assert.ok(degraded.warnings.some((warning) => /document parser "stub" failed/.test(warning)));
-    assert.ok(degraded.warnings.some((warning) => /No text layer was available; page images only/.test(warning)));
+    assert.ok(degraded.warnings.some((warning) => /OCR provider "stub" failed/.test(warning)));
+    assert.ok(degraded.warnings.some((warning) => /Pages without a text layer are returned as page images only/.test(warning)));
     assert.ok(degraded.warnings.every((warning) => !warning.includes('sk-supersecret123456789')));
     assert.ok(degraded.warnings.some((warning) => warning.includes('Bearer ***')));
 

@@ -7,8 +7,8 @@
 //   locate   在页面文字里找短语，返回页码；可选附最佳匹配页的图
 //
 // 设计约束：
-//   - server 本身**不调用任何 LLM**。OCR / 文档解析交给用户配置的 ctx.docProvider；
-//     没配就只出页面图，让多模态模型自己看。
+//   - server 本身**不调用任何 LLM**。OCR 交给 ctx.ocrProvider，有文字层页的排版
+//     交给 ctx.typesetProvider（契约 v2）；没配就只出页面图 / 原生文字层。
 //   - 不假设部署机装了 PDF 工具：运行时探测，缺工具时抛 TOOL_NOT_FOUND 并点名安装包。
 //     栅格化链 pdftoppm → mutool draw → gs；文字层链 pdftotext → mutool。
 //   - 所有命令走 media/ffmpeg.js 的 run()（spawn，无 shell 拼接）。
@@ -27,7 +27,13 @@ import { ffprobeJson } from '../../media/ffmpeg.js';
 import { ToolError, validateCrop } from '../../media/interface.js';
 import { matchSegments } from '../../media/match.js';
 import { IMAGE_LIMITS, layoutForCells } from '../../server/images.js';
-import { providerApiKeyEnv } from '../../server/config.js';
+import { providerApiKeyEnv, providerEnv } from '../../server/config.js';
+import {
+  blocksToText,
+  createBuiltinTypesetProvider,
+  normalizeBlocks,
+  textToBlocks,
+} from '../../providers/doc/builtin.js';
 import { createPdfSupport, normalizePageText } from './pdf.js';
 import {
   DEFAULT_LOCATE_FRAME_MAX_EDGE,
@@ -82,7 +88,7 @@ const DOCUMENT_FORMATS_HINT =
   + 'and plain text (.txt .md .markdown).';
 
 const OCR_HINT =
-  'Configure a document parser with MMGREP_DOC_PROVIDER=mineru and MMGREP_MINERU_API_KEY, '
+  'Configure an OCR provider with MMGREP_OCR_PROVIDER=mineru and MMGREP_MINERU_API_KEY, '
   + 'or use media_overview to work from the page images.';
 
 /* ------------------------------------------------------------------ *
@@ -305,24 +311,36 @@ function isLoopback(url) {
   }
 }
 
-/** 与 server/tools.js 的 docProviderUsable 保持一致：provider 存在 ≠ 可用（可能缺 key）。 */
-function docProviderState(ctx) {
-  const provider = ctx.docProvider ?? null;
+/**
+ * 文档 provider 的某个角色（ocr / typeset）的状态。
+ *
+ * 与 server/tools.js 的 docRoleProviderUsable 保持一致：provider 存在 ≠ 可用
+ * （外部 provider 可能缺 key）。builtin / none 没有凭据，不需要 key。
+ */
+function docRoleState(ctx, role) {
+  const provider = ctx?.[`${role}Provider`] ?? null;
+  const config = ctx?.config?.[role] ?? null;
+  const envName = role === 'ocr' ? 'MMGREP_OCR_PROVIDER' : 'MMGREP_TYPESET_PROVIDER';
+
   if (!provider) {
     return {
-      configured: false,
+      role,
+      configured: Boolean(config?.provider && config.provider !== 'none'),
       available: false,
       id: null,
       provider: null,
-      reason: 'No document parser is configured (MMGREP_DOC_PROVIDER is "none"). '
-        + 'Scanned pages and images are returned as page images only.',
+      reason: role === 'ocr'
+        ? `No OCR provider is configured (${envName} is "none"). Pages without a text layer are returned as page images only.`
+        : `No typeset provider is configured (${envName} is "none"). Pages with a text layer use the raw extracted text.`,
     };
   }
-  const config = ctx.config?.doc;
+
   const configuredProvider = config?.provider && config.provider !== 'none' ? config.provider : null;
   const sameProvider = configuredProvider !== null && (!provider.id || configuredProvider === provider.id);
-  if (config && sameProvider && !config.apiKey && !isLoopback(config.baseUrl)) {
+  const external = providerEnv('doc', provider.id);
+  if (config && sameProvider && external && !config.apiKey && !isLoopback(config.baseUrl)) {
     return {
+      role,
       configured: true,
       available: false,
       id: provider.id ?? null,
@@ -330,12 +348,29 @@ function docProviderState(ctx) {
       reason: `${providerApiKeyEnv('doc', config.provider)} is not set for provider "${config.provider ?? provider.id ?? 'unknown'}".`,
     };
   }
+
   return {
+    role,
     configured: true,
     available: true,
     id: provider.id ?? null,
     provider: provider.id ?? null,
     reason: null,
+  };
+}
+
+/** 两个角色合并成一个旧形状（probe / locate 的兼容字段）。 */
+function combinedDocState(ocrState, typesetState) {
+  const available = ocrState.available || typesetState.available;
+  const configured = ocrState.configured || typesetState.configured;
+  return {
+    configured,
+    available,
+    id: ocrState.available ? ocrState.id : typesetState.id,
+    provider: ocrState.available ? ocrState.provider : typesetState.provider,
+    reason: available
+      ? null
+      : [ocrState.reason, typesetState.reason].filter(Boolean).join(' '),
   };
 }
 
@@ -366,10 +401,15 @@ function toProviderFailure(error, secret = null) {
   return { code, message };
 }
 
-function providerFailureHint(code) {
+function providerFailureHint(code, role = null) {
+  const fallback = role === 'ocr'
+    ? 'set MMGREP_OCR_PROVIDER=none to return page images only'
+    : role === 'typeset'
+      ? 'set MMGREP_TYPESET_PROVIDER=none to use the raw PDF text layer'
+      : 'set MMGREP_OCR_PROVIDER=none / MMGREP_TYPESET_PROVIDER=none to fall back';
   return code === 'PROVIDER_NOT_CONFIGURED'
-    ? 'Set the provider-specific API key (for MinerU: MMGREP_MINERU_API_KEY), or unset MMGREP_DOC_PROVIDER to fall back to page images.'
-    : 'Retry, check MMGREP_MINERU_BASE_URL / MMGREP_MINERU_MODEL, or unset MMGREP_DOC_PROVIDER to fall back to page images.';
+    ? `Set the provider-specific API key (for MinerU: MMGREP_MINERU_API_KEY), or ${fallback}.`
+    : `Retry, check MMGREP_MINERU_BASE_URL / MMGREP_MINERU_MODEL, or ${fallback}.`;
 }
 
 /** provider 的 pages 参数：连续区间用 {from,to}，离散页用 {list}。 */
@@ -400,136 +440,402 @@ function transcriptFor({ anyText, providerId = null, model = null, reason = null
   };
 }
 
+function emptyPage(page) {
+  return { page, textOrigin: 'unknown', blocks: [], text: '' };
+}
+
+/** 规整 provider 返回的一页：blocks / textOrigin / text（text 由 blocks 派生）。 */
+function normalizeProviderPage(entry, fallbackOrigin = 'unknown') {
+  const page = Number(entry?.page);
+  if (!Number.isInteger(page) || page < 1) return null;
+
+  const blocks = normalizeBlocks(entry?.blocks);
+  if (blocks.length === 0) {
+    const fallbackText = String(entry?.text ?? '').trim();
+    if (fallbackText) blocks.push({ type: 'paragraph', text: fallbackText });
+  }
+  const textOrigin = ['textlayer', 'ocr', 'unknown'].includes(entry?.textOrigin)
+    ? entry.textOrigin
+    : fallbackOrigin;
+  const tables = Array.isArray(entry?.tables) ? entry.tables : undefined;
+
+  return {
+    page,
+    textOrigin,
+    blocks,
+    text: blocksToText(blocks),
+    ...(tables ? { tables } : {}),
+  };
+}
+
+/** 调一次 provider.parse（契约 v2 的 role / ocrMode 输入）。 */
+async function parseWithProvider({ provider, role, pages, ocrMode, textLayers, info, ctx }) {
+  const stage = role === 'typeset' ? 'typeset' : 'ocr';
+  ctx.onProgress?.({
+    stage,
+    detail: `parsing ${pages.length} page(s) with ${provider.id ?? 'document provider'} (${role})`,
+  });
+  return provider.parse(
+    {
+      filePath: info.path,
+      pages: pageSpecForProvider(pages),
+      role,
+      ocrMode,
+      signal: ctx.signal,
+      ...(textLayers ? { textLayers } : {}),
+    },
+    {
+      onProgress: (step, detail) => ctx.onProgress?.({
+        stage,
+        detail: detail ? `${step}: ${detail}` : String(step ?? stage),
+      }),
+    },
+  );
+}
+
 /**
- * 收集页文字：provider → PDF 文字层 → 空。
+ * 收集页文字（契约 v2 的逐页路由）。
+ *
+ *   PDF：逐页文字层检测（9z5.27）→ 有文字层的页走 typeset，没有的走 OCR。
+ *        两个角色是同一个 provider 且 ocrMode=auto 时只发**一次** parse（role: 'both'），
+ *        再按 provider 返回的逐页 textOrigin 分配。
+ *   图片：一律走 OCR。
+ *   文本：不走 provider，textOrigin = textlayer。
  *
  * 返回的 texts 对**每个请求页**都有条目（没有文字时为空串），这样 overview 的
  * 段落/page 号才能和页码严格对齐。
  *
  * @returns {Promise<{
  *   texts: Map<number,string>,
+ *   pages: Map<number,{page:number,textOrigin:string,blocks:Array<object>,text:string,tables?:Array<object>}>,
  *   transcript: object,
  *   warnings: string[],
  *   providerError: {code:string,message:string}|null,
+ *   providerErrors: object,
  *   providerState: object,
+ *   ocrState: object,
+ *   typesetState: object,
  *   providerId: string|null,
  *   providerModel: string|null,
  *   providerUsed: boolean,
  *   nativeUsed: boolean,
  *   noTextReason: string|null,
+ *   textPageCount: number,
+ *   ocrPageCount: number,
  * }>}
  */
-async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings }) {
+async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMode = 'auto' }) {
+  const pageMap = new Map(pages.map((page) => [page, emptyPage(page)]));
   const texts = new Map(pages.map((page) => [page, '']));
+  const ocrState = docRoleState(ctx, 'ocr');
+  const typesetState = docRoleState(ctx, 'typeset');
+  const providerErrors = {};
+  const forceOcr = ocrMode === 'force';
+  let textPageCount = 0;
+  let ocrPageCount = 0;
 
-  // 纯文本不需要 OCR：文件本身就是文字层。
+  let providerUsed = false;
+  let nativeUsed = false;
+  let providerId = null;
+  let providerModel = null;
+  let typesetUsed = false;
+
+  const setPage = (entry) => {
+    if (!entry || !pageMap.has(entry.page)) return false;
+    pageMap.set(entry.page, entry);
+    texts.set(entry.page, entry.text);
+    return true;
+  };
+
+  const markUsed = (result, provider, role) => {
+    providerUsed = true;
+    const id = result?.provider ?? provider.id ?? null;
+    const model = result?.model ?? describeModel(provider);
+    if (role === 'typeset' || role === 'both') {
+      typesetUsed = true;
+      providerId = id ?? providerId;
+      providerModel = model ?? providerModel;
+      return;
+    }
+    // 纯 OCR 路径（图片 / 无文字层页）：没有 typeset 结果时才用它填 transcript 的 provider。
+    if (!typesetUsed) {
+      providerId = id ?? providerId;
+      providerModel = model ?? providerModel;
+    }
+  };
+
+  /** 把 provider 结果写进 pageMap；只接受本次目标页。 */
+  const applyResult = (result, provider, { role, targetPages, fallbackOrigin, forceOrigin = null }) => {
+    const wanted = new Set(targetPages);
+    let matched = 0;
+    for (const raw of Array.isArray(result?.pages) ? result.pages : []) {
+      const entry = normalizeProviderPage(raw, fallbackOrigin);
+      if (!entry || !wanted.has(entry.page)) continue;
+      if (forceOrigin) entry.textOrigin = entry.text.trim() ? forceOrigin : 'unknown';
+      setPage(entry);
+      matched += 1;
+    }
+    markUsed(result, provider, role);
+    return matched;
+  };
+
+  const useNativePage = (page) => {
+    const text = String(info.kind === 'pdf' ? (nativeLayerText.get(page) ?? '') : '').trim();
+    if (!text) return false;
+    const blocks = textToBlocks(text);
+    setPage({ page, textOrigin: 'textlayer', blocks, text: blocksToText(blocks) });
+    nativeUsed = true;
+    return true;
+  };
+
+  // 纯文本不需要 OCR：文件本身就是文字层（.21 会映射成 origin=file）。
   if (info.kind === 'text') {
     let text = '';
     if (pages.length > 0) {
       text = normalizePageText(await readFile(info.path, 'utf8'));
-      for (const page of pages) texts.set(page, text);
+      for (const page of pages) {
+        const blocks = textToBlocks(text);
+        setPage({ page, textOrigin: 'textlayer', blocks, text: blocksToText(blocks) });
+      }
     }
     const anyText = hasAnyText(texts);
     const noTextReason = anyText ? null : 'the text file is empty.';
     return {
+      pages: pageMap,
       texts,
       transcript: transcriptFor({ anyText, reason: noTextReason }),
       warnings,
       providerError: null,
-      providerState: docProviderState(ctx),
+      providerErrors,
+      providerState: combinedDocState(ocrState, typesetState),
+      ocrState,
+      typesetState,
       providerId: null,
       providerModel: null,
       providerUsed: false,
       nativeUsed: true,
       noTextReason,
+      textPageCount: pages.length,
+      ocrPageCount: 0,
     };
   }
 
-  const state = docProviderState(ctx);
-  let providerId = null;
-  let providerModel = null;
-  let providerUsed = false;
-  let providerError = null;
-  let providerTextCount = 0;
+  let nativeLayerText = new Map();
 
-  if (state.available && pages.length > 0) {
-    const provider = ctx.docProvider;
-    ctx.onProgress?.({ stage: 'ocr', detail: `parsing ${pages.length} page(s) with ${state.id ?? 'document provider'}` });
-    try {
-      const result = await provider.parse(
-        { filePath: info.path, pages: pageSpecForProvider(pages), signal: ctx.signal },
-        {
-          onProgress: (stage, detail) => ctx.onProgress?.({
-            stage: 'ocr',
-            detail: detail ? `${stage}: ${detail}` : String(stage ?? 'ocr'),
-          }),
-        },
-      );
-      providerUsed = true;
-      providerId = result?.provider ?? state.id ?? null;
-      providerModel = result?.model ?? describeModel(provider);
-      for (const entry of Array.isArray(result?.pages) ? result.pages : []) {
-        const page = Number(entry?.page);
-        if (Number.isInteger(page) && texts.has(page)) {
-          const text = String(entry?.text ?? '');
-          if (text.trim()) providerTextCount += 1;
-          texts.set(page, text);
-        }
-      }
-    } catch (error) {
-      if (ctx.signal?.aborted) throw error;
-      providerError = toProviderFailure(error, ctx.config?.doc?.apiKey ?? null);
-      providerId = null;
-      providerModel = null;
-    }
-  }
-
-  // PDF 文字层：只补齐还空着的页（provider 优先，失败或缺页时兜底）。
-  let nativeUsed = false;
-  if (info.kind === 'pdf') {
-    const missing = pages.filter((page) => !String(texts.get(page) ?? '').trim());
-    if (missing.length > 0) {
-      const native = await pdfSupport.extractText(info.path, missing, { signal: ctx.signal });
-      let filled = 0;
-      for (const page of missing) {
-        const text = native.pages.get(page) ?? '';
-        if (text.trim()) {
-          texts.set(page, text);
-          filled += 1;
-        }
-      }
-      nativeUsed = filled > 0;
-
-      if (providerError) {
+  // 图片文档：一律走 OCR 角色（图片没有文字层）。
+  if (info.kind === 'image') {
+    ocrPageCount = pages.length;
+    if (ocrState.available && pages.length > 0) {
+      try {
+        const provider = ctx.ocrProvider;
+        const result = await parseWithProvider({
+          provider,
+          role: 'ocr',
+          pages,
+          ocrMode: forceOcr ? 'force' : 'auto',
+          info,
+          ctx,
+        });
+        applyResult(result, provider, {
+          role: 'ocr',
+          targetPages: pages,
+          fallbackOrigin: 'ocr',
+          forceOrigin: forceOcr ? 'ocr' : null,
+        });
+      } catch (error) {
+        if (ctx.signal?.aborted) throw error;
+        providerErrors.ocr = toProviderFailure(error, ctx.config?.ocr?.apiKey ?? null);
         warnings.push(
-          `document parser "${state.id ?? 'unknown'}" failed: ${providerError.message}. `
-            + (nativeUsed
-              ? 'Fell back to the PDF text layer where one exists.'
-              : 'No text layer was available; page images only.'),
-        );
-      } else if (providerUsed && filled > 0) {
-        warnings.push(
-          providerTextCount === 0
-            ? 'the document parser returned no text; the PDF text layer was used instead.'
-            : `the document parser returned no text for ${filled} requested page(s); the PDF text layer filled them in.`,
+          `OCR provider "${ocrState.id ?? 'unknown'}" failed: ${providerErrors.ocr.message}. Page images only.`,
         );
       }
-    } else if (providerError) {
-      warnings.push(`document parser "${state.id ?? 'unknown'}" failed: ${providerError.message}. Page images only.`);
     }
-  } else if (providerError) {
-    warnings.push(`document parser "${state.id ?? 'unknown'}" failed: ${providerError.message}. Page images only.`);
+  } else if (info.kind === 'pdf') {
+    // 逐页文字层：这是「逐页路由」的输入。
+    const layers = await pdfSupport.extractTextLayers(info.path, pages, { signal: ctx.signal });
+    nativeLayerText = new Map();
+    const textPages = [];
+    const ocrPages = [];
+    for (const page of pages) {
+      const layer = layers.pages.get(page);
+      const text = String(layer?.text ?? '');
+      nativeLayerText.set(page, text);
+      if (layer?.hasTextLayer) textPages.push(page);
+      else ocrPages.push(page);
+    }
+    textPageCount = textPages.length;
+    ocrPageCount = ocrPages.length;
+
+    if (forceOcr) {
+      textPageCount = 0;
+      ocrPageCount = pages.length;
+      // 9z5.31：强制重新识别 —— 所有请求页都交给 OCR provider，不走 typeset。
+      if (ocrState.available && pages.length > 0) {
+        try {
+          const provider = ctx.ocrProvider;
+          const result = await parseWithProvider({
+            provider,
+            role: 'ocr',
+            pages,
+            ocrMode: 'force',
+            info,
+            ctx,
+          });
+          applyResult(result, provider, {
+            role: 'ocr',
+            targetPages: pages,
+            fallbackOrigin: 'ocr',
+            forceOrigin: 'ocr',
+          });
+        } catch (error) {
+          if (ctx.signal?.aborted) throw error;
+          providerErrors.ocr = toProviderFailure(error, ctx.config?.ocr?.apiKey ?? null);
+          warnings.push(
+            `OCR provider "${ocrState.id ?? 'unknown'}" failed: ${providerErrors.ocr.message}. Page images only.`,
+          );
+        }
+      } else {
+        providerErrors.ocr = {
+          code: 'PROVIDER_NOT_CONFIGURED',
+          message: ocrState.reason ?? 'no OCR provider is configured.',
+        };
+      }
+    } else {
+      const sameProvider = textPages.length > 0
+        && ocrPages.length > 0
+        && typesetState.available
+        && ocrState.available
+        && typesetState.id
+        && typesetState.id === ocrState.id;
+
+      if (sameProvider) {
+        // 同一 provider 担两个角色：只发一次 parse，按 textOrigin 分配。
+        const provider = ctx.ocrProvider ?? ctx.typesetProvider;
+        try {
+          const result = await parseWithProvider({
+            provider,
+            role: 'both',
+            pages,
+            ocrMode: 'auto',
+            textLayers: Object.fromEntries(textPages.map((page) => [page, nativeLayerText.get(page) ?? ''])),
+            info,
+            ctx,
+          });
+          applyResult(result, provider, {
+            role: 'both',
+            targetPages: pages,
+            fallbackOrigin: 'unknown',
+          });
+
+          // typeset 的硬约束：有文字层的页必须保留原字符。
+          const reRecognized = textPages.filter((page) => {
+            const entry = pageMap.get(page);
+            return entry && entry.text.trim() && entry.textOrigin !== 'textlayer';
+          });
+          if (reRecognized.length > 0) {
+            warnings.push(
+              `typeset provider "${typesetState.id}" returned textOrigin "${pageMap.get(reRecognized[0]).textOrigin}" `
+                + `for ${reRecognized.length} page(s) that have a PDF text layer; characters may have been re-recognized.`,
+            );
+          }
+        } catch (error) {
+          if (ctx.signal?.aborted) throw error;
+          const failure = toProviderFailure(error, ctx.config?.ocr?.apiKey ?? null);
+          providerErrors.ocr = failure;
+          providerErrors.typeset = failure;
+          warnings.push(
+            `document provider "${ocrState.id ?? 'unknown'}" failed: ${failure.message}. `
+              + 'Fell back to the PDF text layer where one exists; pages without one are returned as page images only.',
+          );
+        }
+        // 有文字层但 provider 没给文本的页：用原生文字层补齐。
+        for (const page of textPages) {
+          if (!String(texts.get(page) ?? '').trim()) useNativePage(page);
+        }
+      } else {
+        // 两个角色由不同 provider 承担（或只有一个角色启用）。
+        if (textPages.length > 0 && typesetState.available) {
+          try {
+            const provider = ctx.typesetProvider;
+            const result = await parseWithProvider({
+              provider,
+              role: 'typeset',
+              pages: textPages,
+              ocrMode: 'auto',
+              textLayers: Object.fromEntries(textPages.map((page) => [page, nativeLayerText.get(page) ?? ''])),
+              info,
+              ctx,
+            });
+            applyResult(result, provider, {
+              role: 'typeset',
+              targetPages: textPages,
+              // 契约要求 typeset provider 显式返回 textOrigin；缺省时按保守值处理，
+              // 绝不能把「没声明」当成「保留了原字符」。
+              fallbackOrigin: 'unknown',
+            });
+            const reRecognized = textPages.filter((page) => {
+              const entry = pageMap.get(page);
+              return entry && entry.text.trim() && entry.textOrigin !== 'textlayer';
+            });
+            if (reRecognized.length > 0) {
+              warnings.push(
+                `typeset provider "${typesetState.id}" returned textOrigin "${pageMap.get(reRecognized[0]).textOrigin}" `
+                  + `for ${reRecognized.length} page(s) that have a PDF text layer; characters may have been re-recognized.`,
+              );
+            }
+          } catch (error) {
+            if (ctx.signal?.aborted) throw error;
+            providerErrors.typeset = toProviderFailure(error, ctx.config?.typeset?.apiKey ?? null);
+            warnings.push(
+              `typeset provider "${typesetState.id ?? 'unknown'}" failed: ${providerErrors.typeset.message}. `
+                + 'The PDF text layer was used instead where available.',
+            );
+          }
+        }
+        // typeset=none 或失败 / 缺页：有文字层的页一律用原生文字层兜底（无警告）。
+        for (const page of textPages) {
+          if (!String(texts.get(page) ?? '').trim()) useNativePage(page);
+        }
+
+        if (ocrPages.length > 0 && ocrState.available) {
+          try {
+            const provider = ctx.ocrProvider;
+            const result = await parseWithProvider({
+              provider,
+              role: 'ocr',
+              pages: ocrPages,
+              ocrMode: 'auto',
+              info,
+              ctx,
+            });
+            applyResult(result, provider, {
+              role: 'ocr',
+              targetPages: ocrPages,
+              fallbackOrigin: 'ocr',
+            });
+          } catch (error) {
+            if (ctx.signal?.aborted) throw error;
+            providerErrors.ocr = toProviderFailure(error, ctx.config?.ocr?.apiKey ?? null);
+            warnings.push(
+              `OCR provider "${ocrState.id ?? 'unknown'}" failed: ${providerErrors.ocr.message}. `
+                + 'Pages without a text layer are returned as page images only.',
+            );
+          }
+        }
+      }
+    }
   }
 
   const anyText = hasAnyText(texts);
   let noTextReason = null;
   if (!anyText) {
-    if (providerError) {
-      noTextReason = `the document parser failed (${providerError.message}).`;
+    const firstError = providerErrors.ocr ?? providerErrors.typeset ?? null;
+    if (firstError) {
+      noTextReason = `the document provider failed (${firstError.message}).`;
     } else if (providerUsed) {
-      noTextReason = 'the document parser returned no text for the requested pages.';
-    } else if (state.configured && !state.available) {
-      noTextReason = state.reason;
+      noTextReason = 'the document provider returned no text for the requested pages.';
+    } else if (ocrState.configured && !ocrState.available) {
+      noTextReason = ocrState.reason;
     } else if (info.kind === 'pdf') {
       const extractor = await pdfSupport.resolveTools();
       noTextReason = extractor.textExtractor
@@ -542,7 +848,10 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings }) {
     }
   }
 
+  const providerError = providerErrors.ocr ?? providerErrors.typeset ?? null;
+
   return {
+    pages: pageMap,
     texts,
     transcript: transcriptFor({
       anyText,
@@ -552,12 +861,17 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings }) {
     }),
     warnings,
     providerError,
-    providerState: state,
+    providerErrors,
+    providerState: combinedDocState(ocrState, typesetState),
+    ocrState,
+    typesetState,
     providerId,
     providerModel,
     providerUsed,
     nativeUsed,
     noTextReason,
+    textPageCount,
+    ocrPageCount,
   };
 }
 
@@ -827,18 +1141,29 @@ export function createDocumentBackend(ctx = {}) {
   });
   const pdfSupport = ctx.pdfSupport ?? createPdfSupport();
   const inspectCache = new Map();
-  const withSupport = (callCtx) => ({
-    ...(callCtx ?? {}),
-    config: callCtx?.config ?? {},
-    signal: callCtx?.signal ?? undefined,
-    pdfSupport,
-  });
+  // builtin typeset 是本地实现、不需要凭据：直接持有 backend 的调用方（测试 / 嵌入）
+  // 只要 config 里是 builtin，就不必再手动注入 provider 实例。
+  const builtinTypesetProvider = createBuiltinTypesetProvider();
+  const withSupport = (callCtx) => {
+    const config = callCtx?.config ?? {};
+    return {
+      ...(callCtx ?? {}),
+      config,
+      signal: callCtx?.signal ?? undefined,
+      ocrProvider: callCtx?.ocrProvider ?? null,
+      typesetProvider: callCtx?.typesetProvider !== undefined
+        ? callCtx.typesetProvider
+        : (config.typeset?.provider === 'builtin' ? builtinTypesetProvider : null),
+      pdfSupport,
+    };
+  };
 
   async function probe(input, callCtx = backendCtx()) {
     const c = withSupport(callCtx);
     const info = await inspectDocument(input.path, c, pdfSupport, inspectCache);
-    const providerState = docProviderState(c);
-    const hasTextSource = info.hasTextLayer || info.kind === 'text' || providerState.available;
+    const ocrState = docRoleState(c, 'ocr');
+    const typesetState = docRoleState(c, 'typeset');
+    const hasTextSource = info.hasTextLayer || info.kind === 'text' || ocrState.available;
     const transcriptSource = hasTextSource ? 'ocr' : 'none';
 
     return {
@@ -871,9 +1196,14 @@ export function createDocumentBackend(ctx = {}) {
           reason: 'asr is not applicable to document media.',
         },
         ocr: {
-          available: providerState.available,
-          provider: providerState.provider,
-          reason: providerState.reason,
+          available: ocrState.available,
+          provider: ocrState.provider,
+          reason: ocrState.reason,
+        },
+        typeset: {
+          available: typesetState.available,
+          provider: typesetState.provider,
+          reason: typesetState.reason,
         },
         transcriptSource,
         transcriptOrigin: transcriptSource,
@@ -906,16 +1236,24 @@ export function createDocumentBackend(ctx = {}) {
       ctx: c,
       pdfSupport,
       warnings,
+      ocrMode: input.ocrMode === 'force' ? 'force' : 'auto',
     });
 
-    const segments = pages.map((page) => ({
-      page,
-      text: collected.texts.get(page) ?? '',
-      startMs: null,
-      endMs: null,
-      source: 'ocr',
-      origin: 'ocr',
-    }));
+    // 9z5.28 只把逐页 textOrigin / blocks 放进后端结果（供 9z5.21 / 9z5.32 用）；
+    // 对外的 source / origin 枚举仍是旧值，9z5.21 再按 textOrigin 映射。
+    const segments = pages.map((page) => {
+      const entry = collected.pages.get(page);
+      return {
+        page,
+        text: collected.texts.get(page) ?? '',
+        startMs: null,
+        endMs: null,
+        source: 'ocr',
+        origin: 'ocr',
+        textOrigin: entry?.textOrigin ?? 'unknown',
+        blocks: entry?.blocks ?? [],
+      };
+    });
 
     if (info.kind === 'text') {
       warnings.push('plain-text documents have no page images; the page text is returned as the segment text.');
@@ -1030,29 +1368,49 @@ export function createDocumentBackend(ctx = {}) {
     const pages = normalizePages(input.pages ?? null, info.pageCount);
     const warnings = [];
 
-    const collected = await collectPageTexts({ info, pages, ctx: c, pdfSupport, warnings });
-    const segments = pages.map((page) => ({
-      page,
-      text: collected.texts.get(page) ?? '',
-      startMs: null,
-      endMs: null,
-      source: 'ocr',
-      origin: 'ocr',
-    }));
+    const collected = await collectPageTexts({
+      info,
+      pages,
+      ctx: c,
+      pdfSupport,
+      warnings,
+      ocrMode: input.ocrMode === 'force' ? 'force' : 'auto',
+    });
+    const segments = pages.map((page) => {
+      const entry = collected.pages.get(page);
+      return {
+        page,
+        text: collected.texts.get(page) ?? '',
+        startMs: null,
+        endMs: null,
+        source: 'ocr',
+        origin: 'ocr',
+        textOrigin: entry?.textOrigin ?? 'unknown',
+        blocks: entry?.blocks ?? [],
+      };
+    });
 
     if (!hasAnyText(collected.texts)) {
       if (collected.providerError) {
+        const role = collected.providerErrors.ocr ? 'ocr' : 'typeset';
         throw new ToolError(
           collected.providerError.code,
           `cannot search this document: ${collected.providerError.message}`,
-          providerFailureHint(collected.providerError.code),
+          providerFailureHint(collected.providerError.code, role),
         );
       }
-      if (collected.providerState.configured && !collected.providerState.available) {
+      const relevantStates = [];
+      if (collected.textPageCount > 0) relevantStates.push(collected.typesetState);
+      if (collected.ocrPageCount > 0) relevantStates.push(collected.ocrState);
+      const unavailable = (relevantStates.length > 0
+        ? relevantStates
+        : [collected.ocrState, collected.typesetState])
+        .filter((state) => state?.configured && !state?.available);
+      if (unavailable.length > 0) {
         throw new ToolError(
           'PROVIDER_NOT_CONFIGURED',
-          `cannot search this document: ${collected.providerState.reason}`,
-          providerFailureHint('PROVIDER_NOT_CONFIGURED'),
+          `cannot search this document: ${unavailable.map((state) => state.reason).filter(Boolean).join(' ')}`,
+          providerFailureHint('PROVIDER_NOT_CONFIGURED', unavailable[0].role),
         );
       }
       const reason = collected.noTextReason
@@ -1079,6 +1437,7 @@ export function createDocumentBackend(ctx = {}) {
       text: match.text,
       source: 'ocr',
       origin: 'ocr',
+      textOrigin: collected.pages.get(match.page)?.textOrigin ?? 'unknown',
       page: match.page,
     }));
 

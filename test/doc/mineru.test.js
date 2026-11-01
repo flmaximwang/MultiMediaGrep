@@ -292,9 +292,21 @@ test('runs the upload → poll → download flow and maps pages correctly', asyn
       result.pages.map((p) => p.page),
       [1, 2, 3],
     );
-    assert.equal(result.pages[0].text, '第一页标题\n第一页正文');
-    assert.equal(result.pages[1].text, '第二页正文\n表 1\nA | B\n1 | 2');
+    assert.equal(result.pages[0].text, '第一页标题\n\n第一页正文');
+    assert.equal(result.pages[1].text, '第二页正文\n\n表 1\nA | B\n1 | 2');
     assert.equal(result.pages[2].text, '第三页正文');
+
+    // 契约 v2：每页都有 blocks + textOrigin；9z5.28 只做最简 paragraph 映射。
+    for (const page of result.pages) {
+      assert.ok(Array.isArray(page.blocks), 'page.blocks must be an array');
+      assert.ok(page.blocks.length > 0, 'page.blocks must not be empty');
+      assert.ok(page.blocks.every((block) => block.type === 'paragraph'));
+      assert.equal(page.textOrigin, 'unknown', 'pipeline auto is conservative until 9z5.29 verifies it');
+    }
+    assert.deepEqual(result.pages[0].blocks, [
+      { type: 'paragraph', text: '第一页标题' },
+      { type: 'paragraph', text: '第一页正文' },
+    ]);
 
     // 表格结构
     assert.deepEqual(result.pages[1].tables[0].rows, [
@@ -308,7 +320,8 @@ test('runs the upload → poll → download flow and maps pages correctly', asyn
     assert.equal(post.headers['content-type'], 'application/json');
     const postedBody = JSON.parse(post.body);
     assert.equal(postedBody.files[0].name, 'doc.pdf');
-    assert.equal(postedBody.files[0].is_ocr, true);
+    // 契约 v2：auto 不再强制 is_ocr；默认请求体里没有这个字段。
+    assert.equal(postedBody.files[0].is_ocr, undefined);
     assert.equal(postedBody.model_version, undefined); // 默认留空，用服务端默认模型
 
     // 预签名 PUT 不能带 Authorization / Content-Type
@@ -525,7 +538,9 @@ test('a missing token produces a clear error naming the environment variable', a
     () => withTempFile('doc.pdf', 'x', (filePath) => provider.parse({ filePath })),
     (err) => {
       assert.match(err.message, /MMGREP_MINERU_API_KEY/);
-      assert.match(err.message, /MMGREP_DOC_PROVIDER/);
+      assert.match(err.message, /MMGREP_OCR_PROVIDER/);
+      assert.match(err.message, /MMGREP_TYPESET_PROVIDER/);
+      assert.doesNotMatch(err.message, /MMGREP_DOC_PROVIDER/);
       return true;
     },
   );
@@ -538,7 +553,12 @@ test('describe() exposes the configuration but never the token', async () => {
     model: 'vlm',
   });
   const described = provider.describe();
-  assert.deepEqual(described, { id: 'mineru', model: 'vlm', baseUrl: 'https://mineru.net/api/v4' });
+  assert.deepEqual(described, {
+    id: 'mineru',
+    model: 'vlm',
+    baseUrl: 'https://mineru.net/api/v4',
+    roles: ['ocr', 'typeset'],
+  });
   assert.ok(!JSON.stringify(described).includes('super-secret-token'));
   assert.equal(provider.id, 'mineru');
 });
@@ -645,4 +665,59 @@ test('rejects an empty page range', async () => {
 test('a file that is missing on disk', async () => {
   const provider = createMineruDocProvider({ apiKey: 'k', baseUrl: 'http://127.0.0.1:1/api/v4' });
   await assert.rejects(() => provider.parse({ filePath: '/definitely/not/here.pdf' }), /cannot read file/);
+});
+
+test('ocrMode：auto 不发 is_ocr，force 才发 is_ocr: true（契约 v2）', async () => {
+  const stub = await startStub({
+    zipFor: () => contentListZip([{ type: 'text', text: 'ocr text', page_idx: 0 }]),
+  });
+  try {
+    const provider = createMineruDocProvider({ apiKey: 'k', baseUrl: stub.baseUrl, timeoutMs: 10_000, pollIntervalMs: 1 });
+    await withTempFile('doc.pdf', 'x', (filePath) => provider.parse({ filePath, role: 'ocr' }));
+    const autoBody = JSON.parse(stub.calls[0].body);
+    assert.equal(autoBody.files[0].is_ocr, undefined);
+
+    stub.calls.length = 0;
+    const forced = await withTempFile('doc.pdf', 'x', (filePath) =>
+      provider.parse({ filePath, role: 'ocr', ocrMode: 'force' }),
+    );
+    const forceBody = JSON.parse(stub.calls[0].body);
+    assert.equal(forceBody.files[0].is_ocr, true);
+    assert.equal(forced.pages[0].textOrigin, 'ocr', 'force 的结果必须是 ocr');
+  } finally {
+    await stub.close();
+  }
+});
+
+test('textOrigin：ocr 角色 → ocr；typeset 角色 → unknown；vlm → ocr', async () => {
+  const stub = await startStub({
+    zipFor: () => contentListZip([{ type: 'text', text: 'text', page_idx: 0 }]),
+  });
+  try {
+    const base = { apiKey: 'k', baseUrl: stub.baseUrl, timeoutMs: 10_000, pollIntervalMs: 1 };
+    const ocr = await withTempFile('doc.pdf', 'x', (filePath) =>
+      createMineruDocProvider({ ...base, role: 'ocr' }).parse({ filePath, role: 'ocr' }),
+    );
+    assert.equal(ocr.pages[0].textOrigin, 'ocr');
+
+    const typeset = await withTempFile('doc.pdf', 'x', (filePath) =>
+      createMineruDocProvider({ ...base, role: 'typeset' }).parse({ filePath, role: 'typeset' }),
+    );
+    assert.equal(typeset.pages[0].textOrigin, 'unknown');
+
+    const vlm = await withTempFile('doc.pdf', 'x', (filePath) =>
+      createMineruDocProvider({ ...base, model: 'vlm', role: 'typeset' }).parse({ filePath, role: 'typeset' }),
+    );
+    assert.equal(vlm.pages[0].textOrigin, 'ocr', 'VLM 读页图 = 实质 OCR');
+  } finally {
+    await stub.close();
+  }
+});
+
+test('rejects an invalid role / ocrMode', async () => {
+  const provider = createMineruDocProvider({ apiKey: 'k', baseUrl: 'http://127.0.0.1:1/api/v4' });
+  await withTempFile('doc.pdf', 'x', async (filePath) => {
+    await assert.rejects(() => provider.parse({ filePath, role: 'reader' }), /Invalid document provider role/);
+    await assert.rejects(() => provider.parse({ filePath, ocrMode: 'always' }), /Invalid ocrMode/);
+  });
 });

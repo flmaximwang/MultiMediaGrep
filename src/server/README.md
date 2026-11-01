@@ -46,7 +46,8 @@ node --test "test/server/**/*.test.js"
       "env": {
         "MMGREP_ASR_PROVIDER": "elevenlabs",
         "MMGREP_ELEVENLABS_API_KEY": "…",
-        "MMGREP_DOC_PROVIDER": "mineru",
+        "MMGREP_OCR_PROVIDER": "mineru",
+        "MMGREP_TYPESET_PROVIDER": "builtin",
         "MMGREP_MINERU_API_KEY": "…"
       }
     }
@@ -152,8 +153,9 @@ src/backend/<type>/index.js
 ```js
 {
   cache,        // src/cache 的实例，或 null
-  asrProvider,  // ASR provider 实例，或 null（未配置）
-  docProvider,  // 文档解析 provider 实例，或 null
+  asrProvider,      // ASR provider 实例，或 null（未配置）
+  ocrProvider,      // 文档 OCR 角色 provider 实例，或 null（MMGREP_OCR_PROVIDER=none）
+  typesetProvider,  // 文档 typeset 角色 provider 实例，或 null（MMGREP_TYPESET_PROVIDER=none）
   logger,       // { error, warn, info, debug }；只写 stderr
   onProgress,   // 工厂级进度上报（通常不用；每次调用还会收到新的）
   signal,       // AbortSignal | null（进程级）
@@ -167,7 +169,7 @@ src/backend/<type>/index.js
 `ctx` 每次调用新建：
 
 ```js
-{ cache, asrProvider, docProvider, logger, onProgress, signal, config }
+{ cache, asrProvider, ocrProvider, typesetProvider, logger, onProgress, signal, config }
 ```
 
 `await ctx.onProgress({ stage: 'asr', used: '0:12 / 10:00' })` 会转成进度通知；`signal` 用于取消。
@@ -267,8 +269,8 @@ INTERNAL: <type> backend is not implemented yet.
 `MMGREP_ELEVENLABS_API_KEY` · `MMGREP_ELEVENLABS_BASE_URL` · `MMGREP_ELEVENLABS_MODEL` ·
 `MMGREP_OPENAI_COMPATIBLE_API_KEY` · `MMGREP_OPENAI_COMPATIBLE_BASE_URL` ·
 `MMGREP_OPENAI_COMPATIBLE_MODEL` · `MMGREP_ASR_LANGUAGE` · `MMGREP_ASR_TIMEOUT_MS` ·
-`MMGREP_DOC_PROVIDER` · `MMGREP_MINERU_API_KEY` · `MMGREP_MINERU_BASE_URL` ·
-`MMGREP_MINERU_MODEL` · `MMGREP_DOC_TIMEOUT_MS` · `MMGREP_OCR_PROVIDER` ·
+`MMGREP_OCR_PROVIDER` · `MMGREP_TYPESET_PROVIDER` · `MMGREP_MINERU_API_KEY` ·
+`MMGREP_MINERU_BASE_URL` · `MMGREP_MINERU_MODEL` · `MMGREP_DOC_TIMEOUT_MS` ·
 `MMGREP_MAX_IMAGE_TOKENS` · `MMGREP_MAX_IMAGE_EDGE` ·
 `MMGREP_MAX_TEXT_INLINE_CHARS` · `MMGREP_MAX_CONCURRENCY` · `MMGREP_AUDIO_MIN_DBFS` ·
 `MMGREP_AUDIO_MIN_SPEECH_RATIO` · `MMGREP_FFMPEG_PATH` · `MMGREP_FFPROBE_PATH` · `MMGREP_LOG_LEVEL` ·

@@ -83,7 +83,7 @@ export function backendStatus(backend) {
 /**
  * 加载三个后端。
  *
- * @param {object} [ctx] 传给后端工厂的上下文：{ cache, asrProvider, docProvider, logger, config }
+ * @param {object} [ctx] 传给后端工厂的上下文：{ cache, asrProvider, ocrProvider, typesetProvider, logger, config }
  * @param {object} [options]
  * @param {object} [options.logger]
  * @param {(specifier: string) => Promise<object>} [options.importer] 测试注入用

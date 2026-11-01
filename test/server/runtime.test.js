@@ -150,3 +150,56 @@ test('isLoopbackUrl：回环地址不需要 API key', () => {
   assert.equal(isLoopbackUrl('not a url'), false);
   assert.equal(isLoopbackUrl(null), false);
 });
+
+test('createRuntime：文档 provider 默认 typeset=builtin、ocr=none；两个角色同配置时复用实例', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-runtime-doc-'));
+  try {
+    const defaults = await createRuntime(runtimeOptions({
+      MMGREP_CACHE_DIR: path.join(dir, 'cache-default'),
+    }));
+    assert.equal(defaults.ocrProvider, null);
+    assert.equal(defaults.typesetProvider?.id, 'builtin');
+    assert.equal(defaults.config.ocr.provider, 'none');
+    assert.equal(defaults.config.typeset.provider, 'builtin');
+
+    const both = await createRuntime(runtimeOptions({
+      MMGREP_CACHE_DIR: path.join(dir, 'cache-both'),
+      MMGREP_OCR_PROVIDER: 'mineru',
+      MMGREP_TYPESET_PROVIDER: 'mineru',
+      MMGREP_MINERU_API_KEY: 'mineru-test-key',
+    }));
+    assert.equal(both.ocrProvider?.id, 'mineru');
+    assert.equal(both.typesetProvider?.id, 'mineru');
+    assert.equal(both.ocrProvider, both.typesetProvider, '同 provider 同配置应复用实例');
+    assert.equal(both.providerErrors.ocr, undefined);
+    assert.equal(both.providerErrors.typeset, undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('createRuntime：旧 MMGREP_DOC_* 在启动日志里 warn，且不改变默认角色', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-runtime-legacy-'));
+  const lines = [];
+  const logger = createLogger({ level: 'warn', stream: { write: (line) => lines.push(line.trimEnd()) } });
+  try {
+    const runtime = await createRuntime({
+      ...runtimeOptions({
+        MMGREP_CACHE_DIR: path.join(dir, 'cache'),
+        MMGREP_DOC_PROVIDER: 'mineru',
+        MMGREP_DOC_API_KEY: 'legacy-key-must-not-appear',
+      }),
+      logger,
+    });
+    const text = lines.join('\n');
+    assert.match(text, /MMGREP_DOC_PROVIDER was removed in 0\.2\.0/);
+    assert.match(text, /MMGREP_OCR_PROVIDER/);
+    assert.match(text, /MMGREP_TYPESET_PROVIDER/);
+    assert.match(text, /MMGREP_DOC_API_KEY was removed in 0\.2\.0/);
+    assert.ok(!text.includes('legacy-key-must-not-appear'), '启动日志泄漏了旧 key');
+    assert.equal(runtime.ocrProvider, null);
+    assert.equal(runtime.typesetProvider?.id, 'builtin');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -66,7 +66,7 @@ async function withServer(fn) {
       MMGREP_CACHE_DIR: path.join(dir, 'cache'),
       MMGREP_LOG_LEVEL: 'error',
       MMGREP_ASR_PROVIDER: 'none',
-      MMGREP_DOC_PROVIDER: 'none',
+      MMGREP_OCR_PROVIDER: 'none',
     },
     stderr: 'pipe',
   });

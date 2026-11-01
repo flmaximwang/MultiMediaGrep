@@ -1,58 +1,109 @@
 # 文档解析 provider
 
-文档后端（PDF + 图片）复用「probe → overview → zoom」模式：有文本层的 PDF 直接抽文本，
-**扫描件（无文本层）需要 OCR**。OCR / 文档解析交给外部服务，服务商可插拔 —— 用户在自己的
-MCP 配置里用环境变量指定用哪家、给 token，server 照单接受；**没配就不调外部服务**，只返回
-页面图让多模态模型自己看。
+文档后端（PDF + 图片）复用「probe → overview → zoom」模式：有文字层的 PDF 直接抽文本，
+**扫描件（无文字层）需要 OCR**。
+
+0.2.0 起，文档 provider 拆成**两个角色**（契约 v2）：
+
+| 角色 | 做什么 | 环境变量 | 默认 |
+| --- | --- | --- | --- |
+| **OCR** | 从像素识别字符；只处理**没有文字层**的页（以及 `ocrMode: 'force'` 的页） | `MMGREP_OCR_PROVIDER` = `mineru` \| `none` | `none` |
+| **typeset** | 为**有文字层**的页恢复阅读顺序与结构（分栏、标题、段落、图注）；**不得重新识别字符** | `MMGREP_TYPESET_PROVIDER` = `builtin` \| `mineru` \| `none` | `builtin` |
+
+> **typeset 的硬约束**：typeset 角色必须保留 PDF 文字层的原始字符。provider 无法保证
+> 字符不被重新识别时，必须把该页的 `textOrigin` 返回为 `'ocr'` 或 `'unknown'`，绝不能
+> 谎报 `'textlayer'`。文档后端会据此标注文本可信度（9z5.21）。
 
 本目录提供：
 
 | 文件 | 作用 |
 | --- | --- |
-| `index.js` | 工厂：`createDocProvider(env, opts)`，按环境变量选 provider |
-| `mineru.js` | 第一个 provider：MinerU 云 API v4 |
+| `index.js` | 工厂：按**角色**创建 provider；注册表声明每个 provider 支持哪些角色 |
+| `builtin.js` | 内置 typeset provider（本地，不联网；9z5.24 在这里加柱检测 / 重排 / 标题启发式） |
+| `mineru.js` | 外部 provider：MinerU 云 API v4（OCR + typeset） |
 | `README.md` | 接口说明 + 如何新增 provider |
 
 ---
 
-## 1. 接口契约
+## 1. 工厂与注册表 v2
 
 `index.js` 导出：
 
 ```js
-export const DOC_PROVIDERS = ['mineru', 'none'];
-export function createDocProvider(env = process.env, opts = {}) -> provider | null
+export const DOC_ROLES = ['ocr', 'typeset'];
+export const DOC_ROLE_ENV = {
+  ocr: 'MMGREP_OCR_PROVIDER',
+  typeset: 'MMGREP_TYPESET_PROVIDER',
+};
+export const DOC_ROLE_DEFAULTS = { ocr: 'none', typeset: 'builtin' };
+
+// 每个 provider 声明自己支持的角色（none 不是 provider）。
+export const DOC_PROVIDER_REGISTRY = {
+  mineru:  { id: 'mineru',  roles: ['ocr', 'typeset'] },
+  builtin: { id: 'builtin', roles: ['typeset'] },
+};
+
+export function createDocProvider(role, env = process.env, opts = {}) -> provider | null
 ```
 
-`createDocProvider` 的行为：
+行为：
 
-- `MMGREP_DOC_PROVIDER` 未设置 / 为空 / `none` → 返回 `null`，server 降级为「只出页面图」。
-- `MMGREP_DOC_PROVIDER=mineru` → 返回 MinerU provider。**没有 key 时构造不抛错**，
-  等 `parse()` 时才抛清晰错误（说明缺 `MMGREP_MINERU_API_KEY`）。
-- 其它取值 → 构造时直接抛错，并列出支持的 provider。
+- `role` 必须是 `'ocr'` / `'typeset'`，否则构造时抛错。
+- 角色取值为空 / `none` → 返回 `null`（该角色关闭）。
+- `typeset` 默认 `builtin`；`ocr` 默认 `none`。
+- provider id 拼错 → 构造时抛错，消息列出该角色允许的取值。
+- provider 不支持该角色（例如 `builtin` 当 OCR）→ 构造时抛错并说明它支持哪些角色。
+- 外部 provider **没有 key 时构造不抛错**，等 `parse()` 时才抛清晰错误（点名缺哪个变量）。
+- `opts` 优先级高于环境变量，常用：
+  `{ provider, apiKey, baseUrl, model, timeoutMs, fetchImpl, onProgress, pollIntervalMs }`。
+  `opts.provider` 可强制指定 provider id（测试 / server 显式选择时用）。
 
-`opts` 传给具体 provider 的构造参数（优先级高于环境变量），常用的是
-`{ provider, fetchImpl, onProgress, timeoutMs }`；其中 `opts.provider` 可以强制指定
-provider id（覆盖 `MMGREP_DOC_PROVIDER`，测试 / server 显式选择时用）。
+两个角色**共用** MinerU 的凭据变量（`MMGREP_MINERU_*`）与超时变量
+（`MMGREP_DOC_TIMEOUT_MS`）；但各自独立选择 provider。
 
-### provider 对象
+### 0.2.0 删除的变量
+
+`MMGREP_DOC_PROVIDER` / `MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` /
+`MMGREP_DOC_MODEL` **不再读取**。如果启动时检测到这些变量，server 会在 stderr 打一条
+warning，指出替代变量（`MMGREP_OCR_PROVIDER` / `MMGREP_TYPESET_PROVIDER` /
+`MMGREP_MINERU_*`），不会静默忽略。
+
+---
+
+## 2. provider 对象与 parse 契约 v2
 
 ```js
 {
-  id: 'mineru' | 'none',
+  id: 'mineru' | 'builtin',
+  roles: ['ocr', 'typeset'],        // 该实例支持的角色
 
-  // filePath 必须是本地路径；pages 可选；signal 用于取消。
-  async parse({ filePath, pages, signal }) -> {
+  // filePath 必须是本地路径；pages 可选；role / ocrMode 见下。
+  async parse({
+    filePath,
+    pages,
+    role = 'both',                  // 'ocr' | 'typeset' | 'both'
+    ocrMode = 'auto',               // 'auto' | 'force'
+    signal,
+    textLayers,                     // 可选：本地 typeset provider 用（见下）
+  }) -> {
     provider: 'mineru',
-    model: 'vlm' | null,          // null 表示用服务端默认模型
+    model: 'vlm' | null,            // null 表示用服务端默认模型
     pages: [
-      { page: 1, text: '...', tables: [{ rows: [['A','B'], ['1','2']], html, caption, footnote }] },
-      ...
+      {
+        page: 1,                    // 1 起的页码
+        textOrigin: 'textlayer' | 'ocr' | 'unknown',
+        blocks: [
+          { type: 'heading' | 'paragraph' | 'list' | 'table' | 'caption' |
+                  'equation' | 'footnote', level?: 1, text: '...' },
+        ],
+        text: '...',                // 由 blocks 派生，向后兼容的便利字段
+        tables?: [{ rows: [['A','B'], ['1','2']], html, caption, footnote }],
+      },
     ],
-    raw: { ... }                  // 可选，调试用；绝不包含 token
+    raw: { ... },                   // 可选，调试用；绝不包含 token
   },
 
-  describe() -> { id, model, baseUrl }   // 绝不返回 apiKey
+  describe() -> { id, model, baseUrl, roles }   // 绝不返回 apiKey
 }
 ```
 
@@ -60,9 +111,28 @@ provider id（覆盖 `MMGREP_DOC_PROVIDER`，测试 / server 显式选择时用�
 
 - `page` 是 **1 起的页码**，与 PDF 页码一致（与 `page_idx` 这类 0 基字段不同）。
 - `pages` 按页码升序；**只包含请求范围内的页**。请求的页如果在文档里不存在，
-  就不会出现在结果里；提取不到文字时 `text` 为空串。
+  就不会出现在结果里；提取不到文字时 `text` 为空串、`blocks` 为空数组。
+- `textOrigin` 必须是三态之一：
+  - `'textlayer'`：字符来自 PDF 原生文字层，未重新识别（可原话引用）；
+  - `'ocr'`：字符来自像素识别（数字 / 名称可能错）；
+  - `'unknown'`：provider 无法保证字符来源（保守值；下游按 OCR 处理）。
+- `text` 是 `blocks` 的派生便利字段；两者不一致时以 `blocks` 为准。
+- `blocks` 只允许上面 7 种类型；`heading` 可带正整数 `level`。
 - `tables` 可选，但只要有表格，每条至少含 `rows`（`string[][]`）。
 - `parse()` 失败时抛出的 `Error` 必须可诊断（见 §5），且**不能包含 token**。
+- `textLayers` 是给**本地 typeset provider** 的可选输入：文档后端已经把逐页文字层抽好
+  （`pdfSupport.extractTextLayers`），以 `{ [page]: text }` 传入，builtin 直接据此产出
+  blocks，避免重复跑 `pdftotext`。外部 provider 可以忽略它。
+
+### role / ocrMode 的语义
+
+| 输入 | 含义 |
+| --- | --- |
+| `role: 'ocr'` | 这些页需要从像素识别字符；结果 `textOrigin` 应为 `'ocr'`（或 `'unknown'`）。 |
+| `role: 'typeset'` | 这些页有文字层，只恢复结构；**不得重新识别字符**。 |
+| `role: 'both'` | 同一次调用里同时承担两个角色（两个角色是同一 provider 时由后端合并请求）。按页返回各自的 `textOrigin`。 |
+| `ocrMode: 'auto'` | 默认。provider 自行决定是否 OCR（MinerU 不再强制 `is_ocr: true`）。 |
+| `ocrMode: 'force'` | 调用方要求重新识别（9z5.31）。MinerU 发送 `is_ocr: true`，结果 `textOrigin = 'ocr'`。 |
 
 ### `pages` 参数支持的写法
 
@@ -76,28 +146,32 @@ provider id（覆盖 `MMGREP_DOC_PROVIDER`，测试 / server 显式选择时用�
 
 页码必须是 ≥ 1 的整数；空范围（如 `{ from: 5, to: 3 }`）会报错。
 
-### 环境变量
+---
 
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `MMGREP_DOC_PROVIDER` | `none` | `mineru` \| `none` |
-| `MMGREP_MINERU_API_KEY` | — | token（MinerU: https://mineru.net/apiManage/token ） |
-| `MMGREP_MINERU_BASE_URL` | `https://mineru.net/api/v4` | 接口地址 |
-| `MMGREP_MINERU_MODEL` | 空 | 留空 = 用服务端默认模型；MinerU 可选 `pipeline` / `vlm` / `MinerU-HTML` |
-| `MMGREP_DOC_TIMEOUT_MS` | `300000` | 整体超时（包括上传、排队、解析、下载） |
+## 3. 逐页路由（文档后端如何使用两个角色）
 
-旧的 `MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL` 仅在专属变量
-未设置时兜底（0.2.0 删除）。
+`src/backend/document/index.js` 的 `collectPageTexts`：
+
+1. 用 9z5.27 的逐页文字层结果（`pdfSupport.extractTextLayers`）把请求页分成两组：
+   有文字层 → typeset；没有文字层 → OCR。
+2. **两个角色是同一个 provider 且 `ocrMode=auto`**：只发**一次** `parse`（`role: 'both'`），
+   再按 provider 返回的逐页 `textOrigin` 分配。
+3. 两个角色是不同 provider：各发一次请求（只包含各自负责的页）。
+4. 角色为 `none` / provider 失败时降级：
+   - 有文字层的页 → 原生 `pdftotext` 文本 + 最简 paragraph blocks（`textOrigin: 'textlayer'`）；
+   - 没有文字层的页 → 空文本 + 页面图（`textOrigin: 'unknown'`）。
+5. 图片文档（png/jpg/webp）一律走 OCR；`.txt/.md` 不走 provider，`textOrigin: 'textlayer'`。
+6. `ocrMode: 'force'`（9z5.31）：所有请求页都交给 OCR provider，不再走 typeset。
 
 ---
 
-## 2. MinerU 适配器（`mineru.js`）
+## 4. MinerU 适配器（`mineru.js`）
 
 ```js
 export function createMineruDocProvider({
   apiKey, baseUrl, model, timeoutMs, fetchImpl,
   onProgress,        // 可选：进度回调
-  isOcr = true,      // 可选：是否开 OCR，默认 true
+  role = 'both',     // 工厂创建时绑定的角色（只用于错误提示）
   pollIntervalMs,    // 可选：首次轮询间隔，默认 1500（测试用的旋钮）
 }) -> provider
 ```
@@ -112,7 +186,7 @@ export function createMineruDocProvider({
 
    ```json
    {
-     "files": [{ "name": "doc.pdf", "is_ocr": true, "page_ranges": "1-200" }],
+     "files": [{ "name": "doc.pdf", "page_ranges": "1-200" }],
      "model_version": "vlm"
    }
    ```
@@ -123,7 +197,9 @@ export function createMineruDocProvider({
    { "code": 0, "msg": "ok", "data": { "batch_id": "…", "file_urls": ["https://…预签名 PUT URL…"] } }
    ```
 
-   - `files[].is_ocr` 是**文件级**参数（不是顶层）；`page_ranges` 也是文件级。
+   - `files[].is_ocr` 是**文件级**参数（不是顶层），只在 `ocrMode: 'force'` 时发送
+     `true`；`auto` 不发送，让 MinerU 自行选择。
+   - `page_ranges` 也是文件级。
    - `model_version` 只在显式配置 `MMGREP_MINERU_MODEL` 时发送。
    - 链接有效期 24 小时；单次最多 50 个文件（我们一次只传一个）。
 
@@ -156,6 +232,21 @@ export function createMineruDocProvider({
 4. **下载结果包**
    `GET full_zip_url`（预签名 CDN 地址，**同样不带 Authorization**）。
    zip 内含 `full.md`、`layout.json`、`*_model.json`、`*_content_list.json`、`images/`。
+
+### 契约 v2 的 blocks / textOrigin（本票的最小实现）
+
+- `content_list.json` 的每条有文字的条目 → 一个 `paragraph` block；`text` 由 blocks
+  派生（段落之间空行）。完整的类型映射（`text_level` → heading、图注 → caption、
+  公式 → equation、表格 → table 等）属于 **9z5.29**。
+- `textOrigin` 当前是保守值：
+  - `ocrMode: 'force'` → `'ocr'`；
+  - `model_version = vlm` → `'ocr'`（VLM 读页图，实质 OCR）；
+  - `role: 'ocr'` → `'ocr'`；
+  - `role: 'typeset'` / `'both'` 且未强制 OCR → `'unknown'`（pipeline 是否保留文字层
+    尚未核实）。
+- **TODO(9z5.29)**：核实 pipeline + `is_ocr=false` 对有文字层 PDF 的行为、结果包里是否
+  有逐页解析模式字段；核实后再决定能否把 `'unknown'` 收窄成 `'textlayer'`，并补齐
+  完整 blocks 映射与 typeset + vlm 的冲突处理。
 
 ### 字段兼容
 
@@ -192,8 +283,8 @@ export function createMineruDocProvider({
 两种传法都支持，**单次调用优先于构造时**：
 
 ```js
-const provider = createDocProvider(env, { onProgress: (e) => … });   // 构造时
-await provider.parse({ filePath, pages }, { onProgress: (e) => … }); // 单次调用
+const provider = createDocProvider('ocr', env, { onProgress: (e) => … }); // 构造时
+await provider.parse({ filePath, pages }, { onProgress: (e) => … });      // 单次调用
 ```
 
 回调形如 `({ stage, detail })`，`stage` 依次可能是：
@@ -211,7 +302,8 @@ await provider.parse({ filePath, pages }, { onProgress: (e) => … }); // 单次
 
 ### 超时与取消
 
-- `MMGREP_DOC_TIMEOUT_MS`（默认 300000）是**整个 parse 的墙钟上限**，包括排队。
+- `MMGREP_DOC_TIMEOUT_MS`（默认 300000，server 默认 180000）是**整个 parse 的墙钟上限**，
+  包括排队。
 - 超时错误会带上 `batch_id`，便于去 MinerU 控制台排查，并提示调大
   `MMGREP_DOC_TIMEOUT_MS`；任务在服务端可能仍在跑，不会自动取消（API 没有取消接口）。
 - `parse({ signal })` 传入的 `AbortSignal` 会中止所有在途请求。
@@ -249,30 +341,54 @@ Node 22 没有内置的 zip 读取 API（`node:zlib` 只有 `inflateRaw`）。`m
 
 ---
 
-## 3. 新增一个 provider
+## 5. 环境变量
 
-1. 在 `src/providers/doc/` 下新建 `<name>.js`，导出一个
-   `create<Name>DocProvider(options)`，返回上面 §1 的 provider 对象：
-   ```js
-   export function createAcmeDocProvider({ apiKey, baseUrl, model, timeoutMs, fetchImpl } = {}) {
-     return {
-       id: 'acme',
-       async parse({ filePath, pages, signal }, { onProgress } = {}) { /* … */ },
-       describe() { return { id: 'acme', model: model || null, baseUrl }; },
-     };
-   }
-   ```
-2. 在 `index.js` 的 `DOC_PROVIDERS` 里加上 id，并在 `createDocProvider` 里映射环境变量
-   （按 `MMGREP_<PROVIDER>_API_KEY` / `MMGREP_<PROVIDER>_BASE_URL` / `MMGREP_<PROVIDER>_MODEL` /
-   `MMGREP_DOC_TIMEOUT_MS` 的约定；MinerU 即 `MMGREP_MINERU_*`）。
-3. 遵守同一条红线：**构造不抛错（缺 key 时），parse 时才抛清晰错误**；缺 key 的错误信息要
-   点名缺哪个环境变量；`describe()` / 错误 / 进度里都不能出现 token。
-4. 在 `test/doc/` 下加测试：用 `node:http` 起本地 stub，不联网、不用真 key。
-5. 更新本 README 的表格。
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `MMGREP_OCR_PROVIDER` | `none` | OCR 角色：`mineru` \| `none` |
+| `MMGREP_TYPESET_PROVIDER` | `builtin` | typeset 角色：`builtin` \| `mineru` \| `none` |
+| `MMGREP_MINERU_API_KEY` | — | MinerU token（两个角色共用；https://mineru.net/apiManage/token ） |
+| `MMGREP_MINERU_BASE_URL` | `https://mineru.net/api/v4` | 接口地址（两个角色共用） |
+| `MMGREP_MINERU_MODEL` | 空 | 留空 = 用服务端默认模型；MinerU 可选 `pipeline` / `vlm` / `MinerU-HTML` |
+| `MMGREP_DOC_TIMEOUT_MS` | `180000`（server）/ `300000`（provider 默认） | 整体超时（包括上传、排队、解析、下载） |
+
+`MMGREP_DOC_PROVIDER` / `MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` /
+`MMGREP_DOC_MODEL` 已在 0.2.0 删除；启动时检测到会 warn 并指出替代变量。
 
 ---
 
-## 4. 测试
+## 6. 新增一个 provider
+
+1. 在 `src/providers/doc/` 下新建 `<name>.js`，导出一个
+   `create<Name>DocProvider(options)`，返回 §2 的 provider 对象：
+   ```js
+   export function createAcmeDocProvider({ apiKey, baseUrl, model, timeoutMs, fetchImpl, role } = {}) {
+     return {
+       id: 'acme',
+       roles: ['ocr'],              // 必须声明支持的角色（ocr / typeset / 两者）
+       async parse({ filePath, pages, role, ocrMode, signal }, { onProgress } = {}) { /* … */ },
+       describe() { return { id: 'acme', model: model || null, baseUrl, roles: ['ocr'] }; },
+     };
+   }
+   ```
+2. 在 `index.js` 的 `DOC_PROVIDER_REGISTRY` 里注册，并声明 `roles`：
+   ```js
+   acme: { id: 'acme', roles: ['ocr'], create: (options) => createAcmeDocProvider(options) },
+   ```
+   同时更新 `DOC_ROLE_PROVIDERS`（配置层 / HTTP 头的允许值）与 `DOC_PROVIDER_ENV`
+   （按 `MMGREP_<PROVIDER>_API_KEY` / `_BASE_URL` / `_MODEL` 的约定；MinerU 即
+   `MMGREP_MINERU_*`）。
+3. **遵守 typeset 硬约束**：如果 provider 不能保证原字符，返回 `textOrigin: 'ocr'` /
+   `'unknown'`；本地 typeset provider 可以只读 `parse({ textLayers })`，不要自己 OCR。
+4. 遵守同一条红线：**构造不抛错（缺 key 时），parse 时才抛清晰错误**；缺 key 的错误信息要
+   点名缺哪个环境变量；`describe()` / 错误 / 进度里都不能出现 token。
+5. 在 `test/doc/` 下加测试：用 `node:http` 起本地 stub，不联网、不用真 key；覆盖
+   `role` / `ocrMode` / 逐页 `textOrigin`。
+6. 更新本 README 的表格与「新增 provider」步骤。
+
+---
+
+## 7. 测试
 
 ```bash
 node --test 'test/doc/*.test.js'
@@ -289,4 +405,6 @@ node --test 'test/doc/*.test.js'
 测试全程离线：用 `node:http` 起本地 stub server 模拟 MinerU 的四步流程，
 zip 是测试里用 `node:zlib.deflateRawSync` + 手写 zip 结构现造的（不是 mock）。
 覆盖：流程顺序、页码/文本映射、`pages` 范围过滤、>200 页切批、超时、401/500、
-缺 key、token 不泄漏、进度回调、子目录 zip、`full.md` 兜底、相对页码兼容。
+缺 key、token 不泄漏、进度回调、子目录 zip、`full.md` 兜底、相对页码兼容；
+契约 v2 另外覆盖 `role` / `ocrMode`、`blocks` / `textOrigin`，以及逐页路由
+（`test/doc/routing.test.js`：有文字层只发 typeset、无文字层只发 OCR、同一 provider 只发一次）。
