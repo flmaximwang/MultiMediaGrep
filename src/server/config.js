@@ -38,6 +38,19 @@ export const DEFAULT_OPENAI_COMPATIBLE_MODEL = 'whisper-1';
 export const DEFAULT_DOC_BASE_URL = 'https://mineru.net/api/v4';
 export const DEFAULT_DOC_MODEL = '';
 
+/* ------------------------------------------------------------------ *
+ * 传输方式（stdio / http）
+ * ------------------------------------------------------------------ */
+
+/** 默认走 stdio：MCP 客户端最常见的方式，不用开端口、不用鉴权 */
+export const DEFAULT_TRANSPORT_MODE = 'stdio';
+/** 目前只支持这两种传输方式 */
+export const TRANSPORT_MODES = Object.freeze(['stdio', 'http']);
+/** HTTP 默认只监听回环地址：本机自用不该暴露到网络上 */
+export const DEFAULT_HTTP_HOST = '127.0.0.1';
+/** HTTP 默认端口 */
+export const DEFAULT_HTTP_PORT = 3927;
+
 /**
  * provider → 环境变量组。选哪个 provider 就只读哪一组，互不串用。
  *
@@ -226,6 +239,38 @@ function readBool(env, key, fallback, { warnings } = {}) {
   return fallback;
 }
 
+/**
+ * 读传输方式：只认 stdio / http，写错就回落 stdio 并记 warning。
+ * 传输方式写错时**绝不能崩**——回落到 stdio 至少还能正常服务。
+ */
+function readTransportMode(env, warnings) {
+  const raw = readString(env, 'MMGREP_TRANSPORT');
+  if (raw === undefined) return DEFAULT_TRANSPORT_MODE;
+  const mode = raw.toLowerCase();
+  if (TRANSPORT_MODES.includes(mode)) return mode;
+  warnings.push(
+    `MMGREP_TRANSPORT is invalid ("${raw}"); using the default "${DEFAULT_TRANSPORT_MODE}" `
+      + `(supported: ${TRANSPORT_MODES.join(', ')}).`,
+  );
+  return DEFAULT_TRANSPORT_MODE;
+}
+
+/**
+ * 判断监听地址是不是「只有本机能连」。
+ *
+ * 与 src/server/index.js 的 isLoopbackUrl **故意不同**：那里 0.0.0.0 当作「本地基址」，
+ * 但这里 0.0.0.0 / :: 意味着绑定所有网卡——那是对外暴露，必须当成非回环。
+ */
+export function isLoopbackHost(host) {
+  if (!host) return false;
+  const text = String(host).trim().toLowerCase();
+  if (text === 'localhost') return true;
+  // 去掉 IPv6 的方括号与 zone id（fe80::1%en0）
+  const bare = text.replace(/^\[/, '').replace(/\]$/, '').split('%')[0];
+  if (bare === '::1') return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(bare);
+}
+
 /** 缓存目录：`~` 展开；相对路径按 cwd 解析（与 cache 模块的语义一致） */
 function readCacheDir(env, warnings) {
   const raw = readString(env, 'MMGREP_CACHE_DIR');
@@ -275,8 +320,29 @@ export function loadConfig(env = process.env) {
   const asrSection = resolveProviderSection('asr', asrProvider, env, warnings);
   const docSection = resolveProviderSection('doc', docProvider, env, warnings);
 
+  const transportMode = readTransportMode(env, warnings);
+  const httpHost = readString(env, 'MMGREP_HTTP_HOST') ?? DEFAULT_HTTP_HOST;
+  const httpPort = readInt(env, 'MMGREP_HTTP_PORT', DEFAULT_HTTP_PORT, { min: 1, max: 65535, warnings });
+  // 令牌本身是敏感值：这里只存原文给鉴权用，**任何日志路径都不许打印它**
+  // （describeConfig 只回答 set / unset）。
+  const httpToken = readString(env, 'MMGREP_HTTP_TOKEN') ?? '';
+
+  // 监听非回环地址又不配令牌 = 端点裸奔在网络上，必须提醒。
+  if (!isLoopbackHost(httpHost) && !httpToken) {
+    warnings.push(
+      `MMGREP_HTTP_HOST is not a loopback address ("${httpHost}") and MMGREP_HTTP_TOKEN is not set; `
+        + 'the HTTP endpoint would accept unauthenticated requests.',
+    );
+  }
+
   const config = {
     server: Object.freeze({ name: SERVER_NAME, version: SERVER_VERSION }),
+    transport: Object.freeze({
+      mode: transportMode,
+      host: httpHost,
+      port: httpPort,
+      token: httpToken,
+    }),
     cache: Object.freeze({
       dir: readCacheDir(env, warnings),
       maxBytes: readCacheMaxBytes(env, warnings),
@@ -321,11 +387,39 @@ export function loadConfig(env = process.env) {
 }
 
 /**
+ * 用命令行参数覆盖传输配置：**CLI > 环境变量 > 默认值**。
+ *
+ * 只覆盖 transport 这一段——后端、provider、缓存这些跟传输方式无关，
+ * 命令行也管不着。
+ *
+ * @param {object} config loadConfig() 的结果
+ * @param {object} [overrides] { mode?, host?, port?, token? }；值为 undefined 表示「不覆盖」
+ * @returns {Readonly<object>} 新的配置对象（原来那个保持不变）
+ */
+export function applyTransportOverrides(config, overrides = {}) {
+  const current = config.transport ?? {};
+  const next = {
+    mode: overrides.mode ?? current.mode ?? DEFAULT_TRANSPORT_MODE,
+    host: overrides.host ?? current.host ?? DEFAULT_HTTP_HOST,
+    port: overrides.port ?? current.port ?? DEFAULT_HTTP_PORT,
+    token: overrides.token ?? current.token ?? '',
+  };
+  return Object.freeze({ ...config, transport: Object.freeze(next) });
+}
+
+/**
  * 给日志/启动信息用的脱敏视图：**永远不含 apiKey 原文**。
  */
 export function describeConfig(config) {
   return {
     server: `${config.server.name}@${config.server.version}`,
+    transport: {
+      mode: config.transport?.mode ?? DEFAULT_TRANSPORT_MODE,
+      host: config.transport?.host ?? DEFAULT_HTTP_HOST,
+      port: config.transport?.port ?? DEFAULT_HTTP_PORT,
+      // 只回答「有没有配」，永远不回答「配的是什么」
+      token: config.transport?.token ? 'set' : 'unset',
+    },
     cache: { dir: config.cache.dir, maxBytes: config.cache.maxBytes },
     asr: {
       provider: config.asr.provider,
