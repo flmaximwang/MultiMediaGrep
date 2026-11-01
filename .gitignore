@@ -5,3 +5,10 @@
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+fixtures/generated/
+
+# Node
+node_modules/
+npm-debug.log*
+*.tgz
+.DS_Store
