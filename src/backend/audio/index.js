@@ -36,12 +36,16 @@ function shapeProbe({ info, audioHealth, input, ctx, stats, durationSec, subtitl
     language: s.tags?.language ?? null,
     codec: s.codec_name ?? null,
   }));
+  const transcriptMode = input?.transcript ?? 'auto';
   const asrProvider = ctx.asrProvider ?? null;
   let asrAvailable = Boolean(asrProvider) && audioHealth.effective;
   let asrReason = null;
-  if (input?.transcript === 'off') {
+  if (transcriptMode === 'off') {
     asrAvailable = false;
     asrReason = 'Transcription was disabled for this call (transcript: "off").';
+  } else if (transcriptMode === 'subtitle') {
+    asrAvailable = false;
+    asrReason = 'transcript is "subtitle": only subtitle sources are read and ASR is never called.';
   } else if (!asrProvider) {
     asrReason = 'No ASR provider is configured (set MMGREP_ASR_PROVIDER and the matching provider key: '
       + 'MMGREP_ELEVENLABS_API_KEY or MMGREP_OPENAI_COMPATIBLE_API_KEY).';
@@ -55,14 +59,14 @@ function shapeProbe({ info, audioHealth, input, ctx, stats, durationSec, subtitl
   let transcriptSource = 'none';
   let transcriptOrigin = 'none';
   let transcriptPath = null;
-  if (explicitPath) {
+  if (transcriptMode !== 'off' && explicitPath) {
     transcriptSource = 'subtitle';
     transcriptOrigin = 'file';
     transcriptPath = explicitPath;
-  } else if (subtitleHints?.hasEmbeddedSubtitle) {
+  } else if (transcriptMode !== 'off' && subtitleHints?.hasEmbeddedSubtitle) {
     transcriptSource = 'subtitle';
     transcriptOrigin = 'embedded';
-  } else if (siblingPath) {
+  } else if (transcriptMode !== 'off' && siblingPath) {
     transcriptSource = 'subtitle';
     transcriptOrigin = 'file';
     transcriptPath = siblingPath;
@@ -164,11 +168,31 @@ async function probeAudio(input, ctx) {
   return { ...result, info, stats };
 }
 
-const NONE_TRANSCRIPT = Object.freeze({ source: 'none', origin: 'none', provider: null, model: null, language: null, file: null });
+function noneTranscript(reason) {
+  return {
+    source: 'none',
+    origin: 'none',
+    provider: null,
+    model: null,
+    language: null,
+    file: null,
+    reason,
+  };
+}
 
 /** 字幕文件 / 内嵌轨 / ASR / 空转写，四条来源一条路 */
 async function getTranscript(input, ctx, { info, durationSec, audioHealth }) {
   const warnings = [];
+
+  // transcript: "off" 是「完全不要文字」：字幕也不读，直接返回空。
+  if (input.transcript === 'off') {
+    warnings.push('transcript-disabled');
+    return {
+      segments: [],
+      transcript: noneTranscript('transcription was disabled for this call (transcript: "off").'),
+      warnings,
+    };
+  }
 
   // 1–3：字幕来源（契约 §8.5）
   const subtitle = await resolveSubtitleSource({
@@ -194,17 +218,31 @@ async function getTranscript(input, ctx, { info, durationSec, audioHealth }) {
     };
   }
 
-  if (input.transcript === 'off') {
-    warnings.push('transcript-disabled');
-    return { segments: [], transcript: { ...NONE_TRANSCRIPT }, warnings };
+  // transcript: "subtitle" 只读字幕，绝不回退到 ASR。
+  if (input.transcript === 'subtitle') {
+    warnings.push('no-subtitle-source');
+    return {
+      segments: [],
+      transcript: noneTranscript('no subtitle source was found for this file (transcript: "subtitle"); ASR was not used.'),
+      warnings,
+    };
   }
+
   if (!ctx.asrProvider) {
     warnings.push('asr-not-configured');
-    return { segments: [], transcript: { ...NONE_TRANSCRIPT }, warnings };
+    return {
+      segments: [],
+      transcript: noneTranscript('no ASR provider is configured (MMGREP_ASR_PROVIDER="none").'),
+      warnings,
+    };
   }
   if (!audioHealth?.effective) {
     warnings.push(`audio-${audioHealth?.verdict ?? 'unusable'}`);
-    return { segments: [], transcript: { ...NONE_TRANSCRIPT }, warnings };
+    return {
+      segments: [],
+      transcript: noneTranscript(audioHealth?.note || 'the audio has no effective speech; ASR is skipped.'),
+      warnings,
+    };
   }
 
   const cfg = audioConfig(ctx);

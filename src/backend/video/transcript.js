@@ -48,6 +48,17 @@ export async function resolveTranscript(input, ctx, media, {
   warnings = [],
   healthProvider = null,
 } = {}) {
+  // transcript: "off" 是「完全不要文字」：字幕也不读，直接返回空。
+  if (input.transcript === 'off') {
+    warnings.push('transcript-disabled');
+    return {
+      segments: [],
+      transcript: noneTranscript('transcription was disabled for this call (transcript: "off").'),
+      warnings,
+      audioHealth: null,
+    };
+  }
+
   const subtitleWarnings = [];
   const subtitle = await resolveSubtitleSource({
     mediaPath: input.path,
@@ -78,15 +89,17 @@ export async function resolveTranscript(input, ctx, media, {
     };
   }
 
-  if (input.transcript === 'off') {
-    warnings.push('transcript-disabled');
+  // transcript: "subtitle" 只读字幕，绝不回退到 ASR。
+  if (input.transcript === 'subtitle') {
+    warnings.push('no-subtitle-source');
     return {
       segments: [],
-      transcript: noneTranscript('transcription was disabled for this call (transcript: "off").'),
-      warnings,
+      transcript: noneTranscript('no subtitle source was found for this file (transcript: "subtitle"); ASR was not used.'),
+      warnings: mergeWarnings(warnings, subtitleWarnings),
       audioHealth: null,
     };
   }
+
   if (!media.hasAudio) {
     warnings.push('audio-no-audio-track');
     return {

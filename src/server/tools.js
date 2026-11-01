@@ -169,8 +169,10 @@ const TRANSCRIPT_FILE_PARAM = z.string().optional().describe(
   'Absolute path to a local subtitle/transcript file (.srt, .vtt, .ass, .ssa). Applicable to video and audio only. (本地字幕/转写文件)',
 );
 
-const TRANSCRIPT_PARAM = z.enum(['auto', 'off']).optional().describe(
-  '"auto" (default): use subtitles first, ASR only as a fallback. "off": no transcription at all, visuals only. Applicable to video and audio only.',
+const TRANSCRIPT_PARAM = z.enum(['auto', 'subtitle', 'off']).optional().describe(
+  '"auto" (default): use subtitles first (transcriptFile, embedded track, sibling file), ASR only as a fallback. '
+  + '"subtitle": read subtitles only and never call ASR; if there is no subtitle source the result is empty and says why. '
+  + '"off": no transcription at all, neither subtitles nor ASR; visuals only. Applicable to video and audio only.',
 );
 
 const START_PARAM = z.number().optional().describe(

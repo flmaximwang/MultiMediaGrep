@@ -83,6 +83,20 @@ function stubProvider({ text = 'STUB SPOKEN LINE', onCall = null } = {}) {
   return { provider, calls };
 }
 
+/** 会抛错的 ASR stub：用来证明某些模式下一次都不会被调用 */
+function throwingProvider() {
+  const calls = [];
+  const provider = {
+    id: 'stub',
+    describe: () => ({ id: 'stub', model: 'stub-model', baseUrl: null }),
+    transcribe: async ({ audioPath }) => {
+      calls.push(audioPath);
+      throw new Error('ASR MUST NOT BE CALLED');
+    },
+  };
+  return { provider, calls };
+}
+
 function assertPng(buffer) {
   assert.ok(Buffer.isBuffer(buffer), 'image must be a Buffer');
   assert.equal(buffer.subarray(1, 4).toString('latin1'), 'PNG', 'image must be a real PNG');
@@ -273,6 +287,98 @@ test('overview：无字幕时 ASR 兜底，段落标 source/origin=asr，中间�
     assert.equal(result.transcript.model, 'stub-model');
     assert.ok(result.segments.every((segment) => segment.source === 'asr' && segment.origin === 'asr'));
     assert.ok(result.segments.some((segment) => /STUB SPOKEN LINE/.test(segment.text)));
+  });
+});
+
+test('overview：transcript="subtitle" 只读字幕，无字幕时返回空结果且绝不调用 ASR', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const stub = throwingProvider();
+    const backend = createVideoBackend({ config: {}, asrProvider: stub.provider });
+
+    const withSubs = await backend.overview({
+      path: SUBTITLES,
+      startMs: 0,
+      endMs: 12000,
+      cells: 4,
+      images: 1,
+      maxEdge: 640,
+      transcript: 'subtitle',
+      transcriptFile: null,
+    });
+    assert.equal(stub.calls.length, 0);
+    assert.equal(withSubs.transcript.source, 'subtitle');
+    assert.equal(withSubs.transcript.origin, 'file');
+    assert.ok(withSubs.segments.some((segment) => /FIRST SUBTITLE LINE/.test(segment.text)));
+
+    const noSubs = await backend.overview({
+      path: SCENE,
+      startMs: 0,
+      endMs: 12000,
+      cells: 4,
+      images: 1,
+      maxEdge: 640,
+      transcript: 'subtitle',
+      transcriptFile: null,
+    });
+    assert.equal(stub.calls.length, 0, 'subtitle mode must never call ASR');
+    // 视频 overview 的 segments 是宫格单元；没有字幕时每格 text 为空、来源 none。
+    assert.ok(noSubs.segments.every((segment) => segment.text === '' && segment.source === 'none'));
+    assert.equal(noSubs.transcript.source, 'none');
+    assert.match(noSubs.transcript.reason, /no subtitle source/i);
+    assert.ok(noSubs.warnings.includes('no-subtitle-source'));
+  });
+});
+
+test('overview：transcript="off" 不读字幕也不跑 ASR', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const stub = throwingProvider();
+    const backend = createVideoBackend({ config: {}, asrProvider: stub.provider });
+    // SUBTITLES 自带字幕来源；off 必须连字幕都不读。
+    const result = await backend.overview({
+      path: SUBTITLES,
+      startMs: 0,
+      endMs: 12000,
+      cells: 4,
+      images: 1,
+      maxEdge: 640,
+      transcript: 'off',
+      transcriptFile: null,
+    });
+    assert.equal(stub.calls.length, 0);
+    assert.ok(result.segments.every((segment) => segment.text === '' && segment.source === 'none'));
+    assert.equal(result.transcript.source, 'none');
+    assert.equal(result.transcript.origin, 'none');
+    assert.match(result.transcript.reason, /disabled/i);
+    assert.ok(result.warnings.includes('transcript-disabled'));
+  });
+});
+
+test('probe：transcript 三值让 capabilities.asr 与 transcriptSource 如实变化', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const stub = throwingProvider();
+    const backend = createVideoBackend({ config: {}, asrProvider: stub.provider });
+
+    const auto = await backend.probe({ path: SCENE, transcript: 'auto', transcriptFile: null });
+    assert.equal(auto.capabilities.asr.available, true);
+    assert.equal(auto.capabilities.transcriptSource, 'asr');
+
+    const subtitleMode = await backend.probe({ path: SCENE, transcript: 'subtitle', transcriptFile: null });
+    assert.equal(subtitleMode.capabilities.asr.available, false);
+    assert.match(subtitleMode.capabilities.asr.reason, /subtitle/i);
+    assert.equal(subtitleMode.capabilities.transcriptSource, 'none');
+
+    const subtitlePresent = await backend.probe({ path: SUBTITLES, transcript: 'subtitle', transcriptFile: null });
+    assert.equal(subtitlePresent.capabilities.asr.available, false);
+    assert.equal(subtitlePresent.capabilities.transcriptSource, 'subtitle');
+    assert.equal(subtitlePresent.capabilities.transcriptOrigin, 'file');
+
+    const off = await backend.probe({ path: SUBTITLES, transcript: 'off', transcriptFile: null });
+    assert.equal(off.capabilities.asr.available, false);
+    assert.match(off.capabilities.asr.reason, /disabled/i);
+    assert.equal(off.capabilities.transcriptSource, 'none');
+    assert.equal(off.capabilities.transcriptOrigin, 'none');
+    assert.equal(off.capabilities.transcriptPath, null);
+    assert.equal(stub.calls.length, 0, 'probe never runs ASR');
   });
 });
 

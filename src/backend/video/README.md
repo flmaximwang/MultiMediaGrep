@@ -21,9 +21,9 @@
 
 ## 关键约定
 
-- **字幕优先**：`resolveSubtitleSource` 命中时绝不运行 ASR；命中不了且
-  `transcript !== 'off'`、有 `ctx.asrProvider`、音频体检有效时才转写，
-  且只转调用窗口（16 kHz 单声道、按静音切 ≤45 s 块）。
+- **字幕优先**：`resolveSubtitleSource` 命中时绝不运行 ASR；`transcript: 'subtitle'` 只读字幕、
+  永远不回退 ASR；`transcript: 'off'` 则字幕也不读。只有 `auto` 命中不了字幕、有
+  `ctx.asrProvider`、音频体检有效时才转写，且只转调用窗口（16 kHz 单声道、按静音切 ≤45 s 块）。
 - **来源标注**：字幕段落 `source: 'subtitle'`（`origin: file | embedded`），
   ASR 段落 `source: 'asr'`（`origin: 'asr'`）。没有转写时 `source: 'none'`。
 - **overview** 的格范围严格覆盖 `startMs..endMs`：第一格从起点开始、最后一格在终点结束；
