@@ -33,15 +33,14 @@ npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.1.0/
 
 环境要求：Node ≥ 20、`ffmpeg` + `ffprobe` 在 PATH 上；读 PDF 另需 `poppler` / `mutool` / `gs` 任意一个。
 
-## 五个工具
+## 四个工具
 
 | 工具 | 干什么 | 图片开销 |
 |---|---|---|
 | `media_probe` | 类型、时长/页数、轨道、能否 ASR/OCR | 0 |
-| `media_overview` | 视频出分镜宫格 + 时间对齐文本；录音出带时间轴转写；文档出页图 + 每页文字 | 0–4 张 |
+| `media_overview` | 视频出分镜宫格 + 时间对齐文本（`images: 0` 为纯文本）；录音出带时间轴转写；文档出页图 + 每页文字 | 0–4 张 |
 | `media_zoom` | 视频某时刻的单帧 / 文档某页，可裁切，用于读画面上的字 | 1 张（~1900 token） |
 | `media_locate` | 一句文本 → 视频/录音里的时间戳、文档里的页码 | 0（`includeFrame` 才 +1） |
-| `video_subtitles` | 本地 `.srt/.vtt/.ass/.ssa` 或容器内嵌字幕轨 → 带时间轴段落 | 0 |
 
 ## 迁移注记
 
