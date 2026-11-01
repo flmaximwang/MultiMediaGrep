@@ -19,9 +19,15 @@ READING ORDER
    "full text: /abs/path/content.md ..." line. That absolute path is what you read
    (segments.jsonl and manifest.json sit in the same directory): read those files section by
    section and summarise them in chunks yourself — do not re-call the tool just to get more
-   inline text. The inline list is a preview: complete when the range fits, otherwise sampled
-   from complete units, with a "preview: sampled ..." line that names the units inlined and the
-   pages/ranges not represented.
+   inline text. The inline list is a preview with three tiers: complete when the range fits
+   ("complete text ... nothing omitted"); otherwise a document that exposes block structure is
+   skimmed — every heading plus the first sentence of each paragraph (tables as
+   "[table: caption]"), labelled per page like "[page 4 · skim: 12 of 210 sentences]". A skim
+   built from built-in heuristic blocks is best-effort, so read content.md for the authoritative
+   text. Everything else — video, audio, documents without blocks, or a skim that still does not
+   fit — is sampled evenly from complete units, with a "preview: sampled ..." line naming what
+   was inlined and the pages/ranges not represented. In a skim that does not fit, all headings
+   are kept and sentences are sampled; only when even the headings do not fit are they sampled.
 3. media_zoom — only for parts that matter. One frame of a video (at, or a start/end window)
    or one page of a document, optionally cropped.
 4. media_locate — "where was X said" (timestamp) or "on which page" (page number). Text only
@@ -50,8 +56,9 @@ that moment, then read the cropped single frame.
 
 TOKEN DISCIPLINE
 - Long media must be narrowed with start/end (video, audio) or pages (document) before you
-  overview it, then paged through with the continuation hint in the result. A sampled preview
-  is not the full text — read content.md from disk instead of assuming the preview is complete.
+  overview it, then paged through with the continuation hint in the result. A skim or sampled
+  preview is not the full text — read content.md from disk instead of assuming the preview is
+  complete.
 - Prefer more images with fewer cells over one image with many cells: 2 images x 9 legible
   cells beats 1 image x 16 tiny ones at the same token order.
 - Zoom only what the overview showed you is worth zooming into.

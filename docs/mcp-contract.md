@@ -552,13 +552,19 @@ by section and summarise them in chunks yourself — do not ask for the same ran
 get more inline text. If the export could not be written, the line reads
 "full text: NOT written — <reason>" instead.
 
-The inline text is a PREVIEW. It is complete when the requested range fits (the result says
-"complete text ... nothing omitted"); otherwise it is SAMPLED from complete units — document
-sentences, video/audio transcript segments — and the result carries a line like
-"preview: sampled 84 of 312 sentences across pages 1-28; not represented: 2-6, 8-12". Sampling
-never drops a whole page silently: every requested page gets at least one unit when the budget
-allows, pages that could not be represented are listed, and a single over-long unit is
-truncated with a trailing "…[+N chars]". Read content.md when you need the complete text.
+The inline text is a PREVIEW with three tiers. (1) WHOLE: the requested range fits, and the
+result says "complete text ... nothing omitted". (2) SKIM (documents only, when the document
+parser exposes block structure): every heading plus the first complete sentence of each
+paragraph, tables as "[table: caption]", with captions/footnotes/equations left out; each page
+is labelled like "[page 4 · skim: 12 of 210 sentences]". A skim built from the built-in heuristic
+blocks is best-effort — section structure may be wrong; read content.md for the authoritative
+text. (3) SAMPLED: complete units — document sentences, video/audio transcript segments — are
+sampled evenly, with a line like "preview: sampled 84 of 312 sentences across pages 1-28; not
+represented: 2-6, 8-12". In a skim that still does not fit, all headings are kept and sentences
+are sampled; only when even the headings do not fit are the headings sampled. Sampling never
+drops a whole page silently: pages that could not be represented are listed, and a single
+over-long unit is truncated with a trailing "…[+N chars]". Read content.md when you need the
+complete text.
 
 Always call media_probe first: it tells you how long the file is, whether a subtitle source
 exists, and which transcript source applies, for free. Long media must be narrowed with
@@ -605,7 +611,7 @@ through the rest.
 | `images[].estimatedTokens` | integer | 这张图的 token 估算 | token |
 | `images[].source` | `"visual"` | 图内容恒为画面（宫格图里没有任何可引用的文字） | — |
 | `segments[]` | array | 实际内联的单元清单（**节选**：文档 = 句子，视频/录音 = 转写段落） | — |
-| `segments[].index` | integer | 序号（1-based；文档为句子在全文单元列表里的位置） | — |
+| `segments[].index` | integer | 序号（1-based；文档为句子在全文单元列表里的位置，`preview.mode = "skim"` 时为 skim 单元序号） | — |
 | `segments[].startMs` / `endMs` | integer \| null | 时间范围（document 为 null） | ms |
 | `segments[].startSec` / `endSec` | number \| null | 同上，秒 | s |
 | `segments[].text` | string | 该段文字（可能为 ""，表示无台词） | — |
@@ -628,11 +634,15 @@ through the rest.
 | `fullText.manifestJson` | string | `manifest.json` 绝对路径 | — |
 | `fullText.documentJson` | string \| null | `document.json` 绝对路径（cangjie 契约产物；不产出时为 null） | — |
 | `fullTextReason` | string \| null | 全文落盘失败的人话原因（`fullText = null` 时给出） | — |
-| `truncated` | boolean | 内联清单是否是抽样/截断后的预览（不是全文） | — |
-| `preview.mode` | `"whole"` \| `"sampled"` | `whole` = 请求范围整体内联（完整）；`sampled` = 按完整单元抽样 | — |
-| `preview.units` | integer | 实际内联的单元数（文档 = 句子，视频/录音 = 转写段落） | 条 |
-| `preview.totalUnits` | integer | 请求范围内的单元总数 | 条 |
-| `preview.notRepresented` | integer[] | 抽样时没有内联任何单元的页码（文档；其它媒体为空数组） | 页 |
+| `truncated` | boolean | 内联清单是否是预览（`whole` 以外的 skim / sampled 都是预览，不是全文） | — |
+| `preview.mode` | `"whole"` \| `"skim"` \| `"sampled"` | `whole` = 请求范围整体内联（完整）；`skim` = 文档按契约 v2 blocks 速读（全部 heading + 段首句）；`sampled` = 没有 blocks 时的完整单元等距抽样 | — |
+| `preview.units` | integer | 实际内联的单元数（skim 模式下 heading / 段首句 / 表格占位各算一个；其它模式文档 = 句子，视频/录音 = 转写段落） | 条 |
+| `preview.totalUnits` | integer | 请求范围内的句子总数（文档；skim 与 sampled 同口径，逐页标注里的 N 也是它）。视频/录音为转写段落总数 | 条 |
+| `preview.skimUnits` | integer | skim 模式下可用的 skim 单元总数（heading + 段首句 + 表格占位）；其它模式不出现 | 条 |
+| `preview.headingsTotal` / `preview.headingsInlined` | integer | skim 模式下 heading 总数 / 实际内联的 heading 数；两者不等说明连 heading 都放不下、被等距抽样 | 条 |
+| `preview.sampled` | boolean | skim 模式下是否有 skim 单元被抽样掉；其它模式不出现 | — |
+| `preview.headingsSampled` | boolean | skim 模式下是否对 heading 本身做了抽样（只有全部 heading 都放不下时才为 `true`） | — |
+| `preview.notRepresented` | integer[] | 没有被内联任何单元的页码（文档；其它媒体为空数组） | 页 |
 | `continuation` | object \| null | 续读提示 | — |
 | `continuation.nextStartMs` / `nextStartSec` | integer / number | 下一段起点（video/audio） | ms / s |
 | `continuation.nextPage` | integer | 下一批起始页（document） | 页 |
@@ -727,6 +737,31 @@ OCR 的核对 note **只在真的有 OCR 页时出现**，不再无条件写给�
 [page 1  ] (text)  「……」
 [page 2  ] (text)  「……」
 note: complete text of pages 1-2 (nothing omitted).
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
+```
+
+**文档预览的三层（9z5.32）**：whole（整体放得下）→ skim（契约 v2 blocks 可用时）→ sampled（没有 blocks 的旧路径，或 skim 也放不下时）。视频 / 录音**没有** skim，直接 whole → sampled。
+
+skim 的内容是全部 heading + 每个段落的第一个完整句（复用 .20 的断句函数）；table 只留
+`[table: <caption>]`（没有 caption 时只写 `[table]`），caption / footnote / equation 不进
+速读视图。每页标注 `[page N · skim: X of Y sentences]`：X 是这页实际内联的 skim 单元数
+（heading 也算一个），Y 是这页全文的句子数。builtin 启发式 blocks 生成的 skim 会在 note 里
+标 best-effort：
+
+```
+[page 4 · skim: 38 of 210 sentences] (text)  ## 2. Methods 「This section describes the assay.」 [table: Table 2 | Results]
+preview: skim — 38 of 210 sentences inlined across pages 1-12; all 12 headings kept; every requested page is represented. Skim = headings + first sentence per paragraph (tables as [table: caption]). Skim was built from heuristic blocks (best-effort): section structure may be wrong.
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
+```
+
+skim 自己仍放不下时：**heading 全部保留**，段首句按页等距抽样（`preview.sampled = true`，
+`preview.headingsInlined = preview.headingsTotal`）；只有连 heading 都放不下时才对 heading
+本身等距抽样（`preview.headingsSampled = true`）。没有 blocks 的旧路径不做 skim，行为与
+.20 一致：
+
+```
+[page 1  ] (text)  「……」
+preview: sampled 84 of 312 sentences across pages 1-12; not represented: 8-12.
 full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
 
@@ -1513,9 +1548,15 @@ READING ORDER
    "full text: /abs/path/content.md ..." line. That absolute path is what you read
    (segments.jsonl and manifest.json sit in the same directory): read those files section by
    section and summarise them in chunks yourself — do not re-call the tool just to get more
-   inline text. The inline list is a preview: complete when the range fits, otherwise sampled
-   from complete units, with a "preview: sampled ..." line that names the units inlined and the
-   pages/ranges not represented.
+   inline text. The inline list is a preview with three tiers: complete when the range fits
+   ("complete text ... nothing omitted"); otherwise a document that exposes block structure is
+   skimmed — every heading plus the first sentence of each paragraph (tables as
+   "[table: caption]"), labelled per page like "[page 4 · skim: 12 of 210 sentences]". A skim
+   built from built-in heuristic blocks is best-effort, so read content.md for the authoritative
+   text. Everything else — video, audio, documents without blocks, or a skim that still does not
+   fit — is sampled evenly from complete units, with a "preview: sampled ..." line naming what
+   was inlined and the pages/ranges not represented. In a skim that does not fit, all headings
+   are kept and sentences are sampled; only when even the headings do not fit are they sampled.
 3. media_zoom — only for parts that matter. One frame of a video (at, or a start/end window)
    or one page of a document, optionally cropped.
 4. media_locate — "where was X said" (timestamp) or "on which page" (page number). Text only
@@ -1544,8 +1585,9 @@ that moment, then read the cropped single frame.
 
 TOKEN DISCIPLINE
 - Long media must be narrowed with start/end (video, audio) or pages (document) before you
-  overview it, then paged through with the continuation hint in the result. A sampled preview
-  is not the full text — read content.md from disk instead of assuming the preview is complete.
+  overview it, then paged through with the continuation hint in the result. A skim or sampled
+  preview is not the full text — read content.md from disk instead of assuming the preview is
+  complete.
 - Prefer more images with fewer cells over one image with many cells: 2 images x 9 legible
   cells beats 1 image x 16 tiny ones at the same token order.
 - Zoom only what the overview showed you is worth zooming into.
@@ -1633,7 +1675,7 @@ provider 无法保证原字符时必须返回 `textOrigin = "ocr"` / `"unknown"`
 |---|---|---|---|---|
 | `MMGREP_MAX_IMAGE_TOKENS` | integer | `4000` | 单次调用的图片 token 软预算（§10.3） | 用默认值。自动模式保证不超；显式模式超出只警告 |
 | `MMGREP_MAX_IMAGE_EDGE` | integer | `1600` | 单张图最长边的全局上限（§10.2） | 用默认值。请求超过它 → `BUDGET_EXCEEDED` |
-| `MMGREP_MAX_TEXT_INLINE_CHARS` | integer | `24000` | 内联文本预览的字符上限（含 header / notes / `full text:` 行）。超出时按完整单元等距抽样并写明未覆盖范围；HTTP 模式下可被请求头 `x-mmgrep-max-text-inline-chars` 按客户端覆盖（硬上限 `200000`） | 用默认值。**全文永远落盘，不受此限制** |
+| `MMGREP_MAX_TEXT_INLINE_CHARS` | integer | `24000` | 内联文本预览的字符上限（含 header / notes / `full text:` 行）。超出时：文档有契约 v2 blocks 先走 skim（全部 heading + 段首句，每页 `[page N · skim: X of Y sentences]`），skim 仍超出时 heading 全保留、句子等距抽样；没有 blocks 或视频/录音按完整单元等距抽样。两种情况都写明未覆盖范围。HTTP 模式下可被请求头 `x-mmgrep-max-text-inline-chars` 按客户端覆盖（硬上限 `200000`） | 用默认值。**全文永远落盘，不受此限制** |
 | `MMGREP_MAX_CONCURRENCY` | integer | `2` | 单次调用内并行跑的 ffmpeg / 渲染任务数 | 用默认值。机器弱时调成 `1` |
 | `MMGREP_AUDIO_MIN_DBFS` | number | `-35` | 音频体检：判定「有有效声音」的平均音量下限（dBFS）。低于它 → `too-quiet`，**不跑 ASR** | 用默认值。录音确实偏小声时调低（如 `-45`） |
 | `MMGREP_AUDIO_MIN_SPEECH_RATIO` | number | `0.05` | 音频体检：判定「有有效声音」的非静音时长占比下限（0–1） | 用默认值。与 `MMGREP_AUDIO_MIN_DBFS` 是 **或** 的关系，任一不满足即判 `too-quiet` |

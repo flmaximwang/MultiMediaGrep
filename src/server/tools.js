@@ -107,13 +107,19 @@ by section and summarise them in chunks yourself — do not ask for the same ran
 get more inline text. If the export could not be written, the line reads
 "full text: NOT written — <reason>" instead.
 
-The inline text is a PREVIEW. It is complete when the requested range fits (the result says
-"complete text ... nothing omitted"); otherwise it is SAMPLED from complete units — document
-sentences, video/audio transcript segments — and the result carries a line like
-"preview: sampled 84 of 312 sentences across pages 1-28; not represented: 2-6, 8-12". Sampling
-never drops a whole page silently: every requested page gets at least one unit when the budget
-allows, pages that could not be represented are listed, and a single over-long unit is
-truncated with a trailing "…[+N chars]". Read content.md when you need the complete text.
+The inline text is a PREVIEW with three tiers. (1) WHOLE: the requested range fits, and the
+result says "complete text ... nothing omitted". (2) SKIM (documents only, when the document
+parser exposes block structure): every heading plus the first complete sentence of each
+paragraph, tables as "[table: caption]", with captions/footnotes/equations left out; each page
+is labelled like "[page 4 · skim: 12 of 210 sentences]". A skim built from the built-in heuristic
+blocks is best-effort — section structure may be wrong; read content.md for the authoritative
+text. (3) SAMPLED: complete units — document sentences, video/audio transcript segments — are
+sampled evenly, with a line like "preview: sampled 84 of 312 sentences across pages 1-28; not
+represented: 2-6, 8-12". In a skim that still does not fit, all headings are kept and sentences
+are sampled; only when even the headings do not fit are the headings sampled. Sampling never
+drops a whole page silently: pages that could not be represented are listed, and a single
+over-long unit is truncated with a trailing "…[+N chars]". Read content.md when you need the
+complete text.
 
 Always call media_probe first: it tells you how long the file is, whether a subtitle source
 exists, and which transcript source applies, for free. Long media must be narrowed with
@@ -562,12 +568,44 @@ function collectImages(rawImages, plan, config) {
   return describeImages(list, { source: 'visual' });
 }
 
+/** 契约 v2（9z5.28）允许的 block 类型；未知类型按 paragraph 处理 */
+const PREVIEW_BLOCK_TYPES = new Set([
+  'heading', 'paragraph', 'list', 'table', 'caption', 'equation', 'footnote',
+]);
+
+/**
+ * 逐页 blocks 的预览用规整（9z5.32）：只保留 skim 需要的字段与已知类型。
+ * 空文本丢；未知类型降级为 paragraph；heading 的 level 只保留 1..6 的整数。
+ *
+ * @param {Array<object>} raw
+ * @returns {Array<{type: string, text: string, level?: number}>}
+ */
+function normalizePreviewBlocks(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const block of raw) {
+    if (!block || typeof block !== 'object') continue;
+    const text = String(block.text ?? '').trim();
+    if (!text) continue;
+    const type = PREVIEW_BLOCK_TYPES.has(block.type) ? block.type : 'paragraph';
+    const normalized = { type, text };
+    const level = Number(block.level);
+    if (Number.isInteger(level) && level > 0) normalized.level = Math.min(level, 6);
+    out.push(normalized);
+  }
+  return out;
+}
+
 /** 段落的通用归一化（合同 §5.3 / §9.2 的字段口径；source/origin 缺省为 none） */
 function normalizeSegmentsSafe(raw) {
   const list = Array.isArray(raw) ? raw : [];
   return list.map((segment, i) => {
     const startMs = integerOrNull(segment?.startMs);
     const endMs = integerOrNull(segment?.endMs);
+    const page = integerOrNull(segment?.page);
+    // 契约 v2 的 blocks 只用于文档 skim（9z5.32）：只有带页码的 segment 才携带。
+    // 没有 blocks 的旧后端 / 视频 / 录音保持 .20 的 segment 形状（连空数组都不塞）。
+    const blocks = page === null ? [] : normalizePreviewBlocks(segment?.blocks);
     return {
       index: Number.isInteger(segment?.index) ? segment.index : i + 1,
       startMs,
@@ -580,8 +618,9 @@ function normalizeSegmentsSafe(raw) {
       // 契约 v2（9z5.28）的逐页来源细节：source 已按它映射，textOrigin 原样暴露，
       // 让 agent 能看到「这页是文字层 / OCR / 没声明」（9z5.21）。
       textOrigin: segment?.textOrigin ?? null,
-      page: integerOrNull(segment?.page),
+      page,
       speaker: segment?.speaker ? String(segment.speaker) : null,
+      ...(blocks.length > 0 ? { blocks } : {}),
     };
   });
 }
@@ -624,11 +663,11 @@ function padLabel(label, width = 9) {
   return label.padEnd(width);
 }
 
-/* ---------------- 内联预览（契约 §12.5，9z5.20） ----------------
+/* ---------------- 内联预览（契约 §12.5，9z5.20 / 9z5.32） ----------------
  *
  * 内联上限（MMGREP_MAX_TEXT_INLINE_CHARS）之内只放**预览**，全文始终落盘：
  *   tier 1 whole  请求范围整体放得下 → 原样全量返回；
- *   tier 2 skim   标题 + 段首句（9z5.32 实现，这里只留钩子）；
+ *   tier 2 skim   标题 + 段首句（仅文档；需要契约 v2 blocks，9z5.32）；
  *   tier 3 sample 按**完整单元**（文档 = 句子，视频/录音 = 转写段落）等距抽样。
  * 旧实现按「行」截断且一超限就 break：文档一页一行，于是超限页和它后面的所有页
  * 一起消失，而文本末尾还宣称「包含每一页」。这里改成按单元抽样的原因是：
@@ -717,6 +756,319 @@ function renderPreviewBody({ mediaType, units, textOnly }) {
     lines.push(formatOverviewSegmentLine({ ...unit.segment, text: unit.renderText }, mediaType, textOnly));
   });
   return lines.join('\n');
+}
+
+/* ---------------- tier 2 skim（文档专属，9z5.32） ----------------
+ *
+ * 输入是契约 v2 的 blocks（9z5.28；外部 provider 或 .24 builtin 启发式）。
+ * 没有 blocks 的旧路径（以及视频/录音）没有 skim，仍走 tier 1 → tier 3。
+ * skim 内容 = 全部 heading + 每个段落的第一个完整句（复用 .20 的断句函数），
+ * table 只留 [table: caption]；caption / footnote / equation 不进速读视图。
+ */
+
+/** 不属于速读视图的 block 类型：题注 / 脚注 / 公式 */
+const SKIM_EXCLUDED_BLOCKS = new Set(['caption', 'footnote', 'equation']);
+/** 表格占位里 caption 的最大长度 */
+const SKIM_TABLE_CAPTION_MAX_CHARS = 120;
+
+/** table block → `[table: <caption>]`；没有 caption 时只写 `[table]`（不拿表头行冒充） */
+function tableSkimLabel(block) {
+  const firstLine = String(block?.text ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) ?? '';
+  const explicit = String(block?.caption ?? '').trim();
+  const caption = explicit || (/^(?:table|tab\.?|表)\s*\S/i.test(firstLine) ? firstLine : '');
+  if (!caption) return '[table]';
+  const clipped = caption.length > SKIM_TABLE_CAPTION_MAX_CHARS
+    ? `${caption.slice(0, SKIM_TABLE_CAPTION_MAX_CHARS)}…`
+    : caption;
+  return `[table: ${clipped}]`;
+}
+
+/**
+ * 从逐页 blocks 建 skim 模型：每页的 skim 单元、页内句子总数、heading 列表。
+ * 一个 block 至多产出一个单元：heading → 整段标题；paragraph / list → 第一句；
+ * table → 占位符；caption / footnote / equation 丢弃。
+ * 没有任何 block（旧路径）时返回 null。
+ *
+ * @param {'video'|'audio'|'document'} mediaType
+ * @param {Array<{page?: number|null, text: string, source?: string, origin?: string,
+ *   textOrigin?: string|null, blocks?: Array<object>}>} segments
+ * @returns {{pages: Array<object>, units: Array<object>, headings: Array<object>, sentenceTotal: number}|null}
+ */
+function buildSkimModel(mediaType, segments) {
+  if (mediaType !== 'document') return null;
+  const entries = [];
+  let blockCount = 0;
+  for (const segment of segments) {
+    const blocks = Array.isArray(segment.blocks) ? segment.blocks : [];
+    if (blocks.length === 0) continue;
+    blockCount += blocks.length;
+    const page = segment.page ?? segment.index;
+    const units = [];
+    for (const block of blocks) {
+      const type = block.type ?? 'paragraph';
+      const text = String(block.text ?? '').trim();
+      if (!text || SKIM_EXCLUDED_BLOCKS.has(type)) continue;
+      let unit = null;
+      if (type === 'heading') {
+        unit = { kind: 'heading', level: block.level ?? 1, text };
+      } else if (type === 'table') {
+        unit = { kind: 'table', text: tableSkimLabel(block) };
+      } else {
+        // paragraph / list（未知类型已按 paragraph 规整）：只取第一个完整句
+        const first = splitSentences(text)[0];
+        if (first) unit = { kind: 'sentence', text: first };
+      }
+      if (!unit) continue;
+      units.push({
+        ...unit,
+        page,
+        source: segment.source ?? 'none',
+        origin: segment.origin ?? 'none',
+        textOrigin: segment.textOrigin ?? null,
+        segment,
+      });
+    }
+    entries.push({
+      page,
+      units,
+      // 页内「全量」分母：与 tier 3 的句子口径一致（per-page skim 标注用）
+      sentenceTotal: splitSentences(segment.text ?? '').length,
+    });
+  }
+  if (blockCount === 0) return null;
+  const units = [];
+  let sentenceTotal = 0;
+  for (const entry of entries) {
+    sentenceTotal += entry.sentenceTotal;
+    for (const unit of entry.units) {
+      unit.order = units.length;
+      units.push(unit);
+    }
+  }
+  if (units.length === 0) return null;
+  return {
+    pages: entries,
+    units,
+    headings: units.filter((unit) => unit.kind === 'heading'),
+    sentenceTotal,
+  };
+}
+
+/** skim 单元的正文形态：heading 用 Markdown 层级，句子按来源加引号，表格占位原样 */
+function renderSkimUnit(unit) {
+  if (unit.kind === 'heading') {
+    const level = Math.min(Math.max(Number(unit.level) || 1, 1), 6);
+    return `${'#'.repeat(level)} ${unit.renderText}`;
+  }
+  if (unit.kind === 'table') return unit.renderText;
+  return quoteBySource(unit.renderText, unit.source);
+}
+
+/**
+ * skim 正文：文档按页聚合，页首标注 `[page 4 · skim: 38 of 210 sentences]`。
+ * 标注里的 N 是该页全文句子数，X 是这一页实际内联的 skim 单元数（heading 也算一个）。
+ */
+function renderSkimBody({ selected, stats, pageOrder }) {
+  if (selected.length === 0) return '';
+  const byPage = new Map();
+  for (const unit of selected) {
+    if (!byPage.has(unit.page)) byPage.set(unit.page, []);
+    byPage.get(unit.page).push(unit);
+  }
+  const order = [...pageOrder];
+  for (const page of [...byPage.keys()].sort((a, b) => a - b)) {
+    if (!order.includes(page)) order.push(page);
+  }
+  const lines = [];
+  for (const page of order) {
+    const list = byPage.get(page);
+    if (!list || list.length === 0) continue;
+    const parts = [];
+    list.forEach((unit, index) => {
+      if (index > 0 && unit.order !== list[index - 1].order + 1) parts.push('…');
+      parts.push(renderSkimUnit(unit));
+    });
+    const total = Math.max(stats.get(page)?.sentenceTotal ?? 0, list.length);
+    lines.push(`[page ${page} · skim: ${list.length} of ${total} sentences] (${list[0].source})  ${parts.join(' ')}`);
+  }
+  return lines.join('\n');
+}
+
+/** 按 skim 顺序合并多组单元（heading / 段首句） */
+function mergeSkimUnits(...lists) {
+  const seen = new Set();
+  const out = [];
+  for (const list of lists) {
+    for (const unit of list) {
+      if (seen.has(unit.order)) continue;
+      seen.add(unit.order);
+      out.push(unit);
+    }
+  }
+  return out.sort((a, b) => a.order - b.order);
+}
+
+/** 每页等距取 perPage 个非 heading 单元（页内均匀，页与页之间同权） */
+function selectSkimNonHeadings(byPage, pageOrder, perPage) {
+  if (perPage <= 0) return [];
+  const out = [];
+  for (const page of pageOrder) {
+    const list = (byPage.get(page) ?? []).filter((unit) => unit.kind !== 'heading');
+    if (list.length === 0) continue;
+    const count = Math.min(perPage, list.length);
+    for (const index of evenlySpacedIndices(list.length, count)) out.push(list[index]);
+  }
+  return out;
+}
+
+/** heading 本身等距抽样（只有连全部 heading 都放不下时才用） */
+function selectSkimHeadings(headings, count) {
+  if (count >= headings.length) return [...headings];
+  if (count <= 0) return [];
+  return evenlySpacedIndices(headings.length, count).map((index) => headings[index]);
+}
+
+/**
+ * 在预算内挑 skim 单元：
+ *   1. 全部 skim 放得下 → 原样；
+ *   2. 放不下 → **heading 全部保留**，每页再等距塞 r 个段首句（二分找最大 r）；
+ *   3. 连 heading 都放不下 → 对 heading 本身等距抽样（此时不再放句首）。
+ */
+function chooseSkimSelection({ units, headings, byPage, pageOrder, stats, target }) {
+  const bodyLength = (selection) => renderSkimBody({ selected: selection, stats, pageOrder }).length;
+  if (bodyLength(units) <= target) {
+    return { selected: units, sampled: false, headingsSampled: false };
+  }
+
+  // 2. heading 全保留 + 每页 r 个段首句（headings 为空时 r 从 0 起也走这条路）
+  if (bodyLength(headings) <= target) {
+    let maxPerPage = 0;
+    for (const list of byPage.values()) {
+      const count = list.filter((unit) => unit.kind !== 'heading').length;
+      if (count > maxPerPage) maxPerPage = count;
+    }
+    let lo = 0;
+    let hi = maxPerPage;
+    let best = 0;
+    while (lo <= hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      const selection = mergeSkimUnits(headings, selectSkimNonHeadings(byPage, pageOrder, mid));
+      if (bodyLength(selection) <= target) {
+        best = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    const selected = mergeSkimUnits(headings, selectSkimNonHeadings(byPage, pageOrder, best));
+    return { selected, sampled: selected.length < units.length, headingsSampled: false };
+  }
+
+  // 3. 连 heading 都放不下：heading 等距抽样（至少保留一个，交给最后的 clamp 兜底）
+  let lo = 0;
+  let hi = headings.length;
+  let best = 0;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (bodyLength(selectSkimHeadings(headings, mid)) <= target) {
+      best = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  const keep = Math.max(best, headings.length > 0 ? 1 : 0);
+  const selected = selectSkimHeadings(headings, keep);
+  return {
+    selected,
+    sampled: selected.length < units.length,
+    headingsSampled: selected.length < headings.length,
+  };
+}
+
+function buildSkimNote({ preview, pages, cap, anyTruncated, heuristic }) {
+  const coverage = preview.notRepresented.length > 0
+    ? `not represented: ${formatRangeList(preview.notRepresented)}`
+    : 'every requested page is represented';
+  const tail = anyTruncated ? `; units longer than ${cap} chars end with …[+N chars]` : '';
+  const bestEffort = heuristic
+    ? ' Skim was built from heuristic blocks (best-effort): section structure may be wrong.'
+    : '';
+  const across = `across ${pagesLabel(pages)}`;
+  const label = preview.sampled ? 'preview: skim (sampled)' : 'preview: skim';
+  if (preview.headingsSampled) {
+    return `${label} — sampled ${preview.headingsInlined} of ${preview.headingsTotal} headings ${across} (even the headings did not fit); no sentence was inlined; ${coverage}${tail}.${bestEffort}`;
+  }
+  const headingText = preview.headingsTotal > 0
+    ? `all ${preview.headingsTotal} heading${preview.headingsTotal === 1 ? '' : 's'} kept`
+    : 'no headings in these blocks';
+  const sampledSentences = preview.sampled
+    ? `; sampled ${preview.units - preview.headingsInlined} of ${preview.skimUnits - preview.headingsTotal} paragraph first sentences`
+    : '';
+  return `${label} — ${preview.units} of ${preview.totalUnits} sentences inlined ${across}; ${headingText}${sampledSentences}; ${coverage}${tail}. Skim = headings + first sentence per paragraph (tables as [table: caption]).${bestEffort}`;
+}
+
+/**
+ * tier 2 的装配。返回 null 表示这份文档没有可用 blocks（旧路径 → tier 3）。
+ * 与 .20 的抽样一样用「预留说明 → 渲染 → 按实际长度回退」的循环，
+ * 保证 body + note ≤ capacity（极端小上限由 clampInlineText 最终兜底）。
+ */
+function planSkimPreview({ mediaType, segments, pages, capacity, heuristic }) {
+  const model = buildSkimModel(mediaType, segments);
+  if (!model) return null;
+  const pageOrder = Array.isArray(pages) && pages.length > 0
+    ? [...pages]
+    : [...new Set(segments.map((segment) => segment.page ?? segment.index))].sort((a, b) => a - b);
+  const stats = new Map(model.pages.map((entry) => [entry.page, entry]));
+  let target = Math.max(1, capacity - PREVIEW_NOTE_RESERVE);
+  let fallback = null;
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const cap = Math.max(1, Math.min(Math.floor(target / 4), PREVIEW_UNIT_MAX_CHARS));
+    const units = model.units.map((unit) => {
+      const { text, truncated } = capUnitText(unit.text, cap);
+      return { ...unit, renderText: text, unitTruncated: truncated };
+    });
+    const headings = units.filter((unit) => unit.kind === 'heading');
+    const byPage = new Map();
+    for (const unit of units) {
+      if (!byPage.has(unit.page)) byPage.set(unit.page, []);
+      byPage.get(unit.page).push(unit);
+    }
+
+    const selection = chooseSkimSelection({ units, headings, byPage, pageOrder, stats, target });
+    const bodyText = renderSkimBody({ selected: selection.selected, stats, pageOrder });
+    const represented = new Set(selection.selected.map((unit) => unit.page));
+    const preview = {
+      mode: 'skim',
+      units: selection.selected.length,
+      // 与 .20 同口径：分母是请求范围内的句子总数
+      totalUnits: model.sentenceTotal,
+      skimUnits: units.length,
+      headingsTotal: headings.length,
+      headingsInlined: selection.selected.filter((unit) => unit.kind === 'heading').length,
+      sampled: selection.sampled,
+      headingsSampled: selection.headingsSampled,
+      notRepresented: pageOrder.filter((page) => !represented.has(page)),
+    };
+    const note = buildSkimNote({
+      preview,
+      pages: pageOrder,
+      cap,
+      anyTruncated: selection.selected.some((unit) => unit.unitTruncated),
+      heuristic,
+    });
+    const needed = (bodyText ? bodyText.length + 1 : 0) + (note ? note.length + 1 : 0);
+    const result = { mode: 'skim', bodyText, units: selection.selected, preview, note };
+    if (needed <= capacity) return result;
+    fallback = result;
+    if (target <= 1) break;
+    target = Math.max(1, target - (needed - capacity) - 40);
+  }
+  return fallback;
 }
 
 /** 升序索引里等距取 m 个（含首尾）；m >= n 时全取 */
@@ -920,10 +1272,11 @@ function selectTimeUnits(units, target) {
 }
 
 /**
- * 预览装配：tier 1 whole 放得下就全量；否则抽样。
+ * 预览装配：tier 1 whole 放得下就全量；放不下时文档先试 tier 2 skim（有 blocks 才试），
+ * 最后才是 tier 3 均匀抽样。视频/录音没有 skim，直接从 whole 到抽样（与 .20 一致）。
  * capacity = 上限减去 header / 固定 notes / full text 行之后的正文余量。
  */
-function planOverviewPreview({ mediaType, segments, pages, window, textOnly, capacity }) {
+function planOverviewPreview({ mediaType, segments, pages, window, textOnly, capacity, skimHeuristic = false }) {
   const units = buildPreviewUnits(mediaType, segments);
   const totalUnits = units.length;
   // 没有任何可内联的文字（扫描件、无字幕的视频……）：预览是空的，不编也不抽样
@@ -949,6 +1302,16 @@ function planOverviewPreview({ mediaType, segments, pages, window, textOnly, cap
       note: wholeNote,
     };
   }
+
+  // tier 2：文档 + 契约 v2 blocks。没有 blocks 时 planSkimPreview 返回 null，走 .20 的抽样。
+  const skim = planSkimPreview({
+    mediaType,
+    segments,
+    pages,
+    capacity,
+    heuristic: skimHeuristic,
+  });
+  if (skim) return skim;
 
   // 先给说明预留空间，再把余量交给正文；渲染后按实际长度回退重试。
   let target = Math.max(1, capacity - PREVIEW_NOTE_RESERVE);
@@ -1239,7 +1602,18 @@ function formatOverviewText({
     + [...bodyNotes, ...tailNotes].reduce((sum, note) => sum + note.length + 1, 0);
   const capacity = limit - fixedLength - 1;
 
-  const plan = planOverviewPreview({ mediaType, segments, pages, window, textOnly, capacity });
+  // skim 的结构来自契约 v2 blocks：builtin（或没有 typeset provider 的原生文字层）
+  // 是启发式，note 里必须标 best-effort；外部 typeset provider 的 blocks 才算结构。
+  const skimHeuristic = !transcript.typesetProvider || transcript.typesetProvider === 'builtin';
+  const plan = planOverviewPreview({
+    mediaType,
+    segments,
+    pages,
+    window,
+    textOnly,
+    capacity,
+    skimHeuristic,
+  });
   const notes = [plan.note, ...bodyNotes, ...tailNotes].filter(Boolean);
   const text = [headText, plan.bodyText, ...notes].filter(Boolean).join('\n');
   return {
