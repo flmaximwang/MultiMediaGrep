@@ -4,11 +4,12 @@
 
 import { createHash } from 'node:crypto';
 
-/** 契约 §2.5：文字来源（可信度口径） */
-export const SOURCE_VALUES = Object.freeze(['subtitle', 'ocr', 'asr', 'visual', 'none']);
+/** 契约 §2.5：文字来源（可信度口径）。text = 原生文字层 / 纯文本，字符精确；
+ *  mixed 只出现在整份 transcript 上（逐页标签不一致）。 */
+export const SOURCE_VALUES = Object.freeze(['subtitle', 'text', 'ocr', 'asr', 'visual', 'mixed', 'none']);
 
-/** 契约 §2.5：来源渠道口径 */
-export const ORIGIN_VALUES = Object.freeze(['file', 'embedded', 'asr', 'ocr', 'none']);
+/** 契约 §2.5：来源渠道口径。textlayer = PDF 原生文字层。 */
+export const ORIGIN_VALUES = Object.freeze(['file', 'embedded', 'textlayer', 'asr', 'ocr', 'none']);
 
 /** cangjie 契约里 element.type 的枚举 */
 export const ELEMENT_TYPES = Object.freeze([

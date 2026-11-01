@@ -187,6 +187,35 @@ test('writeExport：四个文件落盘，cangjie document 合法', async () => {
   }
 });
 
+test('normalizeSegments / document.json：接受 text 来源与 textlayer 渠道（9z5.21）', () => {
+  const segments = normalizeSegments([
+    { page: 1, text: 'page one body', source: 'text', origin: 'textlayer' },
+    { page: 2, text: '', source: 'none', origin: 'none' },
+  ]);
+  assert.equal(segments[0].source, 'text');
+  assert.equal(segments[0].origin, 'textlayer');
+
+  const doc = buildCangjieDocument({
+    source: { path: '/tmp/a.pdf' },
+    segments,
+    mediaType: 'pdf',
+    language: ['en'],
+    title: 'a',
+    sourceId: sourceIdFor('a.pdf'),
+    versionId: `sha256:${'a'.repeat(64)}`,
+  });
+  assertCangjieDocument(doc);
+  assert.equal(doc.elements[0].source, 'text');
+  assert.equal(doc.elements[1].source, 'none');
+
+  // mixed 只出现在整份 transcript 上（逐页标签不一致），manifest 原样写出。
+  const manifest = buildManifest({
+    source: { path: '/tmp/a.pdf', mediaType: 'document' },
+    transcript: { source: 'mixed', origin: 'textlayer', segmentCount: 2 },
+  });
+  assert.equal(manifest.transcript.source, 'mixed');
+});
+
 test('exportAnalysis：产出材料并保证可复现', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-export-det-'));
   const now = Date.parse('2026-11-01T00:00:00.000Z');

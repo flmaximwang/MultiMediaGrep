@@ -577,6 +577,9 @@ function normalizeSegmentsSafe(raw) {
       text: String(segment?.text ?? ''),
       source: segment?.source ?? 'none',
       origin: segment?.origin ?? 'none',
+      // 契约 v2（9z5.28）的逐页来源细节：source 已按它映射，textOrigin 原样暴露，
+      // 让 agent 能看到「这页是文字层 / OCR / 没声明」（9z5.21）。
+      textOrigin: segment?.textOrigin ?? null,
       page: integerOrNull(segment?.page),
       speaker: segment?.speaker ? String(segment.speaker) : null,
     };
@@ -594,6 +597,9 @@ function resolveTranscriptInfo(result, segments) {
     segmentCount: segments.length,
     provider: given.provider ?? null,
     model: given.model ?? null,
+    // 文档 provider 的两个角色（9z5.28 契约 v2）：只列真正处理过返回页的角色。
+    ocrProvider: given.ocrProvider ?? null,
+    typesetProvider: given.typesetProvider ?? null,
     file: given.file ?? null,
     reason: given.reason ?? null,
   };
@@ -603,7 +609,11 @@ function resolveTranscriptInfo(result, segments) {
  * 文本格式化（契约 §4.4 / §5.4 / §6.4 / §7.4 / §8.4）
  * ------------------------------------------------------------------ */
 
-/** ASR 是机器转写：不加引号，避免看起来像原话（契约 §2.5 的硬约束） */
+/**
+ * 只有 ASR（机器听写）不加引号，避免看起来像原话（契约 §2.5 的硬约束）。
+ * subtitle / text / ocr 都加「」：text 是字符精确的原生文字（可当原话引用），
+ * subtitle / ocr 也是「文件里/页面上已有的字」，只是可能自动生成或识别错。
+ */
 function quoteBySource(text, source) {
   const value = String(text ?? '');
   if (!value) return '';
@@ -656,6 +666,7 @@ function buildPreviewUnits(mediaType, segments) {
       page: null,
       source: segment.source ?? 'none',
       origin: segment.origin ?? 'none',
+      textOrigin: segment.textOrigin ?? null,
       text: String(segment.text ?? ''),
       segment,
     }));
@@ -669,6 +680,8 @@ function buildPreviewUnits(mediaType, segments) {
         page,
         source: segment.source ?? 'none',
         origin: segment.origin ?? 'none',
+        // 9z5.21：逐页来源细节要一路带到 structuredContent.segments。
+        textOrigin: segment.textOrigin ?? null,
         text: sentence,
         segment,
       });
@@ -1002,6 +1015,7 @@ function unitsToInlineSegments(units, mediaType) {
         text: unit.renderText,
         source: unit.source,
         origin: unit.origin,
+        textOrigin: unit.textOrigin ?? null,
         page: unit.page,
         speaker: unit.segment?.speaker ?? null,
       };
@@ -1020,6 +1034,28 @@ function formatOverviewSegmentLine(segment, mediaType, textOnly = false) {
   return `${padLabel(label)}] ${time}(${segment.source})  ${quoteBySource(segment.text, segment.source)}`.trimEnd();
 }
 
+/**
+ * probe 文本里的文字层行（9z5.21）：三态 yes | no | unknown。
+ *
+ * `hasTextLayer = null` 是「本机没有文字抽取器，判不出来」，不能渲染成 no；
+ * 后者会让 agent 以为这份 PDF 只能靠 OCR。
+ */
+function formatTextLayerLine(result) {
+  const layer = result.capabilities?.textLayer ?? {};
+  const checked = Array.isArray(layer.checkedPages) ? layer.checkedPages : [];
+  const sampled = checked.length > 0 ? checked.join(', ') : null;
+  if (result.hasTextLayer === null || result.hasTextLayer === undefined) {
+    return `text layer: unknown — ${layer.reason ?? 'the PDF text layer could not be checked.'}`;
+  }
+  if (result.hasTextLayer === false) {
+    return `text layer: no${sampled ? ` (checked pages ${sampled})` : ''}.`;
+  }
+  if (Number.isInteger(layer.textPage)) {
+    return `text layer: yes (sampled pages ${sampled ?? layer.textPage}; first text on page ${layer.textPage}).`;
+  }
+  return 'text layer: yes.';
+}
+
 function formatProbeText(result) {
   const mediaType = result.mediaType;
   const lines = [];
@@ -1027,7 +1063,10 @@ function formatProbeText(result) {
 
   if (mediaType === 'document') {
     attrs.push(`pages="${result.pageCount ?? '-'}"`);
-    attrs.push(`textLayer="${result.hasTextLayer ? 'yes' : 'no'}"`);
+    const textLayer = result.hasTextLayer === null || result.hasTextLayer === undefined
+      ? 'unknown'
+      : (result.hasTextLayer ? 'yes' : 'no');
+    attrs.push(`textLayer="${textLayer}"`);
   } else {
     attrs.push(`duration="${fixed2(result.durationSec) ?? '-'}"`);
     attrs.push(`durationMs="${result.durationMs ?? '-'}"`);
@@ -1071,15 +1110,18 @@ function formatProbeText(result) {
     lines.push('ocr: not applicable to this media type.');
     lines.push('typeset: not applicable to this media type.');
   } else {
+    // 9z5.21：拆成「文字层状态 + 两个角色各自是否可用 + 实际会走的来源」，
+    // 不再出现「ocr: unavailable」与「transcript source: ocr」自相矛盾的两行。
+    lines.push(formatTextLayerLine(result));
     if (ocr.available) {
-      lines.push(`ocr: available — provider "${ocr.provider ?? 'unknown'}".`);
+      lines.push(`ocr provider: ${ocr.provider ?? 'unknown'}.`);
     } else {
-      lines.push(`ocr: unavailable — ${ocr.reason ?? 'no OCR provider is configured.'}`);
+      lines.push(`ocr provider: none${ocr.reason ? ` — ${ocr.reason}` : '.'}`);
     }
     if (typeset.available) {
-      lines.push(`typeset: available — provider "${typeset.provider ?? 'unknown'}".`);
+      lines.push(`typeset provider: ${typeset.provider ?? 'unknown'}.`);
     } else {
-      lines.push(`typeset: unavailable — ${typeset.reason ?? 'no typeset provider is configured.'}`);
+      lines.push(`typeset provider: none${typeset.reason ? ` — ${typeset.reason}` : '.'}`);
     }
   }
 
@@ -1118,8 +1160,11 @@ function formatOverviewText({
       attrs.push(`image="${imageDescriptors.map((d) => `${d.width}x${d.height}`).join(' ')}"`);
       attrs.push(`tokens="~${budget.estimatedTokens}"`);
     }
-    attrs.push(`text="${transcript.provider ?? 'none'}"`);
+    // 9z5.21：删除误导的 text="<provider>"（它其实是 provider id，且原生文字层没有
+    // provider），改为只列本次真正处理过返回页的角色（后端按逐页 textOrigin 判定）。
     attrs.push(`source="${transcript.source}"`);
+    if (transcript.ocrProvider) attrs.push(`ocrProvider="${transcript.ocrProvider}"`);
+    if (transcript.typesetProvider) attrs.push(`typesetProvider="${transcript.typesetProvider}"`);
   } else {
     if (window) {
       attrs.push(`window="${fixed2(window.startSec)}-${fixed2(window.endSec ?? durationSec ?? 0)}"`);
@@ -1173,7 +1218,15 @@ function formatOverviewText({
     if (textOnly) {
       bodyNotes.push('note: text-only mode (images: 0) — no page thumbnail was rendered.');
     }
-    bodyNotes.push('note: page text comes from OCR of the rendered pages — verify names and numbers against the page image via media_zoom({ path, page }).');
+    // 9z5.21：按实际来源给 note，不再无条件宣称「page text 来自 OCR」。
+    if (transcript.source === 'text') {
+      bodyNotes.push('note: page text comes from the native text layer (or the plain-text file) — characters are exact and may be quoted.');
+    } else if (transcript.source === 'mixed') {
+      bodyNotes.push('note: page sources differ — read the tag on each page (text = character-exact native text, ocr = machine recognition).');
+    }
+    if (segments.some((segment) => segment.source === 'ocr')) {
+      bodyNotes.push('note: some page text comes from OCR — names, numbers and jargon may be misread; verify them against the page image via media_zoom({ path, page }).');
+    }
   }
   if (warnings.includes(ROLLING_SUBTITLE_WARNING)) bodyNotes.push(ROLLING_SUBTITLE_WARNING);
   if (budget.warning) bodyNotes.push(`budget: ${budget.warning}`);
@@ -1269,10 +1322,10 @@ const DOC_LOCATE_CANDIDATE_MAX = 20;
 
 const DOC_LOCATE_FOOTER = 'Feed any of these pages to media_zoom({ path, page }) — no need to re-read the whole file.';
 
-/** 文档命中行：`page 11  hits=3  「…片段…」`（没有 score：文档侧不用分数） */
+/** 文档命中行：`page 11  hits=3  (text)  「…片段…」`（没有 score：文档侧不用分数） */
 function documentMatchLine(match) {
-  const fuzzy = match.fuzzy ? ' (fuzzy)' : '';
-  return `  page ${match.page}  hits=${match.hits}${fuzzy}  「${match.snippet}」`;
+  const flags = [match.fuzzy ? 'fuzzy' : null, match.source ?? null].filter(Boolean).join(', ');
+  return `  page ${match.page}  hits=${match.hits}${flags ? ` (${flags})` : ''}  「${match.snippet}」`;
 }
 
 /** 没展示的命中页折成一行：`  3 more pages match: 3, 9, 14`（页码升序） */
@@ -2172,6 +2225,8 @@ function normalizeMatches(rawMatches, pageCount) {
       text: String(match?.text ?? ''),
       source: match?.source ?? 'none',
       origin: match?.origin ?? 'none',
+      // 文档：逐页来源细节（契约 v2 的 textOrigin；视频/录音为 null）。
+      textOrigin: match?.textOrigin ?? null,
       page,
     };
   });
@@ -2198,6 +2253,7 @@ function buildDocumentMatches(matches, query) {
       snippet: buildSnippet(match.text, query, { index, radius: DOC_SNIPPET_RADIUS }),
       source: match.source,
       origin: match.origin,
+      textOrigin: match.textOrigin ?? null,
     });
   }
   // 排序：精确命中优先 → 命中次数降序 → 页码升序。

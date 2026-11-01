@@ -10,9 +10,9 @@ absolute path, and it prepares images and text for your own multimodal model to 
 
 READING ORDER
 1. media_probe first — cheap, no image tokens. Gives duration / page count / tracks and
-   whether transcription (ASR) and OCR are available for this file. For audio it also gives a
-   health check (level, speech ratio): a recording with no effective speech yields an EMPTY
-   transcript by design.
+   whether transcription (ASR), OCR and a native text layer are available for this file. For
+   audio it also gives a health check (level, speech ratio): a recording with no effective
+   speech yields an EMPTY transcript by design.
 2. media_overview — the main read. Video: numbered storyboard grids plus a time-aligned text
    index. Audio: a timestamped transcript. Document: page thumbnails plus page text.
    The full text of the requested range is written to disk, and the result text ends with a
@@ -36,7 +36,11 @@ Every segment carries a source tag. "subtitle" comes from a subtitle file/track;
 author's words, but may be auto-generated: check names and numbers against the frame.
 "asr" is machine transcription: names, numbers and jargon are often wrong, so NEVER quote an
 ASR segment as the speaker's exact words and never present it as a verbatim quotation.
+"text" is native text — a PDF text layer or a plain-text file: character-exact, and may be
+quoted directly.
 "ocr" is text read off a rendered page — check names and numbers against the page image.
+"mixed" (documents only) means the returned pages have different sources — read the tag on
+each page before quoting.
 "visual" means there is no text at all, only the picture.
 
 READING PICTURES
@@ -56,10 +60,10 @@ TOKEN DISCIPLINE
   a suggested smaller shape, not a silent truncation.
 
 WHEN TEXT IS UNAVAILABLE
-If media_probe reports that no ASR provider and no OCR provider are configured, or that the
-recording has no effective speech, you get the visuals only: describe what is on screen and
-state plainly that the spoken or written content was not available. Do not invent dialogue,
-captions or page text.
+If media_probe reports that no ASR provider, no OCR provider and no native text layer are
+available, or that the recording has no effective speech, you get the visuals only: describe
+what is on screen and state plainly that the spoken or written content was not available. Do
+not invent dialogue, captions or page text.
 
 FORMATS
 - Timestamps are given both as integer milliseconds (*Ms) and as seconds (*Sec); both refer to

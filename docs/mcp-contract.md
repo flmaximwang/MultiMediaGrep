@@ -228,14 +228,27 @@ flowchart TD
 | 值 | 含义 | 可信度 | agent 该怎么用 |
 |---|---|---|---|
 | `subtitle` | 字幕文件或容器内嵌字幕轨里的文字 | 中高 | 通常是作者原话，但**可能是自动生成的**：专有名词、数字要自己核对画面 |
+| `text` | **原生文字**：PDF 文字层（`origin = "textlayer"`）或 `.txt` / `.md` 文件本身（`origin = "file"`） | **最高（字符级精确）** | **可当原话直接引用**；不需要为了核对字符去 zoom 页面图 |
 | `ocr` | 从画面 / 页面上 OCR 出来的文字 | 中高 | 可引用，但专有名词、数字要自己核对 |
 | `asr` | 语音识别转写 | **最低** | **不可当原话引用**——人名、数字、术语会错 |
 | `visual` | 没有文字来源，只有画面 | — | 只能描述画面，不能转述「说了什么」 |
-| `none` | 该项为空 | — | — |
+| `mixed` | **只用于整份 `transcript`**：返回的页来源不一致（例如封面是 `ocr`、正文是 `text`） | — | 看每页自己的 `source` 标签；不要用 `mixed` 推断单页可信度 |
+| `none` | 该项为空（没有文字，也不谎报来源） | — | — |
 
-`origin` 枚举（**来源渠道口径**）：`file`（外部字幕文件）/ `embedded`（容器内嵌字幕轨）/ `asr` / `ocr` / `none`。
+`origin` 枚举（**来源渠道口径**）：`file`（外部字幕文件 / `.txt` / `.md`）/ `embedded`（容器内嵌字幕轨）/ `textlayer`（PDF 原生文字层）/ `asr` / `ocr` / `none`。
 
-两个字段一起给：`source = "subtitle"` + `origin = "embedded"` = 视频自带的字幕轨；`source = "subtitle"` + `origin = "file"` = 取数层给的字幕文件；`source = "asr"` + `origin = "asr"` = 机器转的。
+两个字段一起给：`source = "subtitle"` + `origin = "embedded"` = 视频自带的字幕轨；`source = "subtitle"` + `origin = "file"` = 取数层给的字幕文件；`source = "asr"` + `origin = "asr"` = 机器转的；`source = "text"` + `origin = "textlayer"` = PDF 原生文字层。
+
+**文档的逐页映射（0.2.0 起，破坏性变更）：**
+
+- provider / 抽取层返回 `textOrigin = "textlayer"` → `source = "text"`、`origin = "textlayer"`；
+- `textOrigin = "ocr"` 或 `unknown`（provider 没声明）→ `source = "ocr"`、`origin = "ocr"`（不确定时取保守值）；
+- 页上没有任何文字 → `source = "none"`、`origin = "none"`（扫描件没配 OCR 时**不能**谎报有文本）；
+- 整份 `transcript.source`：所有返回页一致时取该值（含「整份都没文字」→ `none`），不一致 → `mixed`；
+- `.txt` / `.md` 一律 `source = "text"`、`origin = "file"`；
+- `origin` 枚举里没有 `mixed`：`source = "mixed"` 时 `origin` 只表示主要渠道（`textlayer` 优先），逐页口径以 `segments[].origin` 为准。
+
+> `source = "text"` 的段落与 `subtitle` 一样在文本输出里加「」；`asr` 不加（见 §5.4）。
 
 > **硬约束一：ASR 转写不得被当作原话引用。** ASR 会把人名、数字、专业术语听错——上游 `dsh-video-storyboard` 专门写了一个 OCR 模块来用画面里的硬字幕校正 ASR 文本，理由就是「画面更可信」。所以凡是 `source = "asr"` 的段落，工具描述与 server instructions 都要提醒 agent 标注不确定。
 
@@ -381,10 +394,13 @@ path, and it only prepares images and text for your own model to look at.
 | `capabilities.asr.provider` | string \| null | 生效的 ASR provider 名 | — |
 | `capabilities.asr.reason` | string \| null | 不可用时的原因（人话） | — |
 | `capabilities.ocr.available` | boolean | 本文件能否做 OCR | — |
-| `capabilities.ocr.provider` | string \| null | 生效的 OCR provider 名 | — |
+| `capabilities.ocr.provider` | string \| null | 生效的 OCR provider 名（只处理无文字层页） | — |
 | `capabilities.ocr.reason` | string \| null | 不可用时的原因 | — |
-| `capabilities.transcriptSource` | `"subtitle"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 本次探针判定会走哪条转写来源（可信度口径，见 §2.5） | — |
-| `capabilities.transcriptOrigin` | `"file"` \| `"embedded"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道（外部文件 / 内嵌轨 / ASR / OCR） | — |
+| `capabilities.typeset.available` | boolean | 本文件能否做 typeset（有文字层页的阅读顺序 / 结构） | — |
+| `capabilities.typeset.provider` | string \| null | 生效的 typeset provider 名（`builtin` 表示本地内置） | — |
+| `capabilities.typeset.reason` | string \| null | 不可用时的原因 | — |
+| `capabilities.transcriptSource` | `"subtitle"` \| `"text"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"mixed"` \| `"none"` | 本次探针判定会走哪条转写来源（可信度口径，见 §2.5）。文档的 `text` = 原生文字层；`mixed` = 文字层与 OCR 都可用，逐页路由结果可能混合 | — |
+| `capabilities.transcriptOrigin` | `"file"` \| `"embedded"` \| `"textlayer"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道（外部文件 / 内嵌轨 / PDF 文字层 / ASR / OCR）。`transcriptSource = "mixed"` 时给主要渠道（`textlayer` 优先），逐页口径以结果里的 `segments[].origin` 为准 | — |
 | `capabilities.transcriptPath` | string \| null | 若来源是文件，具体是哪个文件 | — |
 | `capabilities.transcriptReason` | string \| null | 文件里有字幕轨、但本次没有用上时的可读原因（如只剩图形字幕轨）；与 `warnings` 中的条目同源 | — |
 | `capabilities.textLayer.checked` | boolean | 是否真的查过文字层（document） | — |
@@ -465,6 +481,23 @@ asr: skipped (audio has no effective speech).
 transcript source: none
 How to read 30 min: one overview is enough. media_overview({ path })
 ```
+
+文档（0.2.0 起分行给出文字层 / 两个 provider 角色 / 实际来源，不再有互相矛盾的两行）：
+
+```
+<media path="/abs/a.pdf" type="document" pages="28" textLayer="yes" container="pdf" subtitles="no" />
+asr: not applicable to this media type.
+text layer: yes (sampled pages 1, 14; first text on page 1).
+ocr provider: none — No OCR provider is configured (MMGREP_OCR_PROVIDER is "none"). Pages without a text layer are returned as page images only.
+typeset provider: builtin.
+transcript source: text
+One overview shows page thumbnails and page text. Use media_zoom({ path, page }) to read a page closely.
+```
+
+- `text layer:` 与 `textLayer` 属性都是三态：`yes` / `no` / `unknown`（本机没有文字抽取器，**判不出来**，不是「没有文字层」）。
+- `ocr provider:` / `typeset provider:` 分别说明两个角色；`none` 时附原因。
+- `transcript source:` 是实际会走的来源：`text`（原生文字层 / 纯文本）、`ocr`（只有 OCR）、`mixed`（文字层与 OCR 都可用，逐页路由可能混合）、`none`。
+- 旧输出的 `ocr: unavailable` 与 `transcript source: ocr` 不会再同时出现：前者描述角色可用性，后者描述实际文字来源，二者不是一回事。
 
 ### 4.5 错误行为
 
@@ -575,14 +608,17 @@ through the rest.
 | `segments[].startMs` / `endMs` | integer \| null | 时间范围（document 为 null） | ms |
 | `segments[].startSec` / `endSec` | number \| null | 同上，秒 | s |
 | `segments[].text` | string | 该段文字（可能为 ""，表示无台词） | — |
-| `segments[].source` | `"subtitle"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 这段文字的来源与可信度（见 §2.5） | — |
-| `segments[].origin` | `"file"` \| `"embedded"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道 | — |
+| `segments[].source` | `"subtitle"` \| `"text"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 这段文字的来源与可信度（见 §2.5）。文档逐页：原生文字层 = `text`，OCR / 未声明 = `ocr`，无文字 = `none` | — |
+| `segments[].origin` | `"file"` \| `"embedded"` \| `"textlayer"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道（文档：`textlayer` = PDF 文字层，`file` = `.txt` / `.md`） | — |
+| `segments[].textOrigin` | `"textlayer"` \| `"ocr"` \| `"unknown"` \| null | 文档 provider / 抽取层对**这一页**的声明（`source` 就是按它映射的）；视频 / 录音为 null | — |
 | `segments[].page` | integer \| null | 页码（document） | 页 |
-| `transcript.source` | `"subtitle"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 整份转写的来源与可信度 | — |
-| `transcript.origin` | `"file"` \| `"embedded"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道 | — |
+| `transcript.source` | `"subtitle"` \| `"text"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"mixed"` \| `"none"` | 整份转写的来源与可信度。文档 `mixed` = 返回页的逐页标签不一致，看每页的 `source` | — |
+| `transcript.origin` | `"file"` \| `"embedded"` \| `"textlayer"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道。`transcript.source = "mixed"` 时只表示主要渠道（`textlayer` 优先），逐页以 `segments[].origin` 为准 | — |
 | `transcript.language` | string \| null | 语言 | — |
 | `transcript.segmentCount` | integer | 总段落数（全文，不是节选数） | 条 |
-| `transcript.provider` / `transcript.model` | string \| null | ASR provider 与模型 | — |
+| `transcript.provider` / `transcript.model` | string \| null | 主 provider 与模型（文档有 typeset 结果时优先 typeset 角色） | — |
+| `transcript.ocrProvider` | string \| null | 本次实际处理过返回页的 OCR 角色 provider（document；没用到时为 null） | — |
+| `transcript.typesetProvider` | string \| null | 本次实际处理过返回页的 typeset 角色 provider（document；`builtin` = 本地内置；没用到时为 null） | — |
 | `transcript.reason` | string \| null | 没有转写时的人话原因（`source = "none"` 时给出） | — |
 | `pages[]` | array \| null | document 的每页文字（`{page, text, truncated}`） | — |
 | `fullText.dir` | string | 全文落盘目录 | — |
@@ -658,27 +694,38 @@ note: source is asr — machine transcription. Names, numbers and jargon may be 
 full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
 
-**文档（document）**——按页：
+**文档（document）**——按页。header 不再有 `text="<provider>"`，改为 `source` + 本次实际处理返回页的角色：
 
 ```
 <overview path="/abs/a.pdf" type="document" pages="1-12" grid="12 pages x 2 image(s)"
-  image="1280x720" tokens="~2458" text="mineru" source="ocr" />
-[page 1  ] (ocr)  「……」
-[page 2  ] (ocr)  「……」 「……」
+  image="1280x720" tokens="~2458" source="text" typesetProvider="builtin" />
+[page 1  ] (text)  「……」
+[page 2  ] (text)  「……」 「……」
 preview: sampled 84 of 312 sentences across pages 1-12; not represented: 8-12.
-note: page text comes from OCR of the rendered pages — verify names and numbers against the
-      page image via media_zoom({ path, page }).
+note: page text comes from the native text layer (or the plain-text file) — characters are exact and may be quoted.
 full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
 
-请求范围整体放得下时是 tier 1，允许宣称完整（且只有此时可以）：
+逐页来源不一致时（封面是扫描图、正文是文字层），整份是 `source="mixed"`，只有真正 OCR 过的页标 `(ocr)`：
 
 ```
+<overview path="/abs/a.pdf" type="document" pages="1-4" source="mixed"
+  ocrProvider="mineru" typesetProvider="builtin" />
 [page 1  ] (ocr)  「……」
-[page 2  ] (ocr)  「……」
+[page 2  ] (text)  「……」
+...
+note: page sources differ — read the tag on each page (text = character-exact native text, ocr = machine recognition).
+note: some page text comes from OCR — names, numbers and jargon may be misread; verify them
+      against the page image via media_zoom({ path, page }).
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
+```
+
+OCR 的核对 note **只在真的有 OCR 页时出现**，不再无条件写给所有文档。请求范围整体放得下时是 tier 1，允许宣称完整（且只有此时可以）：
+
+```
+[page 1  ] (text)  「……」
+[page 2  ] (text)  「……」
 note: complete text of pages 1-2 (nothing omitted).
-note: page text comes from OCR of the rendered pages — verify names and numbers against the
-      page image via media_zoom({ path, page }).
 full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
 
@@ -691,6 +738,8 @@ full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, m
 | video，无音轨 | 同上，原因写「no audio track」 | 只有画面 |
 | audio，**体检结论 too-quiet / silent** | **不跑 ASR**（避免幻觉段落）；`transcript.source = "none"`；说明写明「no effective speech」 | 什么都没有，只有一句说明 + 原因 |
 | audio，有字幕但无 ASR | 用字幕，`transcript.source = "subtitle"` | 画面 + 字幕文字（同上，核对专名与数字） |
+| document，**有文字层** | 不再把所有页标成 `ocr`：文字层页 `source = "text"`、`origin = "textlayer"`（字符精确，可引用）；`transcript.source = "text"`（有 OCR 角色参与时可能是 `mixed`） | 页面缩略图 + 文字层正文；无需为核对字符去 zoom |
+| document，图片封面 + 数字正文 | 封面无文字（没配 OCR 时 `source = "none"`，配置 OCR 后为 `ocr`）；正文 `source = "text"`；整份 `transcript.source = "mixed"` | 每页行首标签 `(text)` / `(ocr)` / 不出现（无文字页）；按标签决定是否核对 |
 | document，`MMGREP_OCR_PROVIDER=none` 且无文字层 | 照常出页缩略图宫格；`pages[].text` 为空；`transcript.source = "none"` | 只有页面缩略图 |
 | document，扫描件且 OCR 未配置 | 同上，且 `capabilities.ocr.available = false` | 只有页面缩略图；需要读字就 `media_zoom` 单页放大 |
 
@@ -847,8 +896,8 @@ speaker's exact words.
 | `mediaType` | string | 媒体类型 | — |
 | `path` | string | 绝对路径 | — |
 | `query` | string | 原始查询串 | — |
-| `transcriptSource` | `"subtitle"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 用的哪份转写（可信度口径，见 §2.5） | — |
-| `transcriptOrigin` | `"file"` \| `"embedded"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道 | — |
+| `transcriptSource` | `"subtitle"` \| `"text"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"mixed"` \| `"none"` | 用的哪份转写（可信度口径，见 §2.5）。文档可能是 `text` / `ocr` / `mixed` | — |
+| `transcriptOrigin` | `"file"` \| `"embedded"` \| `"textlayer"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道（文档：`textlayer` = PDF 文字层） | — |
 | `matches[]` | array | 匹配列表（视频/录音按分数降序；文档按 §7.3.1 排序） | — |
 | `matches[].rank` | integer | 名次（1-based） | — |
 | `matches[].score` | number | 匹配分数（0–1，越大越像）——**仅视频 / 录音**，文档没有这个字段 | — |
@@ -858,8 +907,9 @@ speaker's exact words.
 | `matches[].startMs` / `endMs` | integer \| null | 时间范围（document 为 null） | ms |
 | `matches[].startSec` / `endSec` | number \| null | 同上，秒 | s |
 | `matches[].text` | string | 命中的原文（**文档不返回整页正文**，用 `snippet`） | — |
-| `matches[].source` | `"subtitle"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 这段文字的来源与可信度（见 §2.5） | — |
-| `matches[].origin` | `"file"` \| `"embedded"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道 | — |
+| `matches[].source` | `"subtitle"` \| `"text"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 这段文字的来源与可信度（见 §2.5）；文档逐页映射（`text` / `ocr`） | — |
+| `matches[].origin` | `"file"` \| `"embedded"` \| `"textlayer"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道 | — |
+| `matches[].textOrigin` | `"textlayer"` \| `"ocr"` \| `"unknown"` \| null | 文档 provider / 抽取层对这一页的声明（`source` 按它映射）；视频 / 录音为 null | — |
 | `matches[].page` | integer \| null | 页码（document） | 页 |
 | `totalSegments` | integer | 搜索范围内的段落总数（document = 页数） | 条 |
 | `searchedWindow.startMs` / `endMs` | integer \| null | 搜索范围 | ms |
@@ -879,6 +929,7 @@ speaker's exact words.
 |---|---|
 | `hits` | 该页的命中次数：精确短语（归一化 + 紧凑化后逐字匹配）出现次数；没有精确命中时退回 token 覆盖，`hits` = 命中 token 的出现次数，并置 `fuzzy = true` |
 | `snippet` | 原文里首个命中 ±150 字符，对齐到词边界，折叠换行与排版空白；被截断处用 `…` 标记 |
+| `source` | 该页文字的来源：`text`（原生文字层，字符精确）/ `ocr`（机器识别）。文本行写成 `page 11  hits=3 (text) 「…」`；`fuzzy` 命中写成 `(fuzzy, ocr)` |
 | 排序 | **精确命中优先** → `hits` 降序 → 页码升序（token 覆盖会把只命中一个常见词的页也算进来，精确命中必须压过它们） |
 | 整页正文 | **不再返回**。要整页用 `media_overview({ path, pages })` 或缓存里的 `content.md` |
 | 输出预算 | 文本输出约 3 KB 上限：超了就少展示几页，其余折叠成一行 `N more pages match: 3, 9, 14`（页码升序）。被折叠的页**不算丢失**，文本里写明了页码 |
@@ -898,15 +949,17 @@ matches for "柏氏矢量" (2 of 128 segments):
 Feed any of these windows to media_zoom({ path, start, end }) — no need to re-read the whole file.
 ```
 
-文档（一行一页：页码 + 命中次数 + 命中附近的片段，没有分数）：
+文档（一行一页：页码 + 命中次数 + 来源标签 + 命中附近的片段，没有分数）：
 
 ```
 matches for "deimmunization" (2 of 28 pages):
-  page 11  hits=3  「…workflow for artificial intelligence-directed deimmunization.…」
-  page 4  hits=1  「…the chimera was deimmunized by injection of…」
+  page 11  hits=3 (text)  「…workflow for artificial intelligence-directed deimmunization.…」
+  page 4  hits=1 (ocr)  「…the chimera was deimmunized by injection of…」
   2 more pages match: 7, 19
 Feed any of these pages to media_zoom({ path, page }) — no need to re-read the whole file.
 ```
+
+`(text)` 的片段来自原生文字层，字符精确；`(ocr)` 的片段经过字符识别，专名与数字建议 `media_zoom` 核对。
 
 ### 7.5 错误行为
 
@@ -1129,12 +1182,12 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
 **一行一个 JSON 对象**（不是数组），便于流式读取：
 
 ```json
-{"index":1,"startMs":0,"endMs":4120,"startSec":0,"endSec":4.12,"text":"第一句。","page":null,"speaker":null}
-{"index":2,"startMs":4120,"endMs":9480,"startSec":4.12,"endSec":9.48,"text":"第二句。","page":null,"speaker":null}
-{"index":1,"startMs":null,"endMs":null,"startSec":null,"endSec":null,"text":"第 1 页正文","page":1,"speaker":null}
+{"index":1,"startMs":0,"endMs":4120,"startSec":0,"endSec":4.12,"text":"第一句。","page":null,"speaker":null,"source":"asr","origin":"asr"}
+{"index":2,"startMs":4120,"endMs":9480,"startSec":4.12,"endSec":9.48,"text":"第二句。","page":null,"speaker":null,"source":"asr","origin":"asr"}
+{"index":1,"startMs":null,"endMs":null,"startSec":null,"endSec":null,"text":"第 1 页正文","page":1,"speaker":null,"source":"text","origin":"textlayer"}
 ```
 
-字段：`index`（1-based）、`startMs`/`endMs`（integer ms，document 为 null）、`startSec`/`endSec`（number，document 为 null）、`text`、`page`（document 专用）、`speaker`（有说话人分离时填，否则 null）。
+字段：`index`（1-based）、`startMs`/`endMs`（integer ms，document 为 null）、`startSec`/`endSec`（number，document 为 null）、`text`、`page`（document 专用）、`speaker`（有说话人分离时填，否则 null），以及 `source` / `origin`（§2.5 的枚举；文档逐页可能是 `source = "text"` + `origin = "textlayer"`（PDF 文字层）、`source = "text"` + `origin = "file"`（`.txt` / `.md`）、`source = "ocr"` + `origin = "ocr"`，或 `none`）。`contentHash` 是归一化文本的哈希（扩展字段）。
 
 ### 9.3 `manifest.json`
 
@@ -1261,7 +1314,7 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
 | `asset_ref` | string \| null | 关联资产（图片 / 帧图）的相对路径 |
 | `confidence` | number \| null | 置信度 0–1（OCR / ASR 给，字幕给 1.0） |
 | `content_hash` | string | `sha256:<hex>`，由**归一化后的文本**（去首尾空白 + 折叠内部空白）确定性计算 |
-| `source` | string | **我们额外加的字段**：文字来源与可信度，取 §2.5 的枚举 `subtitle` / `ocr` / `asr` / `visual` / `none` |
+| `source` | string | **我们额外加的字段**：文字来源与可信度，取 §2.5 的枚举 `subtitle` / `text` / `ocr` / `asr` / `visual` / `none`（element 粒度不会出现 `mixed`；`mixed` 只用于整份 `transcript`） |
 
 > `source` 不在 cangjie 契约里，但契约没有禁止 `additionalProperties`，所以加它是合法的。它的价值：cangjie 的 element 没有「这段字是作者写的还是机器猜的」的概念，而下游蒸馏器需要这个区分（ASR 不可当原话引用）。
 
@@ -1270,7 +1323,7 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
 | 本项目的产物 | element `type` | 填充的字段 |
 |---|---|---|
 | 字幕 / ASR 段落 | `transcript` | `text`、`time_start_ms`、`time_end_ms`、`source`（`subtitle`/`asr`）、`confidence` |
-| 文档页文字 | `paragraph` | `text`、`page`、`heading_path`、`source`（`ocr`） |
+| 文档页文字 | `paragraph` | `text`、`page`、`heading_path`、`source`（`text` = 原生文字层 / 纯文本；`ocr` = 机器识别；`none` = 无文字页） |
 | 画面帧 | `frame` | `asset_ref`（帧图路径）、`time_start_ms`、`source` = `visual` |
 
 **已知偏差（必须知道）**：cangjie 的 `media_type` 枚举里**没有 `image`**。所以**图片类文档**（`png` / `jpg` / `webp` / `tiff` / `heic` …）在 `document.json` 里映射成 **`pdf`**（页面式文档）——这是为了让 `media_type` 落在契约枚举内。**真实来源类型记在 `manifest.json` 的 `source.mediaType`**（那里本项目用自己的口径，`document` 表示图片类文档）。下游若要区分「真 PDF」和「一堆图片」，读 manifest，不要读 `document.json` 的 `media_type`。
@@ -1445,9 +1498,9 @@ absolute path, and it prepares images and text for your own multimodal model to 
 
 READING ORDER
 1. media_probe first — cheap, no image tokens. Gives duration / page count / tracks and
-   whether transcription (ASR) and OCR are available for this file. For audio it also gives a
-   health check (level, speech ratio): a recording with no effective speech yields an EMPTY
-   transcript by design.
+   whether transcription (ASR), OCR and a native text layer are available for this file. For
+   audio it also gives a health check (level, speech ratio): a recording with no effective
+   speech yields an EMPTY transcript by design.
 2. media_overview — the main read. Video: numbered storyboard grids plus a time-aligned text
    index. Audio: a timestamped transcript. Document: page thumbnails plus page text.
    The full text of the requested range is written to disk, and the result text ends with a
@@ -1471,7 +1524,11 @@ Every segment carries a source tag. "subtitle" comes from a subtitle file/track;
 author's words, but may be auto-generated: check names and numbers against the frame.
 "asr" is machine transcription: names, numbers and jargon are often wrong, so NEVER quote an
 ASR segment as the speaker's exact words and never present it as a verbatim quotation.
+"text" is native text — a PDF text layer or a plain-text file: character-exact, and may be
+quoted directly.
 "ocr" is text read off a rendered page — check names and numbers against the page image.
+"mixed" (documents only) means the returned pages have different sources — read the tag on
+each page before quoting.
 "visual" means there is no text at all, only the picture.
 
 READING PICTURES
@@ -1491,10 +1548,10 @@ TOKEN DISCIPLINE
   a suggested smaller shape, not a silent truncation.
 
 WHEN TEXT IS UNAVAILABLE
-If media_probe reports that no ASR provider and no OCR provider are configured, or that the
-recording has no effective speech, you get the visuals only: describe what is on screen and
-state plainly that the spoken or written content was not available. Do not invent dialogue,
-captions or page text.
+If media_probe reports that no ASR provider, no OCR provider and no native text layer are
+available, or that the recording has no effective speech, you get the visuals only: describe
+what is on screen and state plainly that the spoken or written content was not available. Do
+not invent dialogue, captions or page text.
 
 FORMATS
 - Timestamps are given both as integer milliseconds (*Ms) and as seconds (*Sec); both refer to

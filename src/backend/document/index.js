@@ -428,13 +428,57 @@ function hasAnyText(texts) {
   return false;
 }
 
-function transcriptFor({ anyText, providerId = null, model = null, reason = null }) {
+/**
+ * 一页的对外 source / origin（契约 §2.5，9z5.21）。
+ *
+ *   textOrigin textlayer → source text（PDF 原生文字层；.txt / .md 记 origin=file）；
+ *   ocr / unknown        → source ocr（不确定时取保守值：宁可提醒核对，也不谎称字符精确）；
+ *   没有任何文字          → none / none（扫描件没配 OCR 时不能谎报有文本）。
+ */
+function pageSourceOrigin(entry, kind) {
+  const text = String(entry?.text ?? '').trim();
+  if (!text) return { source: 'none', origin: 'none' };
+  if (entry?.textOrigin === 'textlayer') {
+    return { source: 'text', origin: kind === 'text' ? 'file' : 'textlayer' };
+  }
+  return { source: 'ocr', origin: 'ocr' };
+}
+
+/**
+ * 整份转写的 source / origin（契约 §2.5，9z5.21）。
+ *
+ * source：所有返回页一致时取该值（含「整份都没文字」→ none），不一致 → mixed。
+ * origin：枚举里没有 mixed，所以 source=mixed 时只表示主要渠道（textlayer 优先）；
+ *         逐页口径以 segments[].origin 为准。
+ */
+function transcriptFor({
+  pageMap,
+  kind,
+  providerId = null,
+  ocrProviderId = null,
+  typesetProviderId = null,
+  model = null,
+  reason = null,
+}) {
+  const mapped = [...pageMap.values()].map((entry) => ({ ...entry, ...pageSourceOrigin(entry, kind) }));
+  const sources = mapped.map((entry) => entry.source);
+  let source = 'none';
+  if (sources.length > 0) {
+    source = sources.every((value) => value === sources[0]) ? sources[0] : 'mixed';
+  }
+  const origins = mapped.map((entry) => entry.origin).filter((origin) => origin !== 'none');
+  const origin = origins.length === 0
+    ? 'none'
+    : ['textlayer', 'file', 'ocr'].find((candidate) => origins.includes(candidate)) ?? origins[0];
+
   return {
-    source: anyText ? 'ocr' : 'none',
-    origin: anyText ? 'ocr' : 'none',
+    source,
+    origin,
     language: null,
     provider: providerId,
     model,
+    ...(ocrProviderId ? { ocrProvider: ocrProviderId } : {}),
+    ...(typesetProviderId ? { typesetProvider: typesetProviderId } : {}),
     file: null,
     ...(reason ? { reason } : {}),
   };
@@ -539,6 +583,9 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
   let providerId = null;
   let providerModel = null;
   let typesetUsed = false;
+  // 9z5.21：overview header 的 ocrProvider / typesetProvider 只列真正处理过返回页的角色。
+  let ocrProviderId = null;
+  let typesetProviderId = null;
 
   const setPage = (entry) => {
     if (!entry || !pageMap.has(entry.page)) return false;
@@ -547,11 +594,27 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
     return true;
   };
 
-  const markUsed = (result, provider, role) => {
+  const markUsed = (result, provider, role, appliedOrigins = [], applied = false) => {
     providerUsed = true;
     const id = result?.provider ?? provider.id ?? null;
     const model = result?.model ?? describeModel(provider);
-    if (role === 'typeset' || role === 'both') {
+    if (role === 'ocr') {
+      if (applied) ocrProviderId = id ?? ocrProviderId;
+    } else if (role === 'typeset') {
+      typesetUsed = true;
+      if (applied) typesetProviderId = id ?? typesetProviderId;
+      providerId = id ?? providerId;
+      providerModel = model ?? providerModel;
+      return;
+    } else {
+      // role: 'both'——同一 provider 担两个角色：按返回页的 textOrigin 判断
+      // 哪个角色真的处理了这些页，没处理过的角色不出现在 header 里。
+      if (applied && appliedOrigins.some((origin) => origin === 'textlayer')) {
+        typesetProviderId = id ?? typesetProviderId;
+      }
+      if (applied && appliedOrigins.some((origin) => origin !== 'textlayer')) {
+        ocrProviderId = id ?? ocrProviderId;
+      }
       typesetUsed = true;
       providerId = id ?? providerId;
       providerModel = model ?? providerModel;
@@ -567,15 +630,17 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
   /** 把 provider 结果写进 pageMap；只接受本次目标页。 */
   const applyResult = (result, provider, { role, targetPages, fallbackOrigin, forceOrigin = null }) => {
     const wanted = new Set(targetPages);
+    const appliedOrigins = [];
     let matched = 0;
     for (const raw of Array.isArray(result?.pages) ? result.pages : []) {
       const entry = normalizeProviderPage(raw, fallbackOrigin);
       if (!entry || !wanted.has(entry.page)) continue;
       if (forceOrigin) entry.textOrigin = entry.text.trim() ? forceOrigin : 'unknown';
       setPage(entry);
+      appliedOrigins.push(entry.textOrigin);
       matched += 1;
     }
-    markUsed(result, provider, role);
+    markUsed(result, provider, role, appliedOrigins, matched > 0);
     return matched;
   };
 
@@ -603,7 +668,7 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
     return {
       pages: pageMap,
       texts,
-      transcript: transcriptFor({ anyText, reason: noTextReason }),
+      transcript: transcriptFor({ pageMap, kind: 'text', reason: noTextReason }),
       warnings,
       providerError: null,
       providerErrors,
@@ -854,8 +919,11 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
     pages: pageMap,
     texts,
     transcript: transcriptFor({
-      anyText,
+      pageMap,
+      kind: info.kind,
       providerId: anyText ? providerId : null,
+      ocrProviderId: anyText ? ocrProviderId : null,
+      typesetProviderId: anyText ? typesetProviderId : null,
       model: anyText ? providerModel : null,
       reason: noTextReason,
     }),
@@ -1108,6 +1176,29 @@ async function renderSinglePage({ info, page, crop, maxEdge, ctx }) {
  * 后端
  * ------------------------------------------------------------------ */
 
+/**
+ * probe 的 transcriptSource 预判（契约 §4.3，9z5.21）。
+ *
+ * 只根据「本机有哪些能力 + 采样到的文字层」判断，不做全文抽取：
+ *   text   PDF 有文字层且没配 OCR（只会走原生文字层）/ .txt .md；
+ *   ocr    没有文字层、只有 OCR（图片 / 扫描件）；
+ *   mixed  PDF 既有文字层又配了 OCR：逐页路由可能两种来源并存，以每页标签为准；
+ *   none   没有任何可读文字的来源。
+ */
+function probeTranscriptSource(info, ocrAvailable) {
+  if (info.kind === 'text') return 'text';
+  if (info.hasTextLayer === true) return ocrAvailable ? 'mixed' : 'text';
+  return ocrAvailable ? 'ocr' : 'none';
+}
+
+/** probe 的 transcriptOrigin：source=mixed 时给主要渠道（textlayer 优先，逐页以 segments 为准）。 */
+function probeTranscriptOrigin(info, source) {
+  if (source === 'none') return 'none';
+  if (info.kind === 'text') return 'file';
+  if (info.kind === 'image') return 'ocr';
+  return info.hasTextLayer === true ? 'textlayer' : 'ocr';
+}
+
 function recommendedFor(info) {
   if (info.kind === 'text') {
     return {
@@ -1163,8 +1254,9 @@ export function createDocumentBackend(ctx = {}) {
     const info = await inspectDocument(input.path, c, pdfSupport, inspectCache);
     const ocrState = docRoleState(c, 'ocr');
     const typesetState = docRoleState(c, 'typeset');
-    const hasTextSource = info.hasTextLayer || info.kind === 'text' || ocrState.available;
-    const transcriptSource = hasTextSource ? 'ocr' : 'none';
+    // 9z5.21：不再把「有任何文字」一律记成 ocr；按本机能力与文字层预判。
+    const transcriptSource = probeTranscriptSource(info, ocrState.available);
+    const transcriptOrigin = probeTranscriptOrigin(info, transcriptSource);
 
     return {
       mediaType: 'document',
@@ -1206,7 +1298,7 @@ export function createDocumentBackend(ctx = {}) {
           reason: typesetState.reason,
         },
         transcriptSource,
-        transcriptOrigin: transcriptSource,
+        transcriptOrigin,
         transcriptPath: null,
         // 文字层探测的细节：采样了哪些页、命中的是哪一页、判不出来时的原因。
         // hasTextLayer 只是汇总结论；这里给出「结论是怎么来的」。
@@ -1239,17 +1331,18 @@ export function createDocumentBackend(ctx = {}) {
       ocrMode: input.ocrMode === 'force' ? 'force' : 'auto',
     });
 
-    // 9z5.28 只把逐页 textOrigin / blocks 放进后端结果（供 9z5.21 / 9z5.32 用）；
-    // 对外的 source / origin 枚举仍是旧值，9z5.21 再按 textOrigin 映射。
+    // 9z5.21：source / origin 按每页 textOrigin 映射（textlayer → text，ocr/unknown → ocr，
+    // 空页 → none）；textOrigin / blocks 保留给工具层做逐页展示。
     const segments = pages.map((page) => {
       const entry = collected.pages.get(page);
+      const { source, origin } = pageSourceOrigin(entry, info.kind);
       return {
         page,
         text: collected.texts.get(page) ?? '',
         startMs: null,
         endMs: null,
-        source: 'ocr',
-        origin: 'ocr',
+        source,
+        origin,
         textOrigin: entry?.textOrigin ?? 'unknown',
         blocks: entry?.blocks ?? [],
       };
@@ -1378,13 +1471,15 @@ export function createDocumentBackend(ctx = {}) {
     });
     const segments = pages.map((page) => {
       const entry = collected.pages.get(page);
+      const { source, origin } = pageSourceOrigin(entry, info.kind);
       return {
         page,
         text: collected.texts.get(page) ?? '',
         startMs: null,
         endMs: null,
-        source: 'ocr',
-        origin: 'ocr',
+        // 9z5.21：逐页来源（与 overview 同一套映射）。
+        source,
+        origin,
         textOrigin: entry?.textOrigin ?? 'unknown',
         blocks: entry?.blocks ?? [],
       };
@@ -1435,9 +1530,10 @@ export function createDocumentBackend(ctx = {}) {
       startSec: null,
       endSec: null,
       text: match.text,
-      source: 'ocr',
-      origin: 'ocr',
-      textOrigin: collected.pages.get(match.page)?.textOrigin ?? 'unknown',
+      // matchSegments 会展开 segment 的字段：逐页 source / origin / textOrigin 直接沿用。
+      source: match.source ?? 'none',
+      origin: match.origin ?? 'none',
+      textOrigin: match.textOrigin ?? 'unknown',
       page: match.page,
     }));
 

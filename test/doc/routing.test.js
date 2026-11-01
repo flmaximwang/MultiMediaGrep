@@ -142,12 +142,20 @@ test('逐页路由：有文字层 → typeset，无文字层 → OCR（两个 pr
     for (const page of [1, 2]) {
       assert.equal(byPage.get(page).text, `page ${page} text from typeset-stub`);
       assert.equal(byPage.get(page).textOrigin, 'textlayer');
+      assert.equal(byPage.get(page).source, 'text');
+      assert.equal(byPage.get(page).origin, 'textlayer');
     }
     for (const page of [3, 4]) {
       assert.equal(byPage.get(page).text, `page ${page} text from ocr-stub`);
       assert.equal(byPage.get(page).textOrigin, 'ocr');
+      assert.equal(byPage.get(page).source, 'ocr');
+      assert.equal(byPage.get(page).origin, 'ocr');
     }
     assert.equal(result.transcript.provider, 'typeset-stub');
+    // 9z5.21：逐页来源不一致 → mixed；两个角色都真的处理过返回页。
+    assert.equal(result.transcript.source, 'mixed');
+    assert.equal(result.transcript.typesetProvider, 'typeset-stub');
+    assert.equal(result.transcript.ocrProvider, 'ocr-stub');
   });
 });
 
@@ -176,6 +184,12 @@ test('同一 provider 担两个角色 → 只发一次 parse（role: both），�
     assert.equal(byPage.get(2).textOrigin, 'textlayer');
     assert.equal(byPage.get(3).textOrigin, 'ocr');
     assert.equal(byPage.get(4).textOrigin, 'ocr');
+    assert.equal(byPage.get(1).source, 'text');
+    assert.equal(byPage.get(3).source, 'ocr');
+    assert.equal(result.transcript.source, 'mixed');
+    // role: both 时按返回页的 textOrigin 判断角色：两种来源都出现了 → 两个角色都列出。
+    assert.equal(result.transcript.typesetProvider, 'both-stub');
+    assert.equal(result.transcript.ocrProvider, 'both-stub');
     assert.equal(result.warnings.some((warning) => /re-recognized/.test(warning)), false);
   });
 });
@@ -209,6 +223,8 @@ test('默认配置（OCR=none, TYPESET=builtin）：每页都有 blocks + textOr
     for (const page of [1, 2]) {
       const segment = result.segments.find((entry) => entry.page === page);
       assert.equal(segment.textOrigin, 'textlayer');
+      assert.equal(segment.source, 'text');
+      assert.equal(segment.origin, 'textlayer');
       assert.deepEqual(segment.blocks, [{ type: 'paragraph', text: `page ${page} text layer` }]);
       assert.equal(segment.text, `page ${page} text layer`);
     }
@@ -216,9 +232,16 @@ test('默认配置（OCR=none, TYPESET=builtin）：每页都有 blocks + textOr
     for (const page of [3, 4]) {
       const segment = result.segments.find((entry) => entry.page === page);
       assert.equal(segment.textOrigin, 'unknown');
+      assert.equal(segment.source, 'none');
+      assert.equal(segment.origin, 'none');
       assert.deepEqual(segment.blocks, []);
       assert.equal(segment.text, '');
     }
+    // 有文字的页是 text、空页是 none → 整份不一致，报 mixed。
+    assert.equal(result.transcript.source, 'mixed');
+    assert.equal(result.transcript.origin, 'textlayer');
+    assert.equal(result.transcript.typesetProvider, 'builtin');
+    assert.equal(result.transcript.ocrProvider, undefined);
   });
 });
 
@@ -241,5 +264,7 @@ test('图片文档一律走 OCR 角色', { skip: !(await (async () => {
   assert.equal(ocr.calls.length, 1);
   assert.equal(ocr.calls[0].role, 'ocr');
   assert.equal(result.segments[0].textOrigin, 'ocr');
+  assert.equal(result.segments[0].source, 'ocr');
+  assert.equal(result.segments[0].origin, 'ocr');
   assert.equal(result.segments[0].text, 'page 1 text from ocr-stub');
 });
