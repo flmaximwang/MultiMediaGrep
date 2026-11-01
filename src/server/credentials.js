@@ -1,7 +1,8 @@
-// src/server/credentials.js —— HTTP 请求级凭据：把请求头解析成「只属于本次请求」的配置。
+// src/server/credentials.js —— HTTP 请求级覆盖：把请求头解析成「只属于本次请求」的配置。
 //
 // 为什么需要这一层：HTTP 端点常常被多个调用方共用（同一台机器上的多个 agent、网关后面的
-// 多个用户），他们不该被迫共用服务器启动时的那一把 API key。请求头是唯一合适的载体：
+// 多个用户），他们不该被迫共用服务器启动时的那一把 API key，也不该被迫共用同一个内联上限。
+// 请求头是唯一合适的载体：
 //   - query string 会进访问日志 / 浏览器历史 / 代理日志，绝不能放 key；
 //   - 请求体是 MCP 协议报文，不能塞旁路配置；
 //   - 自定义头既不会落进 URL，也能被调用方逐请求替换。
@@ -16,9 +17,16 @@
 //   > 所选 provider 专属环境变量 > 服务器 baseConfig（仅当两边 provider 相同）
 //   > provider 内置默认值。
 // 注意：请求头切换 provider 时**只查新 provider 的变量组**，绝不会借用旧 provider 的 key。
+//
+// 非凭据设置走同一套「环境变量名 → 请求头名」映射（HEADER_CONFIG_*），但优先级只有
+// 请求头 > baseConfig（env / 默认值）：它们不是秘密，不参与凭据检测与日志脱敏。
 
 import { ToolError } from '../media/interface.js';
-import { PROVIDER_ENV } from './config.js';
+import {
+  DEFAULT_MAX_TEXT_INLINE_CHARS,
+  MAX_TEXT_INLINE_CHARS_HARD_CAP,
+  PROVIDER_ENV,
+} from './config.js';
 
 /** 环境变量名 → 请求头名：MMGREP_ELEVENLABS_API_KEY → x-mmgrep-elevenlabs-api-key */
 function headerName(envName) {
@@ -74,6 +82,19 @@ function collectHeaderNames() {
 
 export const CREDENTIAL_HEADERS = collectHeaderNames();
 
+/**
+ * 非凭据的请求级设置头。与凭据头用**同一套** env → 头名映射规则
+ * （MMGREP_FOO_BAR → x-mmgrep-foo-bar），这样新增设置时不用再发明命名。
+ *
+ * 键名是 config 里的字段名，值是请求头名。
+ */
+export const HEADER_CONFIG_HEADERS = Object.freeze({
+  maxTextInlineChars: headerName('MMGREP_MAX_TEXT_INLINE_CHARS'),
+});
+
+/** 全部认得非凭据设置头（固定顺序）。 */
+const HEADER_CONFIG_NAMES = Object.freeze(Object.values(HEADER_CONFIG_HEADERS));
+
 /** 归一化头对象：键转小写（容忍测试/代理传进来的非小写键），只保留字符串值。 */
 function normalizeHeaders(headers) {
   const out = Object.create(null);
@@ -108,6 +129,15 @@ function readEnv(env, name) {
 export function presentCredentialHeaders(headers) {
   const normalized = normalizeHeaders(headers);
   return CREDENTIAL_HEADERS.filter((name) => readHeader(normalized, name) !== undefined);
+}
+
+/**
+ * 本请求实际带了的非凭据设置头名（固定顺序）。
+ * 长度为 0 表示「没有请求级设置覆盖」——即使别的头在场，也可以复用共享 runtime。
+ */
+export function presentConfigHeaders(headers) {
+  const normalized = normalizeHeaders(headers);
+  return HEADER_CONFIG_NAMES.filter((name) => readHeader(normalized, name) !== undefined);
 }
 
 /**
@@ -237,6 +267,39 @@ function resolveSection(kind, baseSection, headers, env) {
 }
 
 /**
+ * 解析请求级内联文本上限。优先级：请求头 > baseConfig（env / 默认 24000）。
+ *
+ * 与 provider 头不同，这个头**不合法也不报错**：配置类设置配错只记 warning 并回落到
+ * 服务器侧的值，不能让一个可选调优毁掉整次请求。
+ *   - 非正整数（含 0 / 负数 / 小数 / 带单位）→ warn，回落 baseConfig；
+ *   - 超过硬上限 200000 → warn，按上限截断；
+ *   - 空头已在 readHeader 里当成「没带」。
+ *
+ * warning 里刻意**不回显头值**：http.js 的约定是日志只出现头名，不出现头的值。
+ */
+function resolveMaxTextInlineChars(baseSection, headers, logger) {
+  const name = HEADER_CONFIG_HEADERS.maxTextInlineChars;
+  const base = baseSection ?? {};
+  const fallback = Number.isFinite(base.maxInlineChars) && base.maxInlineChars > 0
+    ? base.maxInlineChars
+    : DEFAULT_MAX_TEXT_INLINE_CHARS;
+
+  const raw = readHeader(headers, name);
+  if (raw === undefined) return { value: fallback, used: null };
+
+  const parsed = /^[0-9]+$/.test(raw) ? Number(raw) : NaN;
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    logger?.warn?.(`${name} is invalid; using the configured value ${fallback}.`);
+    return { value: fallback, used: null };
+  }
+  if (parsed > MAX_TEXT_INLINE_CHARS_HARD_CAP) {
+    logger?.warn?.(`${name} exceeds the hard cap ${MAX_TEXT_INLINE_CHARS_HARD_CAP}; clamping to the cap.`);
+    return { value: MAX_TEXT_INLINE_CHARS_HARD_CAP, used: name };
+  }
+  return { value: parsed, used: name };
+}
+
+/**
  * 按请求头计算本次请求的配置。
  *
  * 返回**新的冻结对象**：形状与 loadConfig() 一致，另外多一个 `requestOverrides`
@@ -245,25 +308,31 @@ function resolveSection(kind, baseSection, headers, env) {
  * @param {object} baseConfig loadConfig() 的结果
  * @param {object} headers Node 的 req.headers（键已小写；这里也会再归一化一次）
  * @param {object} [env] 服务器环境变量（默认 process.env）
+ * @param {object} [options]
+ * @param {object} [options.logger] 配置类头的 warning 走这里（只含头名，不含值）
  * @returns {Readonly<object>}
  * @throws {ToolError} provider 头不是已知 id 时，code = INVALID_ARGUMENT
  */
-export function resolveConfigForRequest(baseConfig, headers = {}, env = process.env) {
+export function resolveConfigForRequest(baseConfig, headers = {}, env = process.env, options = {}) {
+  const logger = options.logger ?? null;
   const normalized = normalizeHeaders(headers);
   const overridesHeaderNames = presentCredentialHeaders(normalized);
 
   const asr = resolveSection('asr', baseConfig?.asr, normalized, env);
   const doc = resolveSection('doc', baseConfig?.doc, normalized, env);
+  const maxInlineChars = resolveMaxTextInlineChars(baseConfig?.text, normalized, logger);
 
   const config = {
     ...baseConfig,
     asr: Object.freeze({ ...(baseConfig?.asr ?? {}), ...asr.section }),
     doc: Object.freeze({ ...(baseConfig?.doc ?? {}), ...doc.section }),
+    text: Object.freeze({ ...(baseConfig?.text ?? {}), maxInlineChars: maxInlineChars.value }),
     requestOverrides: Object.freeze({
       // 只有名字：任何值都不许出现在这里（它可能被 handler / 调试端点序列化）。
       present: Object.freeze(overridesHeaderNames),
       asr: Object.freeze(asr.used),
       doc: Object.freeze(doc.used),
+      text: Object.freeze({ maxInlineChars: maxInlineChars.used }),
     }),
   };
   return Object.freeze(config);

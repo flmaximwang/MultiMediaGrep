@@ -1442,7 +1442,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 |---|---|---|---|---|
 | `MMGREP_MAX_IMAGE_TOKENS` | integer | `4000` | 单次调用的图片 token 软预算（§10.3） | 用默认值。自动模式保证不超；显式模式超出只警告 |
 | `MMGREP_MAX_IMAGE_EDGE` | integer | `1600` | 单张图最长边的全局上限（§10.2） | 用默认值。请求超过它 → `BUDGET_EXCEEDED` |
-| `MMGREP_MAX_TEXT_INLINE_CHARS` | integer | `24000` | 内联文本清单的字符上限。超出在段落/格边界截断，并给续读提示 | 用默认值。**全文永远落盘，不受此限制** |
+| `MMGREP_MAX_TEXT_INLINE_CHARS` | integer | `24000` | 内联文本清单的字符上限。超出在段落/格边界截断，并给续读提示。HTTP 模式下可被请求头 `x-mmgrep-max-text-inline-chars` 按客户端覆盖（硬上限 `200000`） | 用默认值。**全文永远落盘，不受此限制** |
 | `MMGREP_MAX_CONCURRENCY` | integer | `2` | 单次调用内并行跑的 ffmpeg / 渲染任务数 | 用默认值。机器弱时调成 `1` |
 | `MMGREP_AUDIO_MIN_DBFS` | number | `-35` | 音频体检：判定「有有效声音」的平均音量下限（dBFS）。低于它 → `too-quiet`，**不跑 ASR** | 用默认值。录音确实偏小声时调低（如 `-45`） |
 | `MMGREP_AUDIO_MIN_SPEECH_RATIO` | number | `0.05` | 音频体检：判定「有有效声音」的非静音时长占比下限（0–1） | 用默认值。与 `MMGREP_AUDIO_MIN_DBFS` 是 **或** 的关系，任一不满足即判 `too-quiet` |
@@ -1451,6 +1451,13 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | `MMGREP_FFMPEG_PATH` | string | 空（按 PATH 查找） | ffmpeg 可执行文件路径 | 找不到 → `TOOL_NOT_FOUND: ffmpeg was not found on PATH. Install ffmpeg, or set MMGREP_FFMPEG_PATH.` |
 | `MMGREP_FFPROBE_PATH` | string | 空（按 PATH 查找） | ffprobe 可执行文件路径 | 同上，文案换成 `ffprobe` |
 | `MMGREP_LOG_LEVEL` | string | `info` | 日志级别：`error` / `warn` / `info` / `debug` | 用默认值。`debug` 会额外打印每阶段耗时（只进 stderr，不污染 MCP 输出） |
+
+> **HTTP 每请求覆盖（目前只有 `MMGREP_MAX_TEXT_INLINE_CHARS`）**：请求头
+> `x-mmgrep-max-text-inline-chars` 的优先级是 **请求头 > `MMGREP_MAX_TEXT_INLINE_CHARS` > 默认 `24000`**。
+> 头值必须是正整数：超过硬上限 `200000` 时按 `200000` 截断并记 warning；非法值（`0`、负数、
+> 小数、带单位、非数字）记 warning 并回落到环境变量 / 默认值，**不会让请求失败**；空头等于没带。
+> stdio 传输没有请求头，仍然只读环境变量；也**没有**按调用的工具参数——agent 不能自己调大。
+> 头值不进日志（日志只出现头名），也不进 `requestOverrides`（那里只记录头名）。
 
 > **MCP 的 stdout 是协议通道**：日志一律走 stderr，`LOG_LEVEL` 控制不了这一点。
 
