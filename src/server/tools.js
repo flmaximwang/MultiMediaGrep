@@ -1,0 +1,1786 @@
+// src/server/tools.js —— 5 个 MCP 工具的定义与 handler
+//
+// 分工（重要）：
+//   - 本文件负责**参数校验 + 分派 + 结果信封**（content blocks / structuredContent / 文本清单）。
+//   - 真正的媒体处理（取帧、转写、栅格化）由 src/backend/<type>/ 负责，见 backends.js。
+//   - 工具描述逐字来自 docs/mcp-contract.md §4.1 / §5.1 / §6.1 / §7.1 / §8.1，不要改写。
+//
+// 校验一律复用 src/media/interface.js：validatePath / parsePages / validateTimeRange / validateCrop。
+
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { stat } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
+import { z } from 'zod';
+
+import { formatTimestamp } from '../export/format.js';
+import { exportAnalysis } from '../export/index.js';
+import { detectMediaType, isSubtitlePath } from '../media/detect.js';
+import {
+  METHOD_MATRIX,
+  ToolError,
+  createDispatcher,
+  parsePages,
+  validateCrop,
+  validatePath,
+  validateTimeRange,
+} from '../media/interface.js';
+import { guardToolHandler } from './errors.js';
+import {
+  DEFAULT_MAX_IMAGE_TOKENS,
+  DEFAULT_MAX_TEXT_INLINE_CHARS,
+} from './config.js';
+import {
+  IMAGE_LIMITS,
+  budgetReport,
+  describeImages,
+  planImageBudget,
+  validateImageShape,
+  validateProducedImages,
+} from './images.js';
+
+/* ------------------------------------------------------------------ *
+ * 工具描述（契约 §4.1–§8.1，逐字复制）
+ * ------------------------------------------------------------------ */
+
+export const PROBE_DESCRIPTION = `Inspect a local media file — video, audio recording, or document — and report what it is:
+duration, resolution, page count, codec, available tracks (audio / subtitle / text layer), and
+whether transcription (ASR) and OCR are available for this file.
+(读取本地媒体的元信息：时长、分辨率、页数、编码、可用轨道（音轨 / 字幕轨 / 文本层），
+以及能否做 ASR / OCR 的初判。)
+
+Call this FIRST on any file you have not inspected yet. It costs no image tokens and decodes
+nothing. Then pick the right next tool:
+- video / audio  -> media_overview to read it
+- document       -> media_overview to see page thumbnails and per-page text
+- a specific moment or page -> media_zoom for a close-up
+- "where was X said / on which page" -> media_locate for a timestamp or a page number
+
+For audio it also reports a quick health check — average level, speech ratio and silence ratio
+— so you know whether the recording actually contains audible speech before you spend an ASR
+call on it. A recording that is effectively silent is reported as such and is never sent to ASR
+(no hallucinated transcript).
+
+This server never downloads anything and never calls an LLM: you always pass a local absolute
+path, and it only prepares images and text for your own model to look at.`;
+
+export const OVERVIEW_DESCRIPTION = `Build an overview of a local media file so you can read it without guessing.
+(生成媒体总览：视频出分镜宫格图与按时间对齐的文本清单；录音出带时间轴的转写；文档出页面缩略图与每页文字。)
+
+What you get depends on the media:
+- video    : one or more numbered storyboard grids (each cell carries its cell number) plus a
+             time-aligned text index of every cell
+- audio    : a timestamped transcript, segment by segment
+- document : a grid of page thumbnails plus the text of each page, when a document parser is
+             configured
+
+TEXT SOURCE ORDER — subtitles first, ASR only as a fallback:
+1. a transcriptFile you pass in (external subtitle file),
+2. the subtitle track embedded in the container,
+3. a subtitle file with the same base name in the same directory (a.srt next to a.mp4),
+4. ASR — only when none of the above exists and an ASR provider is configured.
+Every segment is tagged with its source. subtitle = the author's own words, safe to quote.
+asr = machine transcription: names, numbers and jargon are often wrong, so do NOT quote an ASR
+segment verbatim and do not present it as the speaker's exact words. visual = there is no text
+at all, only the picture.
+
+The storyboard grid is for FINDING things, not for reading them: cells are small, so text
+inside a cell is usually unreadable. To read text on screen, call media_zoom on that moment
+and read the cropped single frame.
+
+The full text is NOT inlined. It is written to disk and the returned paths point at it:
+content.md (readable), segments.jsonl (one segment per line, machine-readable), manifest.json
+(what was produced and how). Read those files section by section and summarise them in
+chunks yourself — do not ask for the same range again just to get more inline text.
+
+Always call media_probe first: it tells you how long the file is, whether a subtitle source
+exists, and which transcript source applies, for free. Long media must be narrowed with
+start/end (video, audio) or pages (document) — one giant grid of a two-hour film gives you
+illegible cells and spoils the ending. Follow the continuation hint in the result to page
+through the rest.`;
+
+export const ZOOM_DESCRIPTION = `Get a close-up of one moment in a local video, or one page of a local document, returned as a
+single image. (取本地视频某一时刻的特写单帧，或本地文档某一页的整页 / 局部放大图。)
+
+Use it after media_overview when one cell or page needs a closer look: "what exactly is on
+screen at 01:12?" "what does line 3 of page 7 say?"
+
+For video, pass at (a single timestamp) or start/end (a window — the sharpest frame inside it
+is returned, and the exact timestamp is reported back). For a document, pass page, optionally
+with crop. crop is {x, y, width, height}, each a fraction 0..1 of the frame or page, origin
+top-left.
+
+Keep it to one frame. It costs roughly 1,900 vision tokens — far more than a whole overview
+cell. Zoom the parts that matter instead of re-scanning the file.
+
+This is the ONLY tool whose image is meant for reading. A storyboard cell is a few hundred
+pixels wide and the text inside it is unreadable; a cropped single frame at up to 1600 px is
+readable. So: locate in the overview grid, then zoom to read. The returned image is always
+source "visual" — what you read off it is your own reading of pixels, not a transcript, so
+treat it as an observation rather than a quotation.`;
+
+export const LOCATE_DESCRIPTION = `Find where something appears in a local media file and return its position: a timestamp
+(milliseconds and seconds) for a video or recording, a page number for a document.
+(定位：给一段文本或关键词，返回它在视频 / 录音里的时间戳，在文档里的页码。)
+
+Use it when you know roughly what was said but not when ("where does it mention X"), or when
+you need to know which page a phrase is on. Matching ignores punctuation, spacing and case,
+and works for both Chinese and English. Long phrases match better than single characters.
+
+Text only by default — no image, no pixels spent. Add includeFrame: true to also get the
+picture at the best match (one image, roughly 1,900 vision tokens).
+
+A transcript is required: the embedded subtitle track, a transcriptFile you pass in, or ASR
+configured via MMGREP_ASR_PROVIDER. Subtitles win over ASR. If none is available this tool
+says so instead of guessing. Use media_overview if you only need the visuals.
+
+Each match is tagged with its source. A match whose source is "asr" came from machine
+transcription, so the wording may be wrong (names, numbers, jargon) — do not present it as the
+speaker's exact words.`;
+
+export const SUBTITLES_DESCRIPTION = `Read subtitles for a local media file and return them as timestamped segments.
+(读取本地字幕文件或视频内嵌字幕轨，解析成带时间轴的段落列表。)
+
+Two sources, in this order: an explicit transcriptFile (a local .srt, .vtt, .ass or .ssa file),
+or the subtitle track embedded in the container. Auto-discovery also picks up a sibling file
+with the same base name in the same directory (a.srt next to a.mp4) when neither of the above
+is available — the source and the exact path are always reported back, never silently.
+
+No image and no pixels spent: the result is text with millisecond and second timestamps.
+Use media_locate to search inside the subtitles. Use media_overview if you also want to see
+what is on screen.`;
+
+/* ------------------------------------------------------------------ *
+ * 参数 schema
+ *
+ * 约定：数值参数用 z.number()（不用 z.number().int()），这样越界 / 非整数时
+ * 由我们自己的校验器给出契约 §2.2 / §10.2 的原文案，而不是 zod 的通用报错。
+ * 每个字段的 describe 都标注适用媒体类型。
+ * ------------------------------------------------------------------ */
+
+const PATH_PARAM = z.string().describe(
+  'Absolute path to a LOCAL file: video, audio recording, or document. URLs and relative paths are rejected — this server never downloads anything. (本地文件绝对路径)',
+);
+
+const TRANSCRIPT_FILE_PARAM = z.string().optional().describe(
+  'Absolute path to a local subtitle/transcript file (.srt, .vtt, .ass, .ssa). Applicable to video and audio only. (本地字幕/转写文件)',
+);
+
+const TRANSCRIPT_PARAM = z.enum(['auto', 'off']).optional().describe(
+  '"auto" (default): use subtitles first, ASR only as a fallback. "off": no transcription at all, visuals only. Applicable to video and audio only.',
+);
+
+const START_PARAM = z.number().optional().describe(
+  'Window start in seconds (closed interval, both ends included). Applicable to video and audio only; document media uses "pages" instead. Default 0. (起点，秒)',
+);
+
+const END_PARAM = z.number().optional().describe(
+  'Window end in seconds (closed interval, both ends included). Applicable to video and audio only. Defaults to the end of the media; a value past the end is clipped and reported. (终点，秒)',
+);
+
+const SEGMENT_PARAM = z.number().optional().describe(
+  'Window length in seconds (30-3600, default 300), used when only "start" is given. Applicable to video and audio only.',
+);
+
+const PAGES_PARAM = z.string().optional().describe(
+  'Page range for document media: comma-separated 1-based page numbers and closed ranges, e.g. "3-10,15". Not applicable to video or audio. (页码范围)',
+);
+
+const CELLS_PARAM = z.number().optional().describe(
+  'Cells per puzzle image: storyboard shots for video, page thumbnails for document. 1-16; default 9 for video and 6 for document. Applicable to video and document only. (每张拼图的格数)',
+);
+
+const IMAGES_PARAM = z.number().optional().describe(
+  'How many puzzle images to return: 1-4, default 2. Applicable to video and document only. (返回几张拼图)',
+);
+
+const MAX_EDGE_PARAM = z.number().optional().describe(
+  'Longest edge of each image in pixels: 256-1600. Default 1280 for overview, 1600 for zoom. Applicable to video and document only. (单张图最长边)',
+);
+
+const ENVELOPE_PARAM = z.boolean().optional().describe(
+  'Attach an audio envelope waveform image (default false). Applicable to audio recordings only. (音频包络图)',
+);
+
+const AT_PARAM = z.number().optional().describe(
+  'Exact timestamp in seconds for a video frame. Mutually exclusive with start/end. Applicable to video only. (精确时刻，秒)',
+);
+
+const PAGE_PARAM = z.number().optional().describe(
+  '1-based page number to render. Required for document media; not applicable to video. (页码)',
+);
+
+const CROP_PARAM = z.object({
+  x: z.number().optional(),
+  y: z.number().optional(),
+  width: z.number().optional(),
+  height: z.number().optional(),
+}).optional().describe(
+  'Crop rectangle {x, y, width, height}: all four required, each a fraction 0..1 of the frame or page, origin top-left. Applicable to video and document only. (裁切区域，比例制)',
+);
+
+const QUERY_PARAM = z.string().describe(
+  'Text or keyword to find. Matching ignores punctuation, spacing and case; Chinese and English both work. (要找的文本 / 关键词)',
+);
+
+const MAX_MATCHES_PARAM = z.number().optional().describe(
+  'Maximum number of matches to return: 1-20, default 5. (最多返回几条匹配)',
+);
+
+const INCLUDE_FRAME_PARAM = z.boolean().optional().describe(
+  'Also return one picture at the best match (default false). Applicable to video and document only. (是否附带最佳匹配处的画面)',
+);
+
+/** 每个工具的 zod raw shape（`.strict()`：未知参数直接拒绝，不静默吞掉） */
+export const TOOL_SHAPES = Object.freeze({
+  media_probe: {
+    path: PATH_PARAM,
+    transcriptFile: TRANSCRIPT_FILE_PARAM,
+    transcript: TRANSCRIPT_PARAM,
+  },
+  media_overview: {
+    path: PATH_PARAM,
+    transcriptFile: TRANSCRIPT_FILE_PARAM,
+    transcript: TRANSCRIPT_PARAM,
+    start: START_PARAM,
+    end: END_PARAM,
+    segment: SEGMENT_PARAM,
+    pages: PAGES_PARAM,
+    cells: CELLS_PARAM,
+    images: IMAGES_PARAM,
+    maxEdge: MAX_EDGE_PARAM,
+    envelope: ENVELOPE_PARAM,
+  },
+  media_zoom: {
+    path: PATH_PARAM,
+    at: AT_PARAM,
+    start: START_PARAM,
+    end: END_PARAM,
+    page: PAGE_PARAM,
+    crop: CROP_PARAM,
+    maxEdge: MAX_EDGE_PARAM,
+  },
+  media_locate: {
+    path: PATH_PARAM,
+    query: QUERY_PARAM,
+    max: MAX_MATCHES_PARAM,
+    transcriptFile: TRANSCRIPT_FILE_PARAM,
+    transcript: TRANSCRIPT_PARAM,
+    start: START_PARAM,
+    end: END_PARAM,
+    segment: SEGMENT_PARAM,
+    pages: PAGES_PARAM,
+    includeFrame: INCLUDE_FRAME_PARAM,
+  },
+  video_subtitles: {
+    path: PATH_PARAM,
+    transcriptFile: TRANSCRIPT_FILE_PARAM,
+    start: START_PARAM,
+    end: END_PARAM,
+    pages: PAGES_PARAM,
+  },
+});
+
+/* ------------------------------------------------------------------ *
+ * 参数 × 媒体适用性（契约 §2.2）
+ * ------------------------------------------------------------------ */
+
+const ALL_MEDIA = Object.freeze(['video', 'audio', 'document']);
+
+/**
+ * 每个参数适用的媒体类型与不适用时的原文案（契约 §2.2 的「节选」表格）。
+ * `message(mediaType)` 返回契约里的错误文案。
+ */
+export const PARAM_APPLICABILITY = Object.freeze({
+  path: { media: ALL_MEDIA },
+  query: { media: ALL_MEDIA },
+  max: { media: ALL_MEDIA },
+  transcriptFile: {
+    media: ['video', 'audio'],
+    message: (t) => (t === 'document'
+      ? 'transcriptFile is not applicable to document media. Documents have a page text layer, not a transcript.'
+      : `transcriptFile is not applicable to ${t} media.`),
+  },
+  transcript: {
+    media: ['video', 'audio'],
+    message: (t) => `transcript is not applicable to ${t} media.`,
+  },
+  start: {
+    media: ['video', 'audio'],
+    message: (t) => (t === 'document'
+      ? 'start is not applicable to document media. Use "pages" instead (e.g. pages: "3-10,15").'
+      : `start is not applicable to ${t} media.`),
+  },
+  end: {
+    media: ['video', 'audio'],
+    message: (t) => (t === 'document'
+      ? 'end is not applicable to document media. Use "pages" instead (e.g. pages: "3-10,15").'
+      : `end is not applicable to ${t} media.`),
+  },
+  segment: {
+    media: ['video', 'audio'],
+    message: (t) => `segment is not applicable to ${t} media.`,
+  },
+  pages: {
+    media: ['document'],
+    message: (t) => (t === 'document'
+      ? 'pages is not applicable to document media.'
+      : `pages is not applicable to ${t} media. Use "start" and "end" (seconds) instead.`),
+  },
+  includeFrame: {
+    media: ['video', 'document'],
+    message: (t) => `includeFrame is not applicable to ${t} media. There are no frames to show.`,
+  },
+  at: {
+    media: ['video'],
+    message: (t) => (t === 'audio'
+      ? 'at is not applicable to audio media. media_zoom returns one frame for video and one page image for document; for audio use media_locate to find timestamps.'
+      : `at is not applicable to ${t} media. media_zoom uses "at" (or "start"/"end") for video.`),
+  },
+  crop: {
+    media: ['video', 'document'],
+    message: (t) => `crop is not applicable to ${t} media.`,
+  },
+  page: {
+    media: ['document'],
+    message: (t) => (t === 'video'
+      ? 'page is not applicable to video media. media_zoom uses "at" (or "start"/"end") for video.'
+      : `page is not applicable to ${t} media.`),
+  },
+  cells: {
+    media: ['video', 'document'],
+    message: (t) => (t === 'audio'
+      ? 'cells is not applicable to audio media. A recording has no frames; media_overview returns a timestamped transcript instead.'
+      : `cells is not applicable to ${t} media.`),
+  },
+  images: {
+    media: ['video', 'document'],
+    message: (t) => `images is not applicable to ${t} media.`,
+  },
+  maxEdge: {
+    media: ['video', 'document'],
+    message: (t) => `maxEdge is not applicable to ${t} media.`,
+  },
+  envelope: {
+    media: ['audio'],
+    message: (t) => `envelope is not applicable to ${t} media. It only applies to audio recordings.`,
+  },
+});
+
+/**
+ * 契约 §2.2 的硬规则：**不适用的参数必须报错，不能静默忽略。**
+ * 只检查调用方真的传了的参数（默认值不触发）。
+ */
+export function checkApplicability(args, mediaType) {
+  for (const [param, rule] of Object.entries(PARAM_APPLICABILITY)) {
+    if (args?.[param] === undefined) continue;
+    if (rule.media.includes(mediaType)) continue;
+    throw new ToolError('INVALID_ARGUMENT', rule.message(mediaType));
+  }
+}
+
+/** 方法级适用性（契约 §2.2 + interface.js 的 METHOD_MATRIX） */
+export function checkMethod(mediaType, method) {
+  if ((METHOD_MATRIX[mediaType] ?? []).includes(method)) return;
+  throw new ToolError(
+    'INVALID_ARGUMENT',
+    `${method} is not applicable to ${mediaType} media. Supported methods for ${mediaType}: ${(METHOD_MATRIX[mediaType] ?? []).join(', ')}.`,
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * 通用小工具
+ * ------------------------------------------------------------------ */
+
+const MEDIA_TYPES = new Set(['video', 'audio', 'document']);
+
+function numberOrNull(value) {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function integerOrNull(value) {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.round(n) : null;
+}
+
+function fixed2(value) {
+  return value === null || value === undefined ? null : Number(value).toFixed(2);
+}
+
+function rangeLabel(startMs, endMs) {
+  return `${formatTimestamp(startMs)}-${formatTimestamp(endMs)}`;
+}
+
+/** 媒体类型判定 + 文件元信息。detect 失败 → 契约的 UNSUPPORTED_MEDIA_TYPE。 */
+async function resolveMedia(args) {
+  const resolved = await validatePath(args.path);
+  let detected;
+  try {
+    detected = await detectMediaType(resolved);
+  } catch (error) {
+    throw new ToolError(
+      'UNSUPPORTED_MEDIA_TYPE',
+      `cannot determine the media type of "${resolved}". Supported media: video (mp4, mov, mkv, webm, ...), `
+        + 'audio (mp3, wav, m4a, ...), document (pdf, docx, pptx, xlsx, txt, md, images).',
+      'Check the file extension; PDF and image files are documents. If the file is a valid media file, report it — '
+        + `the detector said: ${error?.message ?? error}`,
+    );
+  }
+  const info = await stat(resolved);
+  return {
+    path: resolved,
+    mediaType: detected.mediaType,
+    detection: detected,
+    sizeBytes: info.size,
+    modifiedMs: Math.round(info.mtimeMs),
+  };
+}
+
+/** 契约 §2.1：扩展名只是候选，容器嗅探（probe）可以纠正媒体类型 */
+function refineMediaType(probed, fallback) {
+  const candidate = probed?.mediaType;
+  return typeof candidate === 'string' && MEDIA_TYPES.has(candidate) ? candidate : fallback;
+}
+
+/** 传给后端的公共输入片段 */
+function baseInput(base) {
+  return {
+    path: base.path,
+    mediaType: base.mediaType,
+    sizeBytes: base.sizeBytes,
+    modifiedMs: base.modifiedMs,
+    detectedBy: base.detection?.detectedBy ?? null,
+  };
+}
+
+/** 内部 probe：overview / zoom / locate / subtitles 需要 durationSec / pageCount 做范围校验 */
+async function internalProbe(base, extraInput, call) {
+  const input = { ...baseInput(base), transcriptFile: null, transcript: 'auto', ...extraInput };
+  const result = await call.dispatcher.call(base.mediaType, 'probe', input, call.backendCtx);
+  return result ?? {};
+}
+
+/**
+ * transcriptFile 的校验（契约 §8.6）。
+ * probe 除外（§4.5：probe 只报告、不报错），所以 probe 不走这里。
+ */
+async function resolveTranscriptFile(value, { logger = null } = {}) {
+  if (value === undefined || value === null) return null;
+  const raw = String(value);
+  if (!isSubtitlePath(raw)) {
+    throw new ToolError(
+      'INVALID_ARGUMENT',
+      `transcriptFile must be one of .srt, .vtt, .ass, .ssa (got "${path.extname(raw) || raw}").`,
+      'Pass a local subtitle file path, e.g. "/abs/a.zh.srt".',
+    );
+  }
+  try {
+    return await validatePath(raw);
+  } catch (error) {
+    if (error instanceof ToolError && error.code === 'PATH_NOT_FOUND') {
+      throw new ToolError('PATH_NOT_FOUND', `transcriptFile does not exist: "${raw}".`);
+    }
+    throw error;
+  }
+}
+
+/** 时间窗参数 → 闭区间 [startMs, endMs]（契约 §2.3） */
+function computeTimeWindow(args, durationSec) {
+  if (args.segment !== undefined) {
+    const segment = Number(args.segment);
+    if (!Number.isInteger(segment) || segment < 30 || segment > 3600) {
+      throw new ToolError('INVALID_ARGUMENT', 'segment must be an integer between 30 and 3600 (seconds).');
+    }
+  }
+  const segmentSec = args.segment !== undefined ? Number(args.segment) : 300;
+  const startSec = args.start !== undefined ? Number(args.start) : 0;
+  let endSec;
+  if (args.end !== undefined) endSec = Number(args.end);
+  else if (args.start !== undefined) endSec = startSec + segmentSec;
+  else endSec = durationSec; // 整段媒体
+
+  const validated = validateTimeRange({ startSec, endSec, durationSec });
+  const startMs = validated.startMs ?? 0;
+  const endMs = validated.endMs;
+  return {
+    startMs,
+    endMs,
+    startSec: startMs / 1000,
+    endSec: endMs === null ? null : endMs / 1000,
+    clipped: validated.clipped,
+  };
+}
+
+/** document 的 pages 参数 → 页码数组（省略 = 全文） */
+function computePages(args, pageCount) {
+  if (args.pages !== undefined) return parsePages(args.pages, { pageCount });
+  if (pageCount !== null && pageCount !== undefined) {
+    return Array.from({ length: pageCount }, (_, i) => i + 1);
+  }
+  return null;
+}
+
+/** 图片形状规划：按媒体类型给默认值，走 images.js 的硬上限 + 软预算 */
+function planOverviewImages(args, mediaType, config) {
+  const limitTokens = config?.images?.maxTokens ?? DEFAULT_MAX_IMAGE_TOKENS;
+  const limitEdge = config?.images?.maxEdge ?? IMAGE_LIMITS.maxMaxEdge;
+
+  if (mediaType === 'audio') {
+    if (!args.envelope) return null;
+    return planImageBudget({ cells: 1, images: 1, maxEdge: 1280, explicit: false, limitTokens, limitEdge });
+  }
+  const cells = args.cells !== undefined ? Number(args.cells) : (mediaType === 'document' ? 6 : 9);
+  const images = args.images !== undefined ? Number(args.images) : 2;
+  const maxEdge = args.maxEdge !== undefined ? Number(args.maxEdge) : 1280;
+  const explicit = args.cells !== undefined || args.images !== undefined || args.maxEdge !== undefined;
+  return planImageBudget({ cells, images, maxEdge, explicit, limitTokens, limitEdge });
+}
+
+function zeroBudget(config) {
+  return {
+    requestedImages: 0,
+    producedImages: 0,
+    requestedCells: 0,
+    producedCells: 0,
+    estimatedTokens: 0,
+    limit: config?.images?.maxTokens ?? DEFAULT_MAX_IMAGE_TOKENS,
+    warning: null,
+  };
+}
+
+/** 组装后端返回的 images 为 MCP content + 结构化描述，并核对实际产物 */
+function collectImages(rawImages, plan, config) {
+  const list = Array.isArray(rawImages) ? rawImages : [];
+  const limitEdge = config?.images?.maxEdge ?? IMAGE_LIMITS.maxMaxEdge;
+  validateProducedImages(list, { limitEdge });
+  return describeImages(list, { source: 'visual' });
+}
+
+/** 段落的通用归一化（合同 §5.3 / §9.2 的字段口径；source/origin 缺省为 none） */
+function normalizeSegmentsSafe(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  return list.map((segment, i) => {
+    const startMs = integerOrNull(segment?.startMs);
+    const endMs = integerOrNull(segment?.endMs);
+    return {
+      index: Number.isInteger(segment?.index) ? segment.index : i + 1,
+      startMs,
+      endMs,
+      startSec: startMs === null ? null : startMs / 1000,
+      endSec: endMs === null ? null : endMs / 1000,
+      text: String(segment?.text ?? ''),
+      source: segment?.source ?? 'none',
+      origin: segment?.origin ?? 'none',
+      page: integerOrNull(segment?.page),
+      speaker: segment?.speaker ? String(segment.speaker) : null,
+    };
+  });
+}
+
+/** 从 transcript 对象 / 段落推断整份转写的来源（契约 §2.5） */
+function resolveTranscriptInfo(result, segments) {
+  const given = result?.transcript && typeof result.transcript === 'object' ? result.transcript : {};
+  const first = segments.find((s) => s.source && s.source !== 'none') ?? segments[0] ?? null;
+  return {
+    source: given.source ?? first?.source ?? 'none',
+    origin: given.origin ?? first?.origin ?? 'none',
+    language: given.language ?? null,
+    segmentCount: segments.length,
+    provider: given.provider ?? null,
+    model: given.model ?? null,
+    file: given.file ?? null,
+    reason: given.reason ?? null,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * 文本格式化（契约 §4.4 / §5.4 / §6.4 / §7.4 / §8.4）
+ * ------------------------------------------------------------------ */
+
+function wrapText(text) {
+  const value = String(text ?? '');
+  return value ? `「${value}」` : '';
+}
+
+/** ASR 是机器转写：不加引号，避免看起来像原话（契约 §2.5 的硬约束） */
+function quoteBySource(text, source) {
+  const value = String(text ?? '');
+  if (!value) return '';
+  return source === 'asr' ? value : `「${value}」`;
+}
+
+function padLabel(label, width = 9) {
+  return label.padEnd(width);
+}
+
+/**
+ * 内联清单的长度上限（MMGREP_MAX_TEXT_INLINE_CHARS）：在段落/格边界截断。
+ * 全文始终落盘，不受这个上限影响（契约 §12.5）。
+ */
+function truncateLines(headerLines, bodyLines, maxChars) {
+  const limit = Number.isFinite(maxChars) && maxChars > 0 ? maxChars : DEFAULT_MAX_TEXT_INLINE_CHARS;
+  const kept = [];
+  let length = 0;
+  for (const line of [...headerLines, ...bodyLines]) {
+    const addition = kept.length === 0 ? line.length : line.length + 1;
+    if (length + addition > limit) break;
+    kept.push(line);
+    length += addition;
+  }
+  const dropped = headerLines.length + bodyLines.length - kept.length;
+  return {
+    text: kept.join('\n'),
+    truncated: dropped > 0,
+    keptCount: Math.max(0, kept.length - headerLines.length),
+    dropped,
+  };
+}
+
+function formatOverviewSegmentLine(segment, mediaType) {
+  if (mediaType === 'document') {
+    return `${padLabel(`[page ${segment.page ?? segment.index}`)}] (${segment.source})  ${quoteBySource(segment.text, segment.source)}`.trimEnd();
+  }
+  const label = mediaType === 'video' ? `[cell ${segment.index}` : `[seg ${segment.index}`;
+  const time = `${rangeLabel(segment.startMs, segment.endMs)}  `;
+  return `${padLabel(label)}] ${time}(${segment.source})  ${quoteBySource(segment.text, segment.source)}`.trimEnd();
+}
+
+function formatProbeText(result) {
+  const mediaType = result.mediaType;
+  const lines = [];
+  const attrs = [`path="${result.path}"`, `type="${mediaType}"`];
+
+  if (mediaType === 'document') {
+    attrs.push(`pages="${result.pageCount ?? '-'}"`);
+    attrs.push(`textLayer="${result.hasTextLayer ? 'yes' : 'no'}"`);
+  } else {
+    attrs.push(`duration="${fixed2(result.durationSec) ?? '-'}"`);
+    attrs.push(`durationMs="${result.durationMs ?? '-'}"`);
+    if (mediaType === 'video') {
+      attrs.push(`size="${result.width && result.height ? `${result.width}x${result.height}` : '-'}"`);
+      attrs.push(`fps="${fixed2(result.fps) ?? '-'}"`);
+    }
+    attrs.push(`codec="${(mediaType === 'video' ? result.videoCodec : result.audioCodec) ?? '-'}"`);
+    if (mediaType === 'audio') {
+      attrs.push(`channels="${result.audioChannels ?? '-'}"`);
+      attrs.push(`samplerate="${result.sampleRateHz ?? '-'}"`);
+    }
+    attrs.push(`audio="${result.hasAudio ? 'present' : 'none'}"`);
+  }
+  attrs.push(`container="${result.container ?? '-'}"`);
+  attrs.push(`subtitles="${(result.subtitleTracks ?? []).length > 0 ? 'yes' : 'no'}"`);
+  lines.push(`<media ${attrs.join(' ')} />`);
+
+  if (result.audioHealth) {
+    const h = result.audioHealth;
+    const parts = [];
+    if (h.meanDbfs !== null && h.meanDbfs !== undefined) parts.push(`mean level ${Number(h.meanDbfs).toFixed(1)} dBFS`);
+    if (h.speechRatio !== null && h.speechRatio !== undefined) parts.push(`speech ratio ${(Number(h.speechRatio) * 100).toFixed(1)}%`);
+    lines.push(`audio health: ${h.verdict ?? 'unknown'}${parts.length ? ` — ${parts.join(', ')}` : ''}`);
+    if (h.note) lines.push(`  ${h.note}`);
+  }
+
+  const caps = result.capabilities ?? {};
+  const asr = caps.asr ?? {};
+  if (mediaType === 'document') {
+    lines.push('asr: not applicable to this media type.');
+  } else if (asr.available) {
+    lines.push(`asr: available — provider "${asr.provider ?? 'unknown'}".`);
+  } else {
+    lines.push(`asr: unavailable — ${asr.reason ?? 'no ASR provider is configured.'}`);
+  }
+
+  const ocr = caps.ocr ?? {};
+  if (mediaType !== 'document') {
+    lines.push('ocr: not applicable to this media type.');
+  } else if (ocr.available) {
+    lines.push(`ocr: available — provider "${ocr.provider ?? 'unknown'}".`);
+  } else {
+    lines.push(`ocr: unavailable — ${ocr.reason ?? 'no document parser is configured.'}`);
+  }
+
+  lines.push(`transcript source: ${caps.transcriptSource ?? 'none'}${caps.transcriptPath ? ` (${caps.transcriptPath})` : ''}`);
+
+  const recommended = result.recommended ?? {};
+  if (recommended.note) {
+    lines.push(recommended.note);
+  } else if (result.durationSec !== null && result.durationSec !== undefined) {
+    const minutes = Math.round(result.durationSec / 60);
+    lines.push(`How to read ${minutes} min: one overview is enough. media_overview({ path, cells: ${recommended.cellsPerImage ?? 9}, images: ${recommended.overviewImages ?? 2} })`);
+  } else {
+    lines.push('How to read: call media_overview({ path }) next.');
+  }
+  return lines.join('\n');
+}
+
+function formatOverviewText({
+  mediaType, base, window, pages, durationSec, segments, transcript, imageDescriptors, budget, hasAudio,
+}) {
+  const lines = [];
+  const attrs = [`path="${base.path}"`, `type="${mediaType}"`];
+
+  if (mediaType === 'document') {
+    attrs.push(`pages="${formatPageRangeLabel(pages)}"`);
+    if (imageDescriptors.length > 0) {
+      const totalCells = imageDescriptors.reduce((sum, d) => sum + (d.cells ?? 0), 0);
+      attrs.push(`grid="${totalCells} pages x ${imageDescriptors.length} image(s)"`);
+      attrs.push(`image="${imageDescriptors.map((d) => `${d.width}x${d.height}`).join(' ')}"`);
+      attrs.push(`tokens="~${budget.estimatedTokens}"`);
+    }
+    attrs.push(`text="${transcript.provider ?? 'none'}"`);
+    attrs.push(`source="${transcript.source}"`);
+  } else {
+    if (window) {
+      attrs.push(`window="${fixed2(window.startSec)}-${fixed2(window.endSec ?? durationSec ?? 0)}"`);
+    }
+    if (durationSec !== null && durationSec !== undefined) attrs.push(`duration="${fixed2(durationSec)}"`);
+    if (mediaType === 'video') {
+      if (imageDescriptors.length > 0) {
+        const totalCells = imageDescriptors.reduce((sum, d) => sum + (d.cells ?? 0), 0);
+        attrs.push(`grid="${totalCells} cells x ${imageDescriptors.length} image(s)"`);
+        attrs.push(`cell="${cellSizeLabel(imageDescriptors)}"`);
+        attrs.push(`image="${imageDescriptors.map((d) => `${d.width}x${d.height}`).join(' ')}"`);
+        attrs.push(`tokens="~${budget.estimatedTokens}"`);
+      }
+      attrs.push(`audio="${hasAudio ? 'present' : 'none'}"`);
+    }
+    attrs.push(`transcript="${transcript.source}"`);
+    attrs.push(`origin="${transcript.origin}"`);
+    if (transcript.file) attrs.push(`file="${transcript.file}"`);
+    if (mediaType === 'audio') attrs.push(`segments="${transcript.segmentCount}"`);
+  }
+  lines.push(`<overview ${attrs.join(' ')} />`);
+
+  if (transcript.source === 'none' && segments.length === 0) {
+    lines.push(`transcript: NONE (${transcript.reason ?? 'no transcript source is available for this file'})`);
+  }
+
+  const bodyLines = segments.map((segment) => formatOverviewSegmentLine(segment, mediaType));
+  const truncated = truncateLines(lines, bodyLines, budget.maxInlineChars);
+  const notes = [];
+  if (imageDescriptors.length > 0) {
+    notes.push(`cost: ${imageDescriptors.length} image(s) x ~${budget.perImageTokens ?? '-'} = ~${budget.estimatedTokens} vision tokens · transcript from ${transcript.source}${transcript.file ? ` (${transcript.file})` : ''}`);
+  }
+  if (mediaType === 'video') {
+    notes.push('note: the grids are for locating. To read text on screen, media_zoom({ path, at }) and read the cropped single frame.');
+    if (transcript.source === 'asr') {
+      notes.push('note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not quote these lines as the speaker\'s exact words.');
+    }
+  } else if (mediaType === 'audio') {
+    if (transcript.source === 'asr') {
+      notes.push('note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not quote these lines as the speaker\'s exact words.');
+    } else if (transcript.source === 'subtitle') {
+      notes.push('note: source is subtitle — the author\'s own words, safe to quote.');
+    }
+  } else if (mediaType === 'document') {
+    notes.push('note: page text comes from OCR of the rendered pages — verify names and numbers against the page image via media_zoom({ path, page }).');
+  }
+  if (budget.warning) notes.push(`budget: ${budget.warning}`);
+  const text = [truncated.text, ...notes].filter(Boolean).join('\n');
+  return { text, truncated: truncated.truncated, keptCount: truncated.keptCount };
+}
+
+function cellSizeLabel(imageDescriptors) {
+  const first = imageDescriptors[0];
+  if (!first?.width || !first?.height) return '-';
+  const cells = first.cells ?? 1;
+  const cols = Math.ceil(Math.sqrt(cells));
+  const rows = Math.ceil(cells / cols);
+  return `${Math.floor(first.width / cols)}x${Math.floor(first.height / rows)}`;
+}
+
+function formatPageRangeLabel(pages) {
+  if (!Array.isArray(pages) || pages.length === 0) return '-';
+  if (pages.length === 1) return String(pages[0]);
+  const sorted = [...pages].sort((a, b) => a - b);
+  const contiguous = sorted.every((p, i) => i === 0 || p === sorted[i - 1] + 1);
+  return contiguous ? `${sorted[0]}-${sorted[sorted.length - 1]}` : sorted.join(',');
+}
+
+function formatZoomText({ base, mediaType, target, image, cropLabel }) {
+  const attrs = [`path="${base.path}"`, `kind="${target.kind}"`];
+  if (target.kind === 'frame') {
+    if (target.atMs !== null && target.atMs !== undefined) {
+      attrs.push(`at="${formatTimestamp(target.atMs)}"`);
+      attrs.push(`atMs="${target.atMs}"`);
+    }
+    if (target.selection) attrs.push(`selection="${target.selection}"`);
+    if (target.fromMs !== null && target.fromMs !== undefined && target.toMs !== null && target.toMs !== undefined) {
+      attrs.push(`window="${fixed2(target.fromMs / 1000)}-${fixed2(target.toMs / 1000)}"`);
+    }
+  } else {
+    attrs.push(`page="${target.page}"`);
+  }
+  attrs.push(`crop="${cropLabel}"`);
+  if (image) {
+    attrs.push(`image="${image.width}x${image.height}"`);
+    attrs.push(`tokens="~${image.estimatedTokens}"`);
+  }
+  const header = `<zoom ${attrs.join(' ')} />`;
+
+  let body;
+  if (target.kind === 'frame') {
+    const where = target.atMs !== null && target.atMs !== undefined
+      ? `at ${formatTimestamp(target.atMs)}`
+      : `${fixed2(target.fromMs != null ? target.fromMs / 1000 : null)}-${fixed2(target.toMs != null ? target.toMs / 1000 : null)}s`;
+    const selection = target.selection === 'sharpest'
+      ? ` (sharpest${target.fromMs != null ? ` in ${fixed2(target.fromMs / 1000)}-${fixed2(target.toMs / 1000)}s` : ''})`
+      : '';
+    body = `one frame ${where}${selection}, ${cropLabel}, ${image ? `${image.width}x${image.height}` : 'no image'}.`;
+  } else {
+    body = `page ${target.page}, ${cropLabel}, ${image ? `${image.width}x${image.height}` : 'no image'}.`;
+  }
+  return `${header}\n${body}`;
+}
+
+function formatLocateText({ query, matches, totalSegments, mediaType }) {
+  const header = `matches for "${query}" (${matches.length} of ${totalSegments} ${mediaType === 'document' ? 'pages' : 'segments'}):`;
+  if (matches.length === 0) {
+    return `no line matched "${query}" among ${totalSegments} ${mediaType === 'document' ? 'page texts' : 'transcript segments'}. `
+      + 'Try shorter keywords, or a phrase that appears verbatim.';
+  }
+  const lines = [header];
+  for (const match of matches) {
+    const position = match.page !== null && match.page !== undefined
+      ? `page ${match.page}`
+      : rangeLabel(match.startMs, match.endMs);
+    lines.push(`  ${position}  (${Number(match.score ?? 0).toFixed(2)})  ${quoteBySource(match.text, match.source)}`);
+  }
+  lines.push(mediaType === 'document'
+    ? 'Feed any of these pages to media_zoom({ path, page }) — no need to re-read the whole file.'
+    : 'Feed any of these windows to media_zoom({ path, start, end }) — no need to re-read the whole file.');
+  return lines.join('\n');
+}
+
+function formatSubtitlesText({ base, sourcePath, format, language, origin, segments }) {
+  const attrs = [
+    `path="${base.path}"`,
+    'source="subtitle"',
+    `origin="${origin}"`,
+    sourcePath ? `file="${sourcePath}"` : null,
+    format ? `format="${format}"` : null,
+    language ? `language="${language}"` : null,
+    `segments="${segments.length}"`,
+  ].filter(Boolean);
+  const lines = [`<subtitles ${attrs.join(' ')} />`];
+  for (const segment of segments) {
+    lines.push(`${padLabel(`[${segment.index}`, 4)}] ${rangeLabel(segment.startMs, segment.endMs)}  (subtitle)  ${wrapText(segment.text)}`.trimEnd());
+  }
+  return lines.join('\n');
+}
+
+/** 续读提示（契约 §5.3 的 continuation） */
+function buildContinuation({ mediaType, window, durationMs, pages, pageCount, truncated, lastSegment }) {
+  if (mediaType === 'document') {
+    if (!Array.isArray(pages) || pages.length === 0 || pageCount === null || pageCount === undefined) return null;
+    const lastPage = pages[pages.length - 1];
+    if (lastPage >= pageCount) return null;
+    const nextPage = lastPage + 1;
+    const batch = Math.min(pageCount, nextPage + 11);
+    return {
+      nextPage,
+      note: `More pages follow (${nextPage}-${pageCount}). Call media_overview with pages: "${nextPage}-${batch}".`,
+    };
+  }
+  const duration = numberOrNull(durationMs);
+  let nextStartMs = null;
+  if (truncated && lastSegment) {
+    nextStartMs = lastSegment.endMs ?? lastSegment.startMs;
+  } else if (window && window.endMs !== null && window.endMs !== undefined) {
+    if (duration === null || window.endMs < duration) nextStartMs = window.endMs;
+  }
+  if (nextStartMs === null) return null;
+  if (duration !== null && nextStartMs >= duration) return null;
+  return {
+    nextStartMs,
+    nextStartSec: nextStartMs / 1000,
+    note: `More media follows at ${formatTimestamp(nextStartMs)}. Call media_overview with start: ${(nextStartMs / 1000).toFixed(2)} (and end, or segment) to page through the rest.`,
+  };
+}
+
+/** document 的 pages[]（结构化返回） */
+function buildPageTexts(segments) {
+  const byPage = new Map();
+  for (const segment of segments) {
+    if (segment.page === null || segment.page === undefined) continue;
+    if (!byPage.has(segment.page)) byPage.set(segment.page, []);
+    if (segment.text) byPage.get(segment.page).push(segment.text);
+  }
+  return [...byPage.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([page, texts]) => ({ page, text: texts.join('\n'), truncated: false }));
+}
+
+/* ------------------------------------------------------------------ *
+ * handler 实现
+ * ------------------------------------------------------------------ */
+
+async function handleProbe(args, call) {
+  const base = await resolveMedia(args);
+  checkApplicability(args, base.mediaType);
+
+  const input = {
+    ...baseInput(base),
+    transcriptFile: args.transcriptFile ?? null,
+    transcript: args.transcript ?? 'auto',
+  };
+  const result = (await call.dispatcher.call(base.mediaType, 'probe', input, call.backendCtx)) ?? {};
+  const mediaType = refineMediaType(result, base.mediaType);
+  const normalized = normalizeProbeResult(result, { ...base, mediaType }, call);
+
+  return {
+    content: [{ type: 'text', text: formatProbeText(normalized) }],
+    structuredContent: normalized,
+  };
+}
+
+/** 回环地址不需要 API key（与 provider 的规则一致，契约 §12.2 / §12.3） */
+function isLoopback(url) {
+  if (!url) return false;
+  try {
+    const host = new URL(url).hostname;
+    return ['127.0.0.1', 'localhost', '[::1]', '::1', '0.0.0.0'].includes(host);
+  } catch {
+    return false;
+  }
+}
+
+/** ASR provider 是否真的可用（配了 provider 但缺 key 时 probe 应如实说 available=false） */
+function asrProviderUsable(runtime) {
+  const provider = runtime?.asrProvider;
+  if (!provider) return false;
+  const config = runtime?.config?.asr;
+  if (!config) return true;
+  return Boolean(config.apiKey) || isLoopback(config.baseUrl);
+}
+
+/** 文档解析 provider 是否真的可用 */
+function docProviderUsable(runtime) {
+  const provider = runtime?.docProvider;
+  if (!provider) return false;
+  const config = runtime?.config?.doc;
+  if (!config) return true;
+  return Boolean(config.apiKey) || isLoopback(config.baseUrl);
+}
+
+/** 补全 ProbeResult 的默认字段（契约 §4.3）；后端给了的值优先 */
+function normalizeProbeResult(result, base, call) {
+  const mediaType = base.mediaType;
+  const hasAudio = result.hasAudio ?? (mediaType !== 'document');
+  const audioHealth = result.audioHealth ?? null;
+  const capabilities = result.capabilities ?? {};
+  const asrConfigured = asrProviderUsable(call.runtime);
+  const docConfigured = docProviderUsable(call.runtime);
+  const asrAvailable = asrConfigured
+    && mediaType !== 'document'
+    && hasAudio
+    && (audioHealth === null || audioHealth.effective !== false);
+  const ocrAvailable = docConfigured && mediaType === 'document';
+
+  const defaults = {
+    mediaType,
+    path: base.path,
+    sizeBytes: base.sizeBytes,
+    modifiedMs: base.modifiedMs,
+    durationMs: null,
+    durationSec: null,
+    width: null,
+    height: null,
+    fps: null,
+    rotation: null,
+    aspect: null,
+    videoCodec: null,
+    container: null,
+    hasAudio,
+    audioCodec: null,
+    audioChannels: null,
+    sampleRateHz: null,
+    audioHealth,
+    pageCount: null,
+    hasTextLayer: null,
+    subtitleTracks: [],
+    audioTracks: [],
+    capabilities: {
+      asr: {
+        available: asrAvailable,
+        provider: asrAvailable ? (call.runtime?.asrProvider?.id ?? null) : null,
+        reason: asrAvailable ? null : asrUnavailableReason({ mediaType, hasAudio, audioHealth, call }),
+      },
+      ocr: {
+        available: ocrAvailable,
+        provider: ocrAvailable ? (call.runtime?.docProvider?.id ?? null) : null,
+        reason: ocrAvailable ? null : ocrUnavailableReason(mediaType, call),
+      },
+      transcriptSource: result.capabilities?.transcriptSource ?? 'none',
+      transcriptOrigin: result.capabilities?.transcriptOrigin ?? 'none',
+      transcriptPath: result.capabilities?.transcriptPath ?? null,
+    },
+    recommended: defaultRecommended(mediaType, result.durationSec ?? null, result.pageCount ?? null),
+  };
+
+  return {
+    ...defaults,
+    ...result,
+    mediaType,
+    path: base.path,
+    sizeBytes: base.sizeBytes,
+    modifiedMs: base.modifiedMs,
+    capabilities: {
+      ...defaults.capabilities,
+      ...capabilities,
+      asr: { ...defaults.capabilities.asr, ...(capabilities.asr ?? {}) },
+      ocr: { ...defaults.capabilities.ocr, ...(capabilities.ocr ?? {}) },
+    },
+    recommended: { ...defaults.recommended, ...(result.recommended ?? {}) },
+  };
+}
+
+function asrUnavailableReason({ mediaType, hasAudio, audioHealth, call }) {
+  if (mediaType === 'document') return 'asr is not applicable to document media.';
+  if (!hasAudio) return 'this file has no audio track.';
+  if (audioHealth && audioHealth.effective === false) {
+    return `audio health is "${audioHealth.verdict ?? 'too-quiet'}" — no effective speech, so ASR is skipped to avoid a hallucinated transcript.`;
+  }
+  if (call.runtime?.providerErrors?.asr) return call.runtime.providerErrors.asr;
+  if (!call.runtime?.asrProvider) return 'MMGREP_ASR_PROVIDER is "none". Transcription will be empty.';
+  const config = call.runtime?.config?.asr;
+  if (config && !config.apiKey && !isLoopback(config.baseUrl)) {
+    return `MMGREP_ASR_API_KEY is not set for provider "${config.provider}".`;
+  }
+  return null;
+}
+
+function ocrUnavailableReason(mediaType, call) {
+  if (mediaType !== 'document') return 'ocr is not applicable to this media type.';
+  if (call.runtime?.providerErrors?.doc) return call.runtime.providerErrors.doc;
+  if (!call.runtime?.docProvider) return 'MMGREP_DOC_PROVIDER is "none".';
+  const config = call.runtime?.config?.doc;
+  if (config && !config.apiKey && !isLoopback(config.baseUrl)) {
+    return `MMGREP_DOC_API_KEY is not set for provider "${config.provider}".`;
+  }
+  return null;
+}
+
+function defaultRecommended(mediaType, durationSec, pageCount) {
+  const long = mediaType === 'document'
+    ? (pageCount !== null && pageCount > 30)
+    : (durationSec !== null && durationSec > 1800);
+  return {
+    mode: long ? 'sequence' : 'single',
+    segmentSec: 300,
+    overviewImages: 2,
+    cellsPerImage: mediaType === 'document' ? 6 : 9,
+    estimatedImageTokens: 2458,
+    note: long
+      ? 'Long media: narrow the range first (start/end for video and audio, pages for documents), then page through with the continuation hint.'
+      : 'One overview is enough. media_overview({ path }) is the next step.',
+  };
+}
+
+async function handleOverview(args, call) {
+  const base = await resolveMedia(args);
+  checkApplicability(args, base.mediaType);
+  checkMethod(base.mediaType, 'overview');
+
+  await call.onProgress({ stage: 'scanning', used: describeWindowForProgress(args) });
+
+  const probe = await internalProbe(base, {
+    transcriptFile: args.transcriptFile ?? null,
+    transcript: args.transcript ?? 'auto',
+  }, call);
+  const mediaType = refineMediaType(probe, base.mediaType);
+  if (mediaType !== base.mediaType) {
+    checkApplicability(args, mediaType);
+    checkMethod(mediaType, 'overview');
+  }
+
+  const durationSec = numberOrNull(probe.durationSec);
+  const pageCount = integerOrNull(probe.pageCount);
+  const window = mediaType === 'document' ? null : computeTimeWindow(args, durationSec);
+  const pages = mediaType === 'document' ? computePages(args, pageCount) : null;
+  const transcriptFile = mediaType === 'document' ? null : await resolveTranscriptFile(args.transcriptFile, { logger: call.logger });
+
+  const plan = planOverviewImages(args, mediaType, call.config);
+  const input = {
+    ...baseInput({ ...base, mediaType }),
+    transcriptFile,
+    transcript: mediaType === 'document' ? undefined : (args.transcript ?? 'auto'),
+    startMs: window?.startMs ?? null,
+    endMs: window?.endMs ?? null,
+    startSec: window?.startSec ?? null,
+    endSec: window?.endSec ?? null,
+    clipped: window?.clipped ?? false,
+    pages,
+    pageCount,
+    durationSec,
+    envelope: Boolean(args.envelope),
+    ...(plan ? { cells: plan.produced.cells, images: plan.produced.images, maxEdge: plan.produced.maxEdge } : {}),
+  };
+
+  await call.onProgress({ stage: 'transcribing', used: transcriptFile ? path.basename(transcriptFile) : (args.transcript ?? 'auto') });
+  const result = (await call.dispatcher.call(mediaType, 'overview', input, call.backendCtx)) ?? {};
+  await call.onProgress({ stage: 'rendering', used: `${Array.isArray(result.images) ? result.images.length : 0} image(s)` });
+
+  const segments = normalizeSegmentsSafe(result.segments);
+  const rawImages = Array.isArray(result.images) ? result.images : [];
+  const { blocks, descriptors } = plan
+    ? collectImages(rawImages, plan, call.config)
+    : { blocks: [], descriptors: [] };
+  const budget = plan
+    ? budgetReport(plan, {
+      producedImages: descriptors.length,
+      producedCells: descriptors.reduce((sum, d) => sum + (d.cells ?? 0), 0),
+      extraWarnings: result.warnings,
+    })
+    : { ...zeroBudget(call.config), warning: null };
+  const transcript = resolveTranscriptInfo(result, segments);
+
+  // 全文落盘（契约 §9）：返回路径，不内联全文。
+  const exported = await persistOverview({
+    call,
+    base: { ...base, mediaType },
+    mediaType,
+    segments,
+    transcript,
+    window,
+    pages,
+    descriptors,
+    budget,
+    warnings: [...(Array.isArray(result.warnings) ? result.warnings : [])],
+    durationSec,
+    pageCount,
+  });
+
+  const text = formatOverviewText({
+    mediaType,
+    base,
+    window,
+    pages,
+    durationSec,
+    segments,
+    transcript,
+    imageDescriptors: descriptors,
+    budget: {
+      ...budget,
+      maxInlineChars: call.config?.text?.maxInlineChars ?? DEFAULT_MAX_TEXT_INLINE_CHARS,
+      perImageTokens: plan?.perImageTokens ?? null,
+    },
+    hasAudio: probe.hasAudio ?? mediaType !== 'document',
+  });
+
+  // 内联清单只包含前 N 条，结构化返回与文本保持一致（contract §5.3：节选）
+  const inlineSegments = segments.slice(0, text.keptCount);
+  const continuation = buildContinuation({
+    mediaType,
+    window,
+    durationMs: numberOrNull(probe.durationMs) ?? (durationSec !== null ? Math.round(durationSec * 1000) : null),
+    pages,
+    pageCount,
+    truncated: text.truncated,
+    lastSegment: inlineSegments[inlineSegments.length - 1] ?? null,
+  });
+
+  const structuredContent = {
+    mediaType,
+    path: base.path,
+    window: {
+      startMs: window?.startMs ?? null,
+      endMs: window?.endMs ?? null,
+      startSec: window?.startSec ?? null,
+      endSec: window?.endSec ?? null,
+      pages,
+      clipped: window?.clipped ?? false,
+    },
+    images: descriptors,
+    segments: inlineSegments,
+    transcript,
+    pages: mediaType === 'document' ? buildPageTexts(segments) : null,
+    fullText: {
+      dir: exported.outDir,
+      contentMd: exported.contentPath,
+      segmentsJsonl: exported.segmentsPath,
+      manifestJson: exported.manifestPath,
+    },
+    truncated: text.truncated,
+    continuation,
+    budget,
+  };
+
+  return {
+    content: [{ type: 'text', text: text.text }, ...blocks],
+    structuredContent,
+  };
+}
+
+function describeWindowForProgress(args) {
+  if (args.pages !== undefined) return `pages ${args.pages}`;
+  if (args.start !== undefined || args.end !== undefined) {
+    return `${args.start ?? 0}-${args.end ?? 'end'}s`;
+  }
+  return 'whole media';
+}
+
+/**
+ * 工具层的三类媒体 → cangjie SourceDocument 的 `media_type` 枚举（契约 §9.4）。
+ * 注意：`manifest.json` 的 `source.mediaType` 用本项目口径（video/audio/document），
+ * 这里只给 `document.json` 用；图片类文档按契约偏差映射成 `pdf`。
+ */
+export function cangjieMediaType(mediaType, filePath) {
+  if (mediaType === 'video' || mediaType === 'audio') return mediaType;
+  const ext = (/\.[^./\\]+$/.exec(String(filePath).toLowerCase())?.[0]) ?? '';
+  switch (ext) {
+    case '.md':
+    case '.markdown':
+      return 'markdown';
+    case '.txt':
+      return 'txt';
+    case '.html':
+    case '.htm':
+      return 'html';
+    case '.epub':
+      return 'epub';
+    case '.docx':
+    case '.doc':
+      return 'docx';
+    case '.pptx':
+    case '.ppt':
+      return 'pptx';
+    case '.xlsx':
+    case '.xls':
+      return 'xlsx';
+    case '.srt':
+    case '.vtt':
+    case '.ass':
+    case '.ssa':
+      return 'subtitle';
+    // PDF、图片类文档以及识别不出的页面式文档都落在这个枚举值上
+    default:
+      return 'pdf';
+  }
+}
+
+/** 全文落盘：契约 §9 的 content.md / segments.jsonl / manifest.json */
+async function persistOverview({ call, base, mediaType, segments, transcript, window, pages, descriptors, budget, warnings, durationSec, pageCount }) {
+  const { cache, logger } = call;
+  let sha256 = null;
+  if (cache?.contentKeyForFile) {
+    try {
+      const info = await cache.contentKeyForFile(base.path);
+      sha256 = info?.sha256 ?? null;
+    } catch (error) {
+      logger?.warn?.(`could not hash ${base.path} for the cache key: ${error?.message ?? error}`);
+    }
+  }
+  if (!sha256) sha256 = await sha256File(base.path);
+
+  const key = `sha256:${sha256}`;
+  let outDir;
+  if (cache?.prepareDir) {
+    try {
+      outDir = await cache.prepareDir(key);
+    } catch (error) {
+      logger?.warn?.(`could not prepare the cache directory: ${error?.message ?? error}`);
+    }
+  }
+  if (!outDir) outDir = path.join(os.tmpdir(), 'multimediagrep', sha256);
+
+  const exported = await exportAnalysis({
+    outDir,
+    source: {
+      path: base.path,
+      mediaType,
+      sizeBytes: base.sizeBytes,
+      modifiedMs: base.modifiedMs,
+      sha256,
+      durationSec,
+      pageCount,
+    },
+    mediaType: cangjieMediaType(mediaType, base.path),
+    segments,
+    transcript: {
+      source: transcript.source,
+      origin: transcript.origin,
+      language: transcript.language,
+      provider: transcript.provider,
+      model: transcript.model,
+      file: transcript.file,
+    },
+    overview: {
+      images: descriptors.map((d) => ({
+        index: d.index,
+        width: d.width,
+        height: d.height,
+        cells: d.cells,
+        mimeType: d.mimeType,
+        bytes: d.bytes,
+        estimatedTokens: d.estimatedTokens,
+      })),
+      estimatedTokens: budget.estimatedTokens,
+    },
+    window: window ? { startMs: window.startMs, endMs: window.endMs } : null,
+    pages,
+    provider: transcript.provider,
+    warnings,
+    tool: 'media_overview',
+  });
+
+  if (cache?.register) {
+    try {
+      await cache.register(key);
+    } catch (error) {
+      logger?.debug?.(`could not register the export entry in the cache: ${error?.message ?? error}`);
+    }
+  }
+  return exported;
+}
+
+/** 没有 cache 模块时的兜底哈希（流式，不把整个视频读进内存） */
+async function sha256File(filePath) {
+  const hash = createHash('sha256');
+  await new Promise((resolve, reject) => {
+    const stream = createReadStream(filePath);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('error', reject);
+    stream.on('end', resolve);
+  });
+  return hash.digest('hex');
+}
+
+async function handleZoom(args, call) {
+  const base = await resolveMedia(args);
+  checkApplicability(args, base.mediaType);
+  checkMethod(base.mediaType, 'zoom');
+
+  const probe = await internalProbe(base, {}, call);
+  const mediaType = refineMediaType(probe, base.mediaType);
+  if (mediaType !== base.mediaType) {
+    checkApplicability(args, mediaType);
+    checkMethod(mediaType, 'zoom');
+  }
+  const durationSec = numberOrNull(probe.durationSec);
+  const pageCount = integerOrNull(probe.pageCount);
+
+  const maxEdge = args.maxEdge !== undefined ? Number(args.maxEdge) : 1600;
+  const limitEdge = call.config?.images?.maxEdge ?? IMAGE_LIMITS.maxMaxEdge;
+  validateImageShape({ cells: 1, images: 1, maxEdge, limitEdge });
+
+  let crop = null;
+  if (args.crop !== undefined) {
+    const { x, y, width, height } = args.crop ?? {};
+    if (![x, y, width, height].every((value) => typeof value === 'number' && Number.isFinite(value))) {
+      throw new ToolError('INVALID_ARGUMENT', 'crop must be an object {x, y, width, height} with four numbers in 0..1.');
+    }
+    crop = validateCrop(args.crop);
+  }
+
+  const input = { ...baseInput({ ...base, mediaType }), crop, maxEdge };
+  let target;
+
+  if (mediaType === 'video') {
+    const hasAt = args.at !== undefined;
+    const hasWindow = args.start !== undefined || args.end !== undefined;
+    if (hasAt && hasWindow) {
+      throw new ToolError('INVALID_ARGUMENT', 'at and start/end are mutually exclusive — pass either a single timestamp or a window.');
+    }
+    if (!hasAt && (args.start === undefined || args.end === undefined)) {
+      throw new ToolError('INVALID_ARGUMENT', 'for video, pass "at" (one timestamp) or both "start" and "end" (a window).');
+    }
+    if (hasAt) {
+      const atSec = Number(args.at);
+      if (!Number.isFinite(atSec) || atSec < 0) {
+        throw new ToolError('INVALID_ARGUMENT', 'at must be >= 0.');
+      }
+      if (durationSec !== null && atSec > durationSec) {
+        throw new ToolError(
+          'OUT_OF_RANGE',
+          `at (${atSec.toFixed(1)} s) is beyond the end of the media (duration ${durationSec.toFixed(1)} s).`,
+        );
+      }
+      const atMs = Math.round(atSec * 1000);
+      input.atMs = atMs;
+      input.atSec = atSec;
+      input.selection = 'exact';
+      target = {
+        kind: 'frame',
+        atMs,
+        atSec,
+        fromMs: null,
+        toMs: null,
+        selection: 'exact',
+        page: null,
+        crop,
+      };
+    } else {
+      const window = computeTimeWindow({ start: args.start, end: args.end, segment: args.segment }, durationSec);
+      input.startMs = window.startMs;
+      input.endMs = window.endMs;
+      input.startSec = window.startSec;
+      input.endSec = window.endSec;
+      input.clipped = window.clipped;
+      input.selection = 'sharpest';
+      target = {
+        kind: 'frame',
+        atMs: null,
+        atSec: null,
+        fromMs: window.startMs,
+        toMs: window.endMs,
+        selection: 'sharpest',
+        page: null,
+        crop,
+      };
+    }
+  } else {
+    if (args.page === undefined) {
+      throw new ToolError('INVALID_ARGUMENT', 'page is required for document media.');
+    }
+    const page = Number(args.page);
+    if (!Number.isInteger(page) || page < 1) {
+      throw new ToolError('INVALID_ARGUMENT', `page must be a 1-based integer (got ${JSON.stringify(args.page)}).`);
+    }
+    if (pageCount !== null && page > pageCount) {
+      throw new ToolError('OUT_OF_RANGE', `page ${page} is out of range. This document has ${pageCount} pages.`);
+    }
+    input.page = page;
+    target = { kind: 'page', atMs: null, atSec: null, page, crop };
+  }
+
+  const result = (await call.dispatcher.call(mediaType, 'zoom', input, call.backendCtx)) ?? {};
+  const rawImages = Array.isArray(result.images) ? result.images : [];
+  validateProducedImages(rawImages, { limitEdge });
+  if (rawImages.length !== 1) {
+    throw new ToolError('INTERNAL', `the ${mediaType} backend returned ${rawImages.length} images; media_zoom returns exactly one.`);
+  }
+  const described = describeImages(rawImages, { source: 'visual' });
+  const image = described.descriptors[0];
+  const backendTarget = result.target && typeof result.target === 'object' ? result.target : null;
+  const finalTarget = backendTarget ? { ...target, ...backendTarget, page: backendTarget.page ?? target.page ?? null } : target;
+
+  // 软预算：单张图超预算时只警告（显式形状不改形）
+  const config = call.config ?? {};
+  const limitTokens = config?.images?.maxTokens ?? DEFAULT_MAX_IMAGE_TOKENS;
+  const warnings = [...(Array.isArray(result.warnings) ? result.warnings : [])];
+  if (image?.estimatedTokens && image.estimatedTokens > limitTokens) {
+    warnings.push(`this image needs ~${image.estimatedTokens} image tokens, above the soft budget of ${limitTokens}. Lower maxEdge to reduce cost.`);
+  }
+
+  const structuredContent = {
+    mediaType,
+    path: base.path,
+    target: finalTarget,
+    image,
+    imageCount: 1,
+    text: formatZoomText({
+      base,
+      mediaType,
+      target: finalTarget,
+      image,
+      cropLabel: crop ? `crop ${crop.x},${crop.y} ${crop.width}x${crop.height}` : 'full frame',
+    }),
+    ...(warnings.length > 0 ? { warnings } : {}),
+  };
+
+  const text = structuredContent.text;
+
+  return {
+    content: [{ type: 'text', text }, ...described.blocks],
+    structuredContent,
+  };
+}
+
+async function handleLocate(args, call) {
+  const base = await resolveMedia(args);
+  checkApplicability(args, base.mediaType);
+  checkMethod(base.mediaType, 'locate');
+
+  if (typeof args.query !== 'string' || args.query.trim() === '') {
+    throw new ToolError('INVALID_ARGUMENT', 'query is required.');
+  }
+  const max = args.max !== undefined ? Number(args.max) : 5;
+  if (!Number.isInteger(max) || max < 1 || max > 20) {
+    throw new ToolError('INVALID_ARGUMENT', `max must be an integer between 1 and 20 (got ${JSON.stringify(args.max)}).`);
+  }
+
+  const probe = await internalProbe(base, {
+    transcriptFile: args.transcriptFile ?? null,
+    transcript: args.transcript ?? 'auto',
+  }, call);
+  const mediaType = refineMediaType(probe, base.mediaType);
+  if (mediaType !== base.mediaType) {
+    checkApplicability(args, mediaType);
+    checkMethod(mediaType, 'locate');
+  }
+
+  const durationSec = numberOrNull(probe.durationSec);
+  const pageCount = integerOrNull(probe.pageCount);
+  const window = mediaType === 'document' ? null : computeTimeWindow(args, durationSec);
+  const pages = mediaType === 'document' ? computePages(args, pageCount) : null;
+  const transcriptFile = mediaType === 'document' ? null : await resolveTranscriptFile(args.transcriptFile, { logger: call.logger });
+
+  const input = {
+    ...baseInput({ ...base, mediaType }),
+    query: args.query,
+    max,
+    transcriptFile,
+    transcript: mediaType === 'document' ? undefined : (args.transcript ?? 'auto'),
+    startMs: window?.startMs ?? null,
+    endMs: window?.endMs ?? null,
+    startSec: window?.startSec ?? null,
+    endSec: window?.endSec ?? null,
+    clipped: window?.clipped ?? false,
+    pages,
+    pageCount,
+    durationSec,
+    includeFrame: Boolean(args.includeFrame),
+  };
+
+  const result = (await call.dispatcher.call(mediaType, 'locate', input, call.backendCtx)) ?? {};
+  const matches = normalizeMatches(result.matches, pageCount);
+  const transcriptSource = result.transcript?.source ?? matches[0]?.source ?? 'none';
+  const transcriptOrigin = result.transcript?.origin ?? matches[0]?.origin ?? 'none';
+  const totalSegments = Number.isInteger(result.totalSegments) ? result.totalSegments : matches.length;
+  const warnings = [...(Array.isArray(result.warnings) ? result.warnings : [])];
+
+  const contentBlocks = [];
+  let frame = null;
+  if (args.includeFrame) {
+    const rawFrame = result.frame;
+    if (rawFrame?.buffer) {
+      const described = describeImages([rawFrame], { source: 'visual' });
+      const descriptor = described.descriptors[0];
+      const frameAtMs = integerOrNull(rawFrame.atMs) ?? matches[0]?.startMs ?? null;
+      frame = {
+        atMs: frameAtMs,
+        atSec: frameAtMs === null ? null : frameAtMs / 1000,
+        width: descriptor.width,
+        height: descriptor.height,
+        estimatedTokens: descriptor.estimatedTokens,
+      };
+      contentBlocks.push(...described.blocks);
+    } else {
+      warnings.push('includeFrame was requested but the backend returned no frame for the best match.');
+    }
+  }
+
+  const text = formatLocateText({
+    query: args.query,
+    matches,
+    totalSegments,
+    mediaType,
+  });
+
+  const structuredContent = {
+    mediaType,
+    path: base.path,
+    query: args.query,
+    transcriptSource,
+    transcriptOrigin,
+    matches,
+    totalSegments,
+    searchedWindow: {
+      startMs: window?.startMs ?? null,
+      endMs: window?.endMs ?? null,
+      pages,
+    },
+    frame,
+    text,
+    ...(warnings.length > 0 ? { warnings } : {}),
+  };
+
+  return {
+    content: [{ type: 'text', text }, ...contentBlocks],
+    structuredContent,
+  };
+}
+
+function normalizeMatches(rawMatches, pageCount) {
+  const list = Array.isArray(rawMatches) ? rawMatches : [];
+  return list.map((match, i) => {
+    const startMs = integerOrNull(match?.startMs);
+    const endMs = integerOrNull(match?.endMs);
+    const page = integerOrNull(match?.page);
+    if (page !== null && pageCount !== null && page > pageCount) {
+      throw new ToolError('OUT_OF_RANGE', `page ${page} is out of range. This document has ${pageCount} pages.`);
+    }
+    return {
+      rank: Number.isInteger(match?.rank) ? match.rank : i + 1,
+      score: Number.isFinite(Number(match?.score)) ? Number(match.score) : 0,
+      startMs,
+      endMs,
+      startSec: startMs === null ? null : startMs / 1000,
+      endSec: endMs === null ? null : endMs / 1000,
+      text: String(match?.text ?? ''),
+      source: match?.source ?? 'none',
+      origin: match?.origin ?? 'none',
+      page,
+    };
+  });
+}
+
+async function handleSubtitles(args, call) {
+  const base = await resolveMedia(args);
+  if (base.mediaType === 'document') {
+    throw new ToolError(
+      'INVALID_ARGUMENT',
+      'video_subtitles is not applicable to document media. Documents have a page text layer, not a transcript.',
+    );
+  }
+  checkApplicability(args, base.mediaType);
+  checkMethod(base.mediaType, 'subtitles');
+
+  // 只有给了时间窗才需要 duration 做裁剪；没给就不额外 probe。
+  let durationSec = null;
+  if (args.start !== undefined || args.end !== undefined) {
+    const probe = await internalProbe(base, {}, call);
+    durationSec = numberOrNull(probe.durationSec);
+  }
+  const window = computeTimeWindow(args, durationSec);
+  const transcriptFile = await resolveTranscriptFile(args.transcriptFile, { logger: call.logger });
+
+  const input = {
+    ...baseInput(base),
+    transcriptFile,
+    startMs: window.startMs,
+    endMs: window.endMs,
+    startSec: window.startSec,
+    endSec: window.endSec,
+    clipped: window.clipped,
+  };
+  const result = (await call.dispatcher.call(base.mediaType, 'subtitles', input, call.backendCtx)) ?? {};
+  const segments = normalizeSegmentsSafe(result.segments);
+  const origin = result.origin ?? segments[0]?.origin ?? 'embedded';
+  const sourcePath = result.sourcePath ?? null;
+  const format = result.format ?? null;
+  const language = result.language ?? null;
+  const warnings = Array.isArray(result.warnings) ? result.warnings : [];
+
+  const text = formatSubtitlesText({ base, sourcePath, format, language, origin, segments });
+  const capped = truncateLines([], text.split('\n'), call.config?.text?.maxInlineChars);
+
+  const structuredContent = {
+    mediaType: base.mediaType,
+    path: base.path,
+    source: 'subtitle',
+    origin,
+    sourcePath,
+    format,
+    language,
+    segmentCount: segments.length,
+    segments,
+    ...(capped.truncated ? { truncated: true } : {}),
+    ...(warnings.length > 0 ? { warnings } : {}),
+  };
+
+  return {
+    content: [{ type: 'text', text: capped.text }],
+    structuredContent,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * 注册
+ * ------------------------------------------------------------------ */
+
+/** 5 个工具的定义表（顺序即注册顺序） */
+export const TOOL_DEFINITIONS = Object.freeze([
+  { name: 'media_probe', title: 'Probe media', description: PROBE_DESCRIPTION, shape: TOOL_SHAPES.media_probe, handler: handleProbe },
+  { name: 'media_overview', title: 'Overview', description: OVERVIEW_DESCRIPTION, shape: TOOL_SHAPES.media_overview, handler: handleOverview },
+  { name: 'media_zoom', title: 'Zoom', description: ZOOM_DESCRIPTION, shape: TOOL_SHAPES.media_zoom, handler: handleZoom },
+  { name: 'media_locate', title: 'Locate', description: LOCATE_DESCRIPTION, shape: TOOL_SHAPES.media_locate, handler: handleLocate },
+  { name: 'video_subtitles', title: 'Subtitles', description: SUBTITLES_DESCRIPTION, shape: TOOL_SHAPES.video_subtitles, handler: handleSubtitles },
+]);
+
+/**
+ * 进度上报器（契约 §2.6）：阻塞调用 + `notifications/progress`。
+ * 宿主没给 progressToken / 宿主不支持 / 主动关闭时静默跳过，不影响结果。
+ */
+export function createProgressReporter({ tool, extra, config, logger = null }) {
+  const token = extra?._meta?.progressToken;
+  if (config?.progress?.enabled === false || token === undefined || typeof extra?.sendNotification !== 'function') {
+    return async () => {};
+  }
+  let counter = 0;
+  const defaultTotal = 5;
+  return async (event = {}) => {
+    const payload = typeof event === 'string' ? { stage: event } : event;
+    const stage = payload.stage ?? 'working';
+    counter += 1;
+    const progress = Number.isFinite(payload.progress) ? payload.progress : counter;
+    const total = Number.isFinite(payload.total) ? payload.total : defaultTotal;
+    const detail = payload.used ?? payload.message ?? null;
+    const message = `${tool} ${progress}/${total} · ${stage}${detail ? ` ${detail}` : ''}`;
+    try {
+      await extra.sendNotification({
+        method: 'notifications/progress',
+        params: { progressToken: token, progress, total, message },
+      });
+    } catch (error) {
+      // best-effort：进度失败绝不能影响结果
+      logger?.debug?.(`progress notification failed: ${error?.message ?? error}`);
+    }
+  };
+}
+
+/** 每次调用共享的上下文 */
+export function createCallContext(runtime, extra, toolName) {
+  const onProgress = createProgressReporter({
+    tool: toolName,
+    extra,
+    config: runtime.config,
+    logger: runtime.logger,
+  });
+  return {
+    runtime,
+    tool: toolName,
+    config: runtime.config,
+    logger: runtime.logger,
+    cache: runtime.cache ?? null,
+    dispatcher: runtime.dispatcher,
+    signal: extra?.signal ?? null,
+    onProgress,
+    backendCtx: {
+      cache: runtime.cache ?? null,
+      asrProvider: runtime.asrProvider ?? null,
+      docProvider: runtime.docProvider ?? null,
+      logger: runtime.logger,
+      onProgress,
+      signal: extra?.signal ?? null,
+      config: runtime.config,
+    },
+  };
+}
+
+/**
+ * 把 5 个工具注册到 McpServer。
+ *
+ * @param {import('@modelcontextprotocol/sdk/server/mcp.js').McpServer} server
+ * @param {object} runtime { config, logger, cache, asrProvider, docProvider, backends, dispatcher }
+ */
+export function registerTools(server, runtime) {
+  for (const definition of TOOL_DEFINITIONS) {
+    const inputSchema = z.object(definition.shape).strict();
+    server.registerTool(
+      definition.name,
+      {
+        title: definition.title,
+        description: definition.description,
+        inputSchema,
+        annotations: { readOnlyHint: true, openWorldHint: false },
+      },
+      guardToolHandler(
+        definition.name,
+        async (args, extra) => definition.handler(args ?? {}, createCallContext(runtime, extra, definition.name)),
+        { logger: runtime.logger },
+      ),
+    );
+  }
+}
+
+/** 默认 dispatcher 工厂（测试 / createServer 用） */
+export function createRuntimeDispatcher(backends) {
+  return createDispatcher(backends ?? {});
+}
