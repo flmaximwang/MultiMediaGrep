@@ -19,8 +19,9 @@ import {
 import { ToolError } from '../../media/interface.js';
 import { matchSegments, splitIntoSentences } from '../../media/match.js';
 import {
+  analyzeSubtitleStreams,
+  bitmapSkippedWarnings,
   discoverSiblingSubtitles,
-  pickSubtitleStream,
   resolveSubtitleSource,
 } from '../../media/transcript.js';
 import { audioConfig, computeAudioHealth } from '../../media/audio-health.js';
@@ -70,6 +71,10 @@ function shapeProbe({ info, audioHealth, input, ctx, stats, durationSec, subtitl
     transcriptSource = 'asr';
     transcriptOrigin = 'asr';
   }
+  // 有字幕轨却没用上（如只有图形字幕）时，probe 也要说明原因
+  const transcriptReason = transcriptSource === 'subtitle'
+    ? null
+    : ((subtitleHints?.warnings ?? []).join('; ') || null);
 
   return {
     mediaType: 'audio',
@@ -106,6 +111,7 @@ function shapeProbe({ info, audioHealth, input, ctx, stats, durationSec, subtitl
       transcriptSource,
       transcriptOrigin,
       transcriptPath,
+      transcriptReason,
     },
     recommended: {
       mode: durationSec && durationSec > 600 ? 'sequence' : 'single',
@@ -149,12 +155,14 @@ async function probeAudio(input, ctx) {
     audioHealth = computeAudioHealth({ levels, silences, durationSec, thresholds: cfg });
   }
   const sibling = (await discoverSiblingSubtitles(input.path))[0] ?? null;
+  const subtitleAnalysis = analyzeSubtitleStreams(info?.streams ?? []);
   const result = {
     durationSec,
     audioHealth,
     subtitleHints: {
       siblingPath: sibling?.path ?? null,
-      hasEmbeddedSubtitle: pickSubtitleStream(info?.streams ?? []) !== null,
+      hasEmbeddedSubtitle: subtitleAnalysis.stream !== null,
+      warnings: bitmapSkippedWarnings(subtitleAnalysis.bitmapSkipped),
     },
   };
   if (PROBE_CACHE.size >= PROBE_CACHE_MAX) {
@@ -421,7 +429,7 @@ export function createAudioBackend(ctx = {}) {
       sourcePath: subtitle.sourcePath,
       format: subtitle.format,
       language: subtitle.language,
-      warnings: [...warnings, ...subtitle.warnings],
+      warnings: [...new Set([...warnings, ...subtitle.warnings])],
     };
   }
 

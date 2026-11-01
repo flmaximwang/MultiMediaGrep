@@ -33,6 +33,37 @@ async function makeAudio(dir, name, expr, durationSec) {
   return out;
 }
 
+/** 最小 PGS 段（PCS + END），让 ffmpeg 能 mux 出一条图形字幕轨 */
+function minimalPgs() {
+  const segment = (type, payload = Buffer.alloc(0)) => {
+    const buffer = Buffer.alloc(13 + payload.length);
+    buffer.write('PG', 0, 'latin1');
+    buffer.writeUInt32BE(0, 2);
+    buffer.writeUInt32BE(0, 6);
+    buffer[10] = type;
+    buffer.writeUInt16BE(payload.length, 11);
+    payload.copy(buffer, 13);
+    return buffer;
+  };
+  return Buffer.concat([segment(0x14), segment(0x80)]);
+}
+
+/** 现造一个带音轨与图形字幕轨（hdmv_pgs_subtitle）的录音容器 */
+async function makeBitmapSubtitleAudio(dir) {
+  const sup = path.join(dir, 'bitmap.sup');
+  const out = path.join(dir, 'bitmap-audio.mkv');
+  await writeFile(sup, minimalPgs());
+  await run('ffmpeg', [
+    '-y', '-v', 'error',
+    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=4',
+    '-f', 'sup', '-i', sup,
+    '-map', '0:a', '-map', '1:s',
+    '-c:a', 'aac', '-c:s', 'copy',
+    out,
+  ]);
+  return out;
+}
+
 test('planChunks：短音频一片；长音频在静音中点切；无静音则硬切并加重叠', () => {
   assert.equal(planChunks({ durationSec: 30 }).length, 1);
 
@@ -169,6 +200,35 @@ test('后端 probe/overview/zoom/locate：字幕文件路径', { skip }, async (
     const locate = await backend.locate({ path: audio, transcriptFile: srt, query: '位错理论' });
     assert.equal(locate.matches.length, 1);
     assert.equal(locate.matches[0].startMs, 3000);
+  } finally {
+    if (prevCache === undefined) delete process.env.MMGREP_CACHE_DIR;
+    else process.env.MMGREP_CACHE_DIR = prevCache;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('后端 probe/overview：图形字幕轨写出 bitmap-skipped 原因', { skip }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-audio-bitmap-'));
+  const prevCache = process.env.MMGREP_CACHE_DIR;
+  process.env.MMGREP_CACHE_DIR = path.join(dir, 'cache');
+  try {
+    const audio = await makeBitmapSubtitleAudio(dir);
+    const backend = createAudioBackend({ config: {} });
+
+    const probe = await backend.probe({ path: audio });
+    assert.equal(probe.capabilities.transcriptSource, 'none');
+    assert.match(
+      probe.capabilities.transcriptReason,
+      /^embedded-subtitle-bitmap-skipped \(hdmv_pgs_subtitle, track \d+\)$/,
+    );
+    assert.ok(probe.subtitleTracks.some((track) => track.codec === 'hdmv_pgs_subtitle'));
+
+    const overview = await backend.overview({ path: audio, envelope: false });
+    assert.ok(
+      overview.warnings.some((w) => /^embedded-subtitle-bitmap-skipped \(hdmv_pgs_subtitle, track \d+\)$/.test(w)),
+      JSON.stringify(overview.warnings),
+    );
+    assert.equal(overview.transcript.source, 'none');
   } finally {
     if (prevCache === undefined) delete process.env.MMGREP_CACHE_DIR;
     else process.env.MMGREP_CACHE_DIR = prevCache;

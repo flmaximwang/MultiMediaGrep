@@ -706,6 +706,9 @@ function formatProbeText(result) {
   }
 
   lines.push(`transcript source: ${caps.transcriptSource ?? 'none'}${caps.transcriptPath ? ` (${caps.transcriptPath})` : ''}`);
+  if (caps.transcriptReason) {
+    lines.push(`transcript reason: ${caps.transcriptReason}`);
+  }
 
   const recommended = result.recommended ?? {};
   if (recommended.note) {
@@ -1020,6 +1023,7 @@ function normalizeProbeResult(result, base, call) {
       transcriptSource: result.capabilities?.transcriptSource ?? 'none',
       transcriptOrigin: result.capabilities?.transcriptOrigin ?? 'none',
       transcriptPath: result.capabilities?.transcriptPath ?? null,
+      transcriptReason: result.capabilities?.transcriptReason ?? null,
     },
     recommended: defaultRecommended(mediaType, result.durationSec ?? null, result.pageCount ?? null),
   };

@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import { createVideoBackend } from '../../src/backend/video/index.js';
-import { assertFfmpegAvailable } from '../../src/media/ffmpeg.js';
+import { assertFfmpegAvailable, ffprobeJson, run } from '../../src/media/ffmpeg.js';
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -50,6 +50,66 @@ async function ensureFixtures() {
 const ffmpegReady = await hasFfmpeg();
 const fixturesReady = ffmpegReady ? await ensureFixtures() : false;
 const skip = !(ffmpegReady && fixturesReady);
+
+/**
+ * 最小 PGS 段（PCS + END）。足以让 ffmpeg 的 sup demuxer 建出
+ * hdmv_pgs_subtitle 轨；本测试只关心「图形字幕轨被识别并跳过」。
+ */
+function minimalPgs() {
+  const segment = (type, payload = Buffer.alloc(0)) => {
+    const buffer = Buffer.alloc(13 + payload.length);
+    buffer.write('PG', 0, 'latin1');
+    buffer.writeUInt32BE(0, 2);
+    buffer.writeUInt32BE(0, 6);
+    buffer[10] = type;
+    buffer.writeUInt16BE(payload.length, 11);
+    payload.copy(buffer, 13);
+    return buffer;
+  };
+  return Buffer.concat([segment(0x14), segment(0x80)]);
+}
+
+/** 现造一个带图形字幕轨（hdmv_pgs_subtitle）的视频；建不出来返回 null。 */
+async function makeBitmapSubtitleVideo(dir) {
+  const sup = path.join(dir, 'bitmap.sup');
+  const out = path.join(dir, 'bitmap-subs.mkv');
+  await writeFile(sup, minimalPgs());
+  try {
+    await run('ffmpeg', [
+      '-y', '-v', 'error',
+      '-f', 'lavfi', '-i', 'color=c=black:s=160x90:d=4:r=10',
+      '-f', 'sup', '-i', sup,
+      '-map', '0:v', '-map', '1:s',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+      '-c:s', 'copy',
+      out,
+    ]);
+    const info = await ffprobeJson(out);
+    const hasBitmap = (info?.streams ?? []).some(
+      (stream) => stream.codec_type === 'subtitle' && stream.codec_name === 'hdmv_pgs_subtitle',
+    );
+    return hasBitmap ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 现造一个带空 mov_text 轨的视频（只有 WEBVTT 头，没有任何 cue）。 */
+async function makeEmptyTextSubtitleVideo(dir) {
+  const vtt = path.join(dir, 'empty-source.vtt');
+  const out = path.join(dir, 'empty-track.mp4');
+  await writeFile(vtt, 'WEBVTT\n\n');
+  await run('ffmpeg', [
+    '-y', '-v', 'error',
+    '-f', 'lavfi', '-i', 'color=c=black:s=160x90:d=4:r=10',
+    '-i', vtt,
+    '-map', '0:v', '-map', '1:s',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+    '-c:s', 'mov_text',
+    out,
+  ]);
+  return out;
+}
 
 async function withCache(fn) {
   const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-video-'));
@@ -154,6 +214,62 @@ test('probe：契约 §4.3 字段、音频体检、字幕与 ASR 能力', { skip
     assert.equal(asrProbe.capabilities.transcriptSource, 'asr');
     assert.equal(asrProbe.capabilities.transcriptOrigin, 'asr');
     assert.equal(stub.calls.length, 0, 'probe must not run ASR');
+  });
+});
+
+test('probe/overview：图形字幕轨与空文本轨报出具名 warning', { skip, timeout: 120000 }, async () => {
+  await withCache(async (dir) => {
+    const backend = createVideoBackend({ config: {} });
+
+    // 图形字幕（PGS）：无法解析成文字，probe 与 overview 都要说明原因
+    const bitmap = await makeBitmapSubtitleVideo(dir);
+    if (bitmap) {
+      const probe = await backend.probe({ path: bitmap, transcript: 'auto', transcriptFile: null });
+      assert.equal(probe.capabilities.transcriptSource, 'none');
+      assert.match(
+        probe.capabilities.transcriptReason,
+        /^embedded-subtitle-bitmap-skipped \(hdmv_pgs_subtitle, track \d+\)$/,
+      );
+      assert.ok(probe.subtitleTracks.some((track) => track.codec === 'hdmv_pgs_subtitle'));
+
+      const overview = await backend.overview({
+        path: bitmap,
+        startMs: 0,
+        endMs: 4000,
+        cells: 2,
+        images: 1,
+        maxEdge: 320,
+        transcript: 'auto',
+        transcriptFile: null,
+      });
+      assert.ok(
+        overview.warnings.some((w) => /^embedded-subtitle-bitmap-skipped \(hdmv_pgs_subtitle, track \d+\)$/.test(w)),
+        JSON.stringify(overview.warnings),
+      );
+      assert.equal(overview.transcript.source, 'none');
+    }
+
+    // 空 mov_text 轨：存在文本轨，但抽出来没有任何段落
+    const empty = await makeEmptyTextSubtitleVideo(dir);
+    const probe = await backend.probe({ path: empty, transcript: 'auto', transcriptFile: null });
+    assert.equal(probe.capabilities.transcriptSource, 'subtitle', 'probe 只报轨道存在，不抽取内容');
+    assert.equal(probe.capabilities.transcriptOrigin, 'embedded');
+
+    const overview = await backend.overview({
+      path: empty,
+      startMs: 0,
+      endMs: 4000,
+      cells: 2,
+      images: 1,
+      maxEdge: 320,
+      transcript: 'auto',
+      transcriptFile: null,
+    });
+    assert.ok(
+      overview.warnings.some((w) => /^embedded-subtitle-empty \(track \d+\)$/.test(w)),
+      JSON.stringify(overview.warnings),
+    );
+    assert.equal(overview.transcript.source, 'none');
   });
 });
 

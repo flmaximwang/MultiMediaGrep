@@ -78,6 +78,9 @@ export async function resolveTranscript(input, ctx, media, {
     };
   }
 
+  // 没有命中字幕来源时，也要把「字幕轨存在但用不上」的原因带进调用方 warnings
+  mergeWarnings(warnings, subtitleWarnings);
+
   if (input.transcript === 'off') {
     warnings.push('transcript-disabled');
     return {
