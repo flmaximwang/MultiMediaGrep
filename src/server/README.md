@@ -18,7 +18,7 @@
 | `../index.js` | 入口：建 runtime → 建 server → 接 `StdioServerTransport`；启动横幅写 stderr；SIGINT/SIGTERM 优雅退出 |
 | `index.js` | `createServer()` / `createRuntime()`；加载 cache、provider、后端；组装 dispatcher |
 | `http.js` | Streamable HTTP 传输（`POST /mcp`，无状态）：每个请求新建 server + transport，用完即关；Bearer 鉴权、请求体上限与超时 |
-| `tools.js` | 5 个工具的 zod schema、参数×媒体校验、handler、进度上报、全文落盘、文本清单 |
+| `tools.js` | 4 个工具的 zod schema、参数×媒体校验、handler、进度上报、全文落盘、文本清单 |
 | `backends.js` | 三个后端的集中动态导入；缺失/损坏 → 占位后端（调用时报 `INTERNAL`） |
 | `images.js` | 图片 → MCP image content；契约 §10 的 token 计价、硬上限、软预算降级 |
 | `errors.js` | `ToolError` / 任意异常 → 契约 §2.4 的 MCP 错误结果（`isError: true`） |
@@ -54,9 +54,9 @@ node --test "test/server/**/*.test.js"
 }
 ```
 
-## 5 个工具
+## 4 个工具
 
-描述文本直接取自契约 §4–§8（英文 + 中文触发词），不要改写。`path` 恒为必填；`media_locate` 另需 `query`。
+描述文本直接取自契约 §4–§7（英文 + 中文触发词），不要改写。`path` 恒为必填；`media_locate` 另需 `query`。
 
 | 工具 | 参数（类型 / 适用媒体） |
 |---|---|
@@ -64,7 +64,6 @@ node --test "test/server/**/*.test.js"
 | `media_overview` | `path`；`start` / `end`（秒，video/audio）；`segment`（30–3600，video/audio）；`pages`（`"3-10,15"`，document）；`cells`（1–16，video/document）；`images`（0–4，video/document；audio 仅 `0` = 零像素纯文本模式）；`maxEdge`（256–1600，video/document）；`envelope`（audio）；`subtitle` / `transcript`（video/audio） |
 | `media_zoom` | `path`；`at`（video）；`start` + `end`（video）；`page`（document）；`crop`（video/document）；`maxEdge` |
 | `media_locate` | `path` + `query`；`max`（1–20）；`start` / `end` / `segment` / `pages`；`subtitle` / `transcript`；`includeFrame`（video/document） |
-| `video_subtitles` | `path`（video/audio）；`start` / `end`；`pages` 仅用于报「不适用」；`subtitle` |
 
 参数 schema 通过 `.describe()` 标注适用媒体类型；**传了不适用于该媒体类型的参数会返回契约 §2.2 的
 `INVALID_ARGUMENT` 原文案**（`tools.js` 的 `PARAM_APPLICABILITY` / `checkApplicability`），不会静默忽略。
@@ -287,7 +286,7 @@ API key 只留在 runtime 里：`describeConfig()` 输出 `set` / `unset`，日�
 test/server/config.test.js    # §12 默认值 / 自定义 / 非法值 / 脱敏 / 日志器
 test/server/errors.test.js    # §2.4 错误映射
 test/server/images.test.js    # §10 计价 / 硬上限 / 软预算 / 降级
-test/server/tools.test.js     # stub 后端：schema、适用性、5 个工具、进度、落盘
+test/server/tools.test.js     # stub 后端：schema、适用性、4 个工具、进度、落盘
 test/server/server.test.js    # spawn node src/index.js，StdioClientTransport 端到端
 test/server/http.test.js      # Streamable HTTP：协议面、鉴权、路由、配置、超时中止
 ```

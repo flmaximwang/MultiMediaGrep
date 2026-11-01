@@ -206,20 +206,21 @@ test('后端 probe/overview/zoom/locate：字幕文件路径', { skip }, async (
     assert.ok(Buffer.isBuffer(overview.images[0].buffer), '图片必须带 buffer 交给 MCP 层');
     assert.equal(overview.images[0].width, 1200);
 
-    const subs = await backend.subtitles({ path: audio, subtitle: srt });
+    const subs = await backend.overview({ path: audio, subtitle: srt, images: 0, transcript: 'subtitle' });
     assert.equal(subs.segments.length, 2);
-    assert.equal(subs.format, 'srt');
-    assert.equal(subs.sourcePath, srt);
+    assert.equal(subs.transcript.file, srt);
     assert.equal(subs.segments[1].source, 'subtitle');
-    const clipped = await backend.subtitles({ path: audio, subtitle: srt, startMs: 3000, endMs: 6000 });
+    const clipped = await backend.overview({
+      path: audio, subtitle: srt, images: 0, transcript: 'subtitle', startMs: 3000, endMs: 6000,
+    });
     assert.equal(clipped.segments.length, 1);
     assert.match(clipped.segments[0].text, /柏氏矢量/);
 
     const bare = await makeAudio(dir, 'bare.wav', '0.5*sin(2*PI*440*t)', 3);
-    await assert.rejects(
-      () => backend.subtitles({ path: bare }),
-      (e) => e.code === 'NO_TRANSCRIPT' && /no subtitle source/.test(e.message),
-    );
+    const bareOverview = await backend.overview({ path: bare, images: 0, transcript: 'subtitle' });
+    assert.deepEqual(bareOverview.segments, []);
+    assert.equal(bareOverview.transcript.source, 'none');
+    assert.ok(bareOverview.warnings.includes('no-subtitle-source'));
 
     const locate = await backend.locate({ path: audio, subtitle: srt, query: '位错理论' });
     assert.equal(locate.matches.length, 1);
@@ -286,18 +287,20 @@ test('显式 subtitle：文件 / 轨 index / 语言码 / 失败不回退（录�
     // 文件路径
     const srt = path.join(dir, 'picked.srt');
     await writeFile(srt, '1\n00:00:00,000 --> 00:00:02,000\n显式文件字幕\n');
-    const byFile = await backend.subtitles({ path: multi, subtitle: srt });
-    assert.equal(byFile.origin, 'file');
-    assert.equal(byFile.sourcePath, srt);
+    const byFile = await backend.overview({ path: multi, subtitle: srt, images: 0, transcript: 'subtitle' });
+    assert.equal(byFile.transcript.origin, 'file');
+    assert.equal(byFile.transcript.file, srt);
     assert.match(byFile.segments[0].text, /显式文件字幕/);
 
     // 轨 index
-    const byIndex = await backend.subtitles({ path: multi, subtitle: chi2.index });
-    assert.equal(byIndex.origin, 'embedded');
+    const byIndex = await backend.overview({
+      path: multi, subtitle: chi2.index, images: 0, transcript: 'subtitle',
+    });
+    assert.equal(byIndex.transcript.origin, 'embedded');
     assert.match(byIndex.segments[0].text, /音频中文二轨/);
 
     // 语言码：zh ≈ chi/zho；多条命中取靠前，其余写 warning；eng ≈ en
-    const byLanguage = await backend.subtitles({ path: multi, subtitle: 'zh' });
+    const byLanguage = await backend.overview({ path: multi, subtitle: 'zh', images: 0, transcript: 'subtitle' });
     assert.match(byLanguage.segments[0].text, /音频中文一轨/);
     assert.ok(
       byLanguage.warnings.includes(
@@ -305,21 +308,21 @@ test('显式 subtitle：文件 / 轨 index / 语言码 / 失败不回退（录�
       ),
       JSON.stringify(byLanguage.warnings),
     );
-    const byEnglish = await backend.subtitles({ path: multi, subtitle: 'eng' });
+    const byEnglish = await backend.overview({ path: multi, subtitle: 'eng', images: 0, transcript: 'subtitle' });
     assert.match(byEnglish.segments[0].text, /AUDIO ENGLISH TRACK/);
 
     // 不可用 → INVALID_ARGUMENT，不回退
     await assert.rejects(
-      () => backend.subtitles({ path: multi, subtitle: 99 }),
+      () => backend.overview({ path: multi, subtitle: 99, images: 0, transcript: 'subtitle' }),
       (error) => error.code === 'INVALID_ARGUMENT' && /does not exist in this file/.test(error.message),
     );
     await assert.rejects(
-      () => backend.subtitles({ path: multi, subtitle: 'ja' }),
+      () => backend.overview({ path: multi, subtitle: 'ja', images: 0, transcript: 'subtitle' }),
       (error) => error.code === 'INVALID_ARGUMENT' && /no subtitle track matches language "ja"/.test(error.message),
     );
     const missing = path.join(dir, 'missing.srt');
     await assert.rejects(
-      () => backend.subtitles({ path: multi, subtitle: missing }),
+      () => backend.overview({ path: multi, subtitle: missing, images: 0, transcript: 'subtitle' }),
       (error) => error.code === 'INVALID_ARGUMENT' && error.message === `subtitle file does not exist: "${missing}".`,
     );
 
@@ -328,12 +331,12 @@ test('显式 subtitle：文件 / 轨 index / 语言码 / 失败不回退（录�
     const bitmapInfo = await ffprobeJson(bitmap);
     const bitmapTrack = bitmapInfo.streams.find((stream) => stream.codec_type === 'subtitle');
     await assert.rejects(
-      () => backend.subtitles({ path: bitmap, subtitle: bitmapTrack.index }),
+      () => backend.overview({ path: bitmap, subtitle: bitmapTrack.index, images: 0, transcript: 'subtitle' }),
       (error) => error.code === 'INVALID_ARGUMENT'
         && error.message.includes(`embedded-subtitle-bitmap-skipped (hdmv_pgs_subtitle, track ${bitmapTrack.index})`),
     );
     await assert.rejects(
-      () => backend.subtitles({ path: bitmap, subtitle: 'zh' }),
+      () => backend.overview({ path: bitmap, subtitle: 'zh', images: 0, transcript: 'subtitle' }),
       (error) => error.code === 'INVALID_ARGUMENT' && /bitmap subtitle tracks cannot be read as text/i.test(error.message),
     );
 
@@ -348,9 +351,9 @@ test('显式 subtitle：文件 / 轨 index / 语言码 / 失败不回退（录�
     // 不传 subtitle：保持自动顺序（同目录同名文件）
     const auto = await makeAudio(dir, 'auto.wav', '0.5*sin(2*PI*440*t)', 3);
     await writeFile(path.join(dir, 'auto.srt'), '1\n00:00:00,000 --> 00:00:01,000\n自动发现字幕\n');
-    const autoSubs = await backend.subtitles({ path: auto });
-    assert.equal(autoSubs.origin, 'file');
-    assert.equal(autoSubs.sourcePath, path.join(dir, 'auto.srt'));
+    const autoSubs = await backend.overview({ path: auto, images: 0, transcript: 'subtitle' });
+    assert.equal(autoSubs.transcript.origin, 'file');
+    assert.equal(autoSubs.transcript.file, path.join(dir, 'auto.srt'));
   } finally {
     if (prevCache === undefined) delete process.env.MMGREP_CACHE_DIR;
     else process.env.MMGREP_CACHE_DIR = prevCache;

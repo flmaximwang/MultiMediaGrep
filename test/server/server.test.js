@@ -71,10 +71,10 @@ async function withStdioClient(fn) {
 
 test('stdio：listTools / instructions / 路径错误 / 占位后端', { timeout: 30000 }, async () => {
   await withStdioClient(async ({ client, videoPath, stderr }) => {
-    // 1) 5 个工具，schema 与描述完整
+    // 1) 4 个工具，schema 与描述完整
     const listed = await client.listTools();
     assert.deepEqual(listed.tools.map((tool) => tool.name), [
-      'media_probe', 'media_overview', 'media_zoom', 'media_locate', 'video_subtitles',
+      'media_probe', 'media_overview', 'media_zoom', 'media_locate',
     ]);
     const probe = listed.tools.find((tool) => tool.name === 'media_probe');
     assert.match(probe.description, /读取本地媒体/);

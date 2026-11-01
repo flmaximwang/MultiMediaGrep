@@ -43,6 +43,12 @@ npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.1.0/
 | `media_locate` | 一句文本 → 视频/录音里的时间戳、文档里的页码 | 0（`includeFrame` 才 +1） |
 | `video_subtitles` | 本地 `.srt/.vtt/.ass/.ssa` 或容器内嵌字幕轨 → 带时间轴段落 | 0 |
 
+## 迁移注记
+
+`video_subtitles` 已并入 `media_overview`：纯字幕读取用
+`media_overview({ path, images: 0, transcript: "subtitle" })`，需要显式选择来源时再加 `subtitle`
+（本地字幕文件绝对路径 / 字幕轨 index / 语言码）。工具总数从 5 个变为 4 个，旧工具名不再注册。
+
 ## 这一版的边界（重要）
 
 - **只吃本地绝对路径**，不下载、不检索、不碰 cookie / 凭据。

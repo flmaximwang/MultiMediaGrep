@@ -429,7 +429,7 @@ test('overview：字幕优先——sibling 自动发现、显式 subtitle 胜出
   });
 });
 
-test('probe/overview/subtitles：显式 subtitle 的文件、轨 index、语言码与失败不回退', { skip, timeout: 120000 }, async () => {
+test('probe/overview：显式 subtitle 的文件、轨 index、语言码与失败不回退', { skip, timeout: 120000 }, async () => {
   await withCache(async (dir) => {
     const backend = createVideoBackend({ config: {} });
     const multi = await makeMultiTextSubtitleVideo(dir);
@@ -441,20 +441,28 @@ test('probe/overview/subtitles：显式 subtitle 的文件、轨 index、语言�
     // 文件路径：显式文件优先于内嵌轨
     const explicitFile = path.join(dir, 'explicit.srt');
     await writeFile(explicitFile, '1\n00:00:00,000 --> 00:00:04,000\nPICKED FILE\n');
-    const byFile = await backend.subtitles({ path: multi, subtitle: explicitFile });
-    assert.equal(byFile.origin, 'file');
-    assert.equal(byFile.sourcePath, explicitFile);
+    const byFile = await backend.overview({
+      path: multi, images: 0, transcript: 'subtitle', subtitle: explicitFile,
+    });
+    assert.equal(byFile.transcript.origin, 'file');
+    assert.equal(byFile.transcript.file, explicitFile);
     assert.match(byFile.segments[0].text, /PICKED FILE/);
 
     // 轨 index：数字与纯数字字符串等价
-    const byIndex = await backend.subtitles({ path: multi, subtitle: chi2.index });
-    assert.equal(byIndex.origin, 'embedded');
+    const byIndex = await backend.overview({
+      path: multi, images: 0, transcript: 'subtitle', subtitle: chi2.index,
+    });
+    assert.equal(byIndex.transcript.origin, 'embedded');
     assert.match(byIndex.segments[0].text, /CHI TRACK TWO/);
-    const byIndexString = await backend.subtitles({ path: multi, subtitle: String(chi2.index) });
+    const byIndexString = await backend.overview({
+      path: multi, images: 0, transcript: 'subtitle', subtitle: String(chi2.index),
+    });
     assert.match(byIndexString.segments[0].text, /CHI TRACK TWO/);
 
     // 语言码：zh ≈ chi/zho；多条命中取靠前的一条，其余写 warning；en ≈ eng
-    const byLanguage = await backend.subtitles({ path: multi, subtitle: 'zh' });
+    const byLanguage = await backend.overview({
+      path: multi, images: 0, transcript: 'subtitle', subtitle: 'zh',
+    });
     assert.match(byLanguage.segments[0].text, /CHI TRACK ONE/);
     assert.ok(
       byLanguage.warnings.includes(
@@ -462,21 +470,23 @@ test('probe/overview/subtitles：显式 subtitle 的文件、轨 index、语言�
       ),
       JSON.stringify(byLanguage.warnings),
     );
-    const byEnglish = await backend.subtitles({ path: multi, subtitle: 'en' });
+    const byEnglish = await backend.overview({
+      path: multi, images: 0, transcript: 'subtitle', subtitle: 'en',
+    });
     assert.match(byEnglish.segments[0].text, /ENG TRACK/);
 
     // 显式选择不可用 → INVALID_ARGUMENT，不回退到自动顺序
     await assert.rejects(
-      () => backend.subtitles({ path: multi, subtitle: 99 }),
+      () => backend.overview({ path: multi, images: 0, transcript: 'subtitle', subtitle: 99 }),
       (error) => error.code === 'INVALID_ARGUMENT' && /does not exist in this file/.test(error.message),
     );
     await assert.rejects(
-      () => backend.subtitles({ path: multi, subtitle: 'ja' }),
+      () => backend.overview({ path: multi, images: 0, transcript: 'subtitle', subtitle: 'ja' }),
       (error) => error.code === 'INVALID_ARGUMENT' && /no subtitle track matches language "ja"/.test(error.message),
     );
     const missing = path.join(dir, 'missing.srt');
     await assert.rejects(
-      () => backend.subtitles({ path: multi, subtitle: missing }),
+      () => backend.overview({ path: multi, images: 0, transcript: 'subtitle', subtitle: missing }),
       (error) => error.code === 'INVALID_ARGUMENT' && error.message === `subtitle file does not exist: "${missing}".`,
     );
 
@@ -486,12 +496,12 @@ test('probe/overview/subtitles：显式 subtitle 的文件、轨 index、语言�
       const bitmapInfo = await ffprobeJson(bitmap);
       const bitmapTrack = bitmapInfo.streams.find((stream) => stream.codec_type === 'subtitle');
       await assert.rejects(
-        () => backend.subtitles({ path: bitmap, subtitle: bitmapTrack.index }),
+        () => backend.overview({ path: bitmap, images: 0, transcript: 'subtitle', subtitle: bitmapTrack.index }),
         (error) => error.code === 'INVALID_ARGUMENT'
           && error.message.includes(`embedded-subtitle-bitmap-skipped (hdmv_pgs_subtitle, track ${bitmapTrack.index})`),
       );
       await assert.rejects(
-        () => backend.subtitles({ path: bitmap, subtitle: 'zh' }),
+        () => backend.overview({ path: bitmap, images: 0, transcript: 'subtitle', subtitle: 'zh' }),
         (error) => error.code === 'INVALID_ARGUMENT' && /bitmap subtitle tracks cannot be read as text/i.test(error.message),
       );
 
@@ -507,9 +517,9 @@ test('probe/overview/subtitles：显式 subtitle 的文件、轨 index、语言�
     assert.equal(siblingProbe.capabilities.transcriptReason, `subtitle file does not exist: "${missing}".`);
 
     // 不传 subtitle：保持自动顺序（内嵌文本轨优先，sibling 也能命中）
-    const auto = await backend.subtitles({ path: SUBTITLES });
-    assert.equal(auto.origin, 'file');
-    assert.equal(auto.sourcePath, SRT);
+    const auto = await backend.overview({ path: SUBTITLES, images: 0, transcript: 'subtitle' });
+    assert.equal(auto.transcript.origin, 'file');
+    assert.equal(auto.transcript.file, SRT);
   });
 });
 
@@ -617,7 +627,6 @@ test('overview：images: 0 是零像素纯文本模式——不出图、不扫�
         images: 0,
         maxEdge: 640,
         transcript: 'subtitle',
-        transcriptFile: null,
       });
 
       assert.equal(result.images.length, 0, '零像素模式不得出图');
@@ -643,7 +652,6 @@ test('overview：images: 0 是零像素纯文本模式——不出图、不扫�
         images: 1,
         maxEdge: 640,
         transcript: 'subtitle',
-        transcriptFile: null,
       });
       assert.equal(withImage.images.length, 1);
       assert.ok((await counter.calls()).length > 0, '对照组必须记录到 ffmpeg 调用，否则计数没生效');
@@ -667,7 +675,6 @@ test('overview：images: 0 与 transcript="subtitle" 组合——零像素、零
         images: 0,
         maxEdge: 640,
         transcript: 'subtitle',
-        transcriptFile: null,
       });
 
       assert.equal(stub.calls.length, 0, '零像素模式不得触发 ASR');
@@ -691,7 +698,6 @@ test('overview：images: 0 时窗口仍然生效，超窗段落被过滤掉', { 
       images: 0,
       maxEdge: 640,
       transcript: 'subtitle',
-      transcriptFile: null,
     });
 
     assert.equal(result.images.length, 0);
@@ -860,18 +866,19 @@ test('locate：没有任何转写来源 → NO_TRANSCRIPT（契约 §7.5 文案�
   });
 });
 
-test('subtitles：sibling 文件、窗口过滤、显式文件；无字幕来源 → NO_TRANSCRIPT（契约 §8.6）', { skip, timeout: 120000 }, async () => {
+test('overview：sibling 文件、窗口过滤、显式文件；无字幕来源时 transcript 如实为空', { skip, timeout: 120000 }, async () => {
   await withCache(async (dir) => {
     const backend = createVideoBackend({ config: {} });
-    const clipped = await backend.subtitles({
+    const clipped = await backend.overview({
       path: SUBTITLES,
       startMs: 3000,
       endMs: 6000,
+      images: 0,
+      transcript: 'subtitle',
       subtitle: null,
     });
-    assert.equal(clipped.origin, 'file');
-    assert.equal(clipped.sourcePath, SRT);
-    assert.equal(clipped.format, 'srt');
+    assert.equal(clipped.transcript.origin, 'file');
+    assert.equal(clipped.transcript.file, SRT);
     assert.equal(clipped.segments.length, 1);
     assert.equal(clipped.segments[0].index, 1);
     assert.equal(clipped.segments[0].source, 'subtitle');
@@ -880,23 +887,23 @@ test('subtitles：sibling 文件、窗口过滤、显式文件；无字幕来源
 
     const explicit = path.join(dir, 'picked.vtt');
     await writeFile(explicit, 'WEBVTT\n\n00:00:00.000 --> 00:00:12.000\nEXPLICIT VTT LINE\n');
-    const picked = await backend.subtitles({
+    const picked = await backend.overview({
       path: SUBTITLES,
       startMs: 0,
       endMs: 12000,
+      images: 0,
+      transcript: 'subtitle',
       subtitle: explicit,
     });
-    assert.equal(picked.origin, 'file');
-    assert.equal(picked.sourcePath, explicit);
-    assert.equal(picked.format, 'vtt');
+    assert.equal(picked.transcript.origin, 'file');
+    assert.equal(picked.transcript.file, explicit);
     assert.ok(picked.segments.some((segment) => /EXPLICIT VTT LINE/.test(segment.text)));
 
-    await assert.rejects(
-      () => backend.subtitles({ path: SCENE, subtitle: null }),
-      (error) => error.code === 'NO_TRANSCRIPT'
-        && error.message === `no subtitle source for "${SCENE}": no embedded subtitle track, `
-          + 'no sibling .srt/.vtt/.ass/.ssa file, and no ASR provider configured. '
-          + 'Pass subtitle with a local subtitle file, a track index, or a language code.',
-    );
+    // 没有字幕来源：overview 不报错，transcript 如实为空并写明原因
+    const empty = await backend.overview({ path: SCENE, images: 0, transcript: 'subtitle', subtitle: null });
+    assert.deepEqual(empty.segments, []);
+    assert.equal(empty.transcript.source, 'none');
+    assert.match(empty.transcript.reason, /no subtitle source was found/);
+    assert.ok(empty.warnings.includes('no-subtitle-source'));
   });
 });

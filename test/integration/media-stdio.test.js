@@ -84,11 +84,11 @@ async function withServer(fn) {
 
 const call = (client, name, args) => client.callTool({ name, arguments: args });
 
-test('video：probe / overview / zoom / locate / subtitles 走真 server', { skip, timeout: 120000 }, async () => {
+test('video：probe / overview / zoom / locate 走真 server', { skip, timeout: 120000 }, async () => {
   await withServer(async ({ client }) => {
     const listed = await client.listTools();
     assert.deepEqual(listed.tools.map((tool) => tool.name), [
-      'media_probe', 'media_overview', 'media_zoom', 'media_locate', 'video_subtitles',
+      'media_probe', 'media_overview', 'media_zoom', 'media_locate',
     ]);
 
     const probe = await call(client, 'media_probe', { path: ASSETS.scene });
@@ -124,14 +124,20 @@ test('video：probe / overview / zoom / locate / subtitles 走真 server', { ski
     assert.equal(locate.structuredContent.matches[0].source, 'subtitle');
     assert.match(locate.content[0].text, /media_zoom\(\{ path, start, end \}\)/);
 
-    const subs = await call(client, 'video_subtitles', { path: ASSETS.subsVideo });
+    const subs = await call(client, 'media_overview', {
+      path: ASSETS.subsVideo, images: 0, transcript: 'subtitle',
+    });
     assert.notEqual(subs.isError, true);
-    assert.equal(subs.structuredContent.segmentCount, 4);
-    assert.equal(subs.structuredContent.origin, 'file');
+    assert.equal(subs.structuredContent.segments.length, 4);
+    assert.equal(subs.structuredContent.transcript.source, 'subtitle');
+    assert.equal(subs.structuredContent.transcript.origin, 'file');
 
-    const noSource = await call(client, 'video_subtitles', { path: ASSETS.scene });
-    assert.equal(noSource.isError, true);
-    assert.equal(noSource.structuredContent.error.code, 'NO_TRANSCRIPT');
+    const noSource = await call(client, 'media_overview', {
+      path: ASSETS.scene, images: 0, transcript: 'subtitle',
+    });
+    assert.notEqual(noSource.isError, true);
+    assert.deepEqual(noSource.structuredContent.segments, []);
+    assert.equal(noSource.structuredContent.transcript.source, 'none');
   });
 });
 

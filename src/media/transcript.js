@@ -7,7 +7,7 @@
 // 未显式选择时的判定顺序（写死）：
 //   1. 容器内嵌的字幕轨（第一条文本型轨，语言优先级 zh-Hans → zh-CN → zh → en-US → en → 轨序）
 //   2. 同目录同名文件（a.mp4 → a.srt / a.vtt / a.ass / a.ssa，再 base.<lang>.<ext>）
-// 两步都没有 → 返回 null（ASR 兜底由后端决定；video_subtitles 直接 NO_TRANSCRIPT）。
+// 两步都没有 → 返回 null（是否用 ASR 兜底由调用方按 transcript 参数决定）。
 
 import { constants } from 'node:fs';
 import { access, readdir, stat } from 'node:fs/promises';

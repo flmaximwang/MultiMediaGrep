@@ -174,16 +174,16 @@ export function validateCrop(crop) {
  * 契约 §2.2 的参数适用性总表在这里落到「方法级」。
  */
 export const METHOD_MATRIX = Object.freeze({
-  video: ['probe', 'overview', 'zoom', 'locate', 'subtitles'],
-  audio: ['probe', 'overview', 'locate', 'subtitles'],
+  video: ['probe', 'overview', 'zoom', 'locate'],
+  audio: ['probe', 'overview', 'locate'],
   document: ['probe', 'overview', 'zoom', 'locate'],
 });
 
-export const METHODS = Object.freeze(['probe', 'overview', 'zoom', 'locate', 'subtitles']);
+export const METHODS = Object.freeze(['probe', 'overview', 'zoom', 'locate']);
 
 /**
  * 分派器：按 mediaType 选后端，再按方法选实现。
- * 后端对象形如 { probe, overview, zoom, locate, subtitles }（不适用的方法可以缺省）。
+ * 后端对象形如 { probe, overview, zoom, locate }（不适用的方法可以缺省）。
  */
 export function createDispatcher(backends) {
   return {
