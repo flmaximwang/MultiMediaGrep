@@ -1,9 +1,12 @@
-// test/doc/overview-preview.test.js —— 用合成 PDF fixture 跑文档预览（9z5.20）
+// test/doc/overview-preview.test.js —— 用合成 PDF fixture 跑文档预览（9z5.20 / 9z5.32）
 //
 // fixture：fixtures/generated/sample-longpage.pdf（fixtures/generate.mjs 生成）
 //   page 4 正文 > 24k 字符（内联上限），page 6 是一个无标点的超长单元。
-// 这里故意走**真实文档后端**（pdftotext 文字层），验证的是「页面正文超过内联上限
-// 也不会整页消失」这条端到端行为；缺 PDF 工具或 fixture 时整组跳过。
+// 这里故意走**真实文档后端**（pdftotext 文字层 + builtin 启发式 blocks），验证的是：
+//   - .20：页面正文超过内联上限也不会整页消失；
+//   - .32：builtin blocks 让文档走 skim（heading + 段首句），note 标 best-effort，
+//     每页带 [page N · skim: X of Y sentences] 标注。
+// 缺 PDF 工具或 fixture 时整组跳过。
 import assert from 'node:assert/strict';
 import { access, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -107,7 +110,7 @@ test('fixture 自检：page 4 正文确实大于内联上限（24k），page 6 �
   assert.doesNotMatch(page6, /[.!?;]/);
 });
 
-test('pages:"4"：单页正文 > 24k 字符时返回非空摘录 + 抽样说明', { skip, timeout: 120000 }, async () => {
+test('pages:"4"：单页正文 > 24k 字符时走 skim（heading + 段首句），页面不消失', { skip, timeout: 120000 }, async () => {
   await withServer(24000, async (client) => {
     const result = await overview(client, { pages: '4' });
     assert.notEqual(result.isError, true);
@@ -115,12 +118,15 @@ test('pages:"4"：单页正文 > 24k 字符时返回非空摘录 + 抽样说明'
     const data = result.structuredContent;
 
     assert.ok(text.length <= 24000, `text is ${text.length} chars`);
-    assert.match(text, /^\[page 4\s*\] \(text\)/m, 'page 4 must not vanish');
-    assert.match(text, /preview: sampled \d+ of \d+ sentences across page 4/);
+    assert.match(text, /^\[page 4 · skim: \d+ of \d+ sentences\] \(text\)/m, 'page 4 must not vanish');
+    assert.match(text, /^preview: skim — \d+ of \d+ sentences inlined across page 4;/m);
+    assert.match(text, /Skim was built from heuristic blocks \(best-effort\)/);
     assert.match(text, /every requested page is represented/);
-    assert.equal(data.preview.mode, 'sampled');
+    assert.equal(data.preview.mode, 'skim');
     assert.ok(data.preview.units > 0);
     assert.ok(data.preview.totalUnits > data.preview.units);
+    assert.equal(data.preview.headingsInlined, data.preview.headingsTotal);
+    assert.equal(data.preview.headingsSampled, false);
     assert.doesNotMatch(text, /every requested page\./);
     assert.doesNotMatch(text, /list below is the text/);
 
@@ -134,24 +140,25 @@ test('pages:"4"：单页正文 > 24k 字符时返回非空摘录 + 抽样说明'
   });
 });
 
-test('pages:"4-6"：长页被抽样时 4/5/6 三页都出现，超长单元带 …[+N chars]', { skip, timeout: 120000 }, async () => {
+test('pages:"4-6"：长页被 skim 时 4/5/6 三页都出现，超长单元带 …[+N chars]', { skip, timeout: 120000 }, async () => {
   await withServer(24000, async (client) => {
     const result = await overview(client, { pages: '4-6' });
     const text = result.content[0].text;
     const data = result.structuredContent;
 
     assert.ok(text.length <= 24000, `text is ${text.length} chars`);
-    assert.match(text, /^\[page 4\s*\] \(text\)/m);
-    assert.match(text, /^\[page 5\s*\] \(text\)/m);
-    assert.match(text, /^\[page 6\s*\] \(text\)/m);
+    assert.match(text, /^\[page 4 · skim: \d+ of \d+ sentences\] \(text\)/m);
+    assert.match(text, /^\[page 5 · skim: \d+ of \d+ sentences\] \(text\)/m);
+    assert.match(text, /^\[page 6 · skim: \d+ of \d+ sentences\] \(text\)/m);
     assert.match(text, /…\[\+\d+ chars\]/, 'page 6 is one unpunctuated unit and must be hard-truncated');
     assert.ok(data.preview.notRepresented.length === 0);
-    assert.equal(data.preview.mode, 'sampled');
+    assert.equal(data.preview.mode, 'skim');
+    assert.match(text, /Skim was built from heuristic blocks \(best-effort\)/);
     assert.doesNotMatch(text, /every requested page\./);
   });
 });
 
-test('不传 pages：28k+ 字符的整份文档仍在 24k 内，且不再宣称「每一页」', { skip, timeout: 120000 }, async () => {
+test('不传 pages：28k+ 字符的整份文档走 skim，且不再宣称「每一页」', { skip, timeout: 120000 }, async () => {
   await withServer(24000, async (client) => {
     const result = await overview(client, {});
     const text = result.content[0].text;
@@ -159,15 +166,15 @@ test('不传 pages：28k+ 字符的整份文档仍在 24k 内，且不再宣称�
 
     assert.ok(text.length <= 24000, `text is ${text.length} chars`);
     assert.equal(data.window.pages.length, 6);
-    assert.match(text, /^preview: sampled \d+ of \d+ sentences across pages 1-6/m);
+    assert.match(text, /^preview: skim — \d+ of \d+ sentences inlined across pages 1-6;/m);
+    assert.match(text, /Skim was built from heuristic blocks \(best-effort\)/);
     assert.doesNotMatch(text, /the list below is the text of every requested page/);
-    assert.doesNotMatch(text, /every requested page\./);
     if (data.preview.notRepresented.length > 0) {
       assert.match(text, /not represented: /);
     }
     // 每页至少一个单元：文字里应当出现全部有文字的页
     for (const page of [1, 2, 3, 4, 5, 6]) {
-      assert.match(text, new RegExp(`^\\[page ${page}\\s*\\]`, 'm'), `page ${page} must be represented`);
+      assert.match(text, new RegExp(`^\\[page ${page} · skim: \\d+ of \\d+ sentences\\]`, 'm'), `page ${page} must be represented`);
     }
   });
 });
