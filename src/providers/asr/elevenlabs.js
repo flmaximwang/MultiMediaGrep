@@ -99,7 +99,7 @@ export function createElevenLabsAsr({
       if (!apiKey) {
         // 正常情况下 index.js 会在缺 key 时直接返回一个「会报错」的 provider，根本走不到这里。
         throw new Error(
-          'ElevenLabs ASR is not configured: environment variable MMGREP_ASR_API_KEY is not set.',
+          'ElevenLabs ASR is not configured: environment variable MMGREP_ELEVENLABS_API_KEY is not set.',
         );
       }
 

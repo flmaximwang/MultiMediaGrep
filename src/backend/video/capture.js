@@ -12,7 +12,7 @@ import path from 'node:path';
 
 import { run } from '../../media/ffmpeg.js';
 import { ToolError } from '../../media/interface.js';
-import { extractSharpest } from '../../../vendor/dsh-video-storyboard/src/storyboard/sheet.js';
+import { extractSharpest } from './frames.js';
 import { makeWorkDir, uniqueSuffix } from './work.js';
 
 const MIN_EDGE = 256;

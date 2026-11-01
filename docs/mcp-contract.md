@@ -4,13 +4,13 @@
 >
 > 状态：设计稿 v1 · 对应 beads `MultiMediaGrep-9z5.4`（工具 MCP 契约）与 `MultiMediaGrep-32x`（图片 token 预算）
 >
-> 上游参考：`dsh-video-storyboard` v0.5.9（Apache-2.0，本地副本 `~/.hermes/cache/scratch/dsh-video-storyboard`）。
+> 上游参考：[`dsh-video-storyboard`](https://github.com/SAOS-3624/dsh-video-storyboard) v0.5.9（Apache-2.0）。本项目的视频模块部分派生自它，见 `NOTICE` / `CREDITS.md`。
 
 ---
 
 ## 1. 这份契约是什么
 
-MultiMediaGrep 是一个 **stdio MCP server**。它给任何 MCP client 的 agent 提供「看 / 听」本地媒体的能力：
+MultiMediaGrep 是一个 **MCP server**：默认走 stdio（由宿主拉起），也可以显式开启 Streamable HTTP（`POST /mcp`）。它给任何 MCP client 的 agent 提供「看 / 听」本地媒体的能力：
 
 | 媒体 | agent 能拿到什么 |
 |---|---|
@@ -21,8 +21,8 @@ MultiMediaGrep 是一个 **stdio MCP server**。它给任何 MCP client 的 agen
 三条不可动摇的边界：
 
 1. **server 自己绝不调用 LLM。** server 只做「取帧 / 转写 / 排版」，理解由 agent 自己的多模态模型完成。
-2. **server 不做取数。** 只收本地文件的绝对路径；拒绝 URL；不碰 cookie / 凭据 / 下载器。
-3. **server 不做鉴权、不落用户凭据。** 需要字幕就让取数层把字幕文件交给它。
+2. **server 不做取数。** 只收本地文件的绝对路径；拒绝 URL；不碰 cookie、不替你管理凭据、不下载。provider key 只由调用方显式提供（环境变量或 HTTP 请求头）。
+3. **server 不保存用户凭据。** stdio 模式不做鉴权；HTTP 模式只做 Bearer 令牌这一层接入控制。请求头里的 provider key 只活在这一个请求内，不落盘、不缓存、不回显。需要字幕就让取数层把字幕文件交给它。
 
 契约里出现的一切**工具名、参数名、字段名、工具描述文本**都是英文（agent 的 API 面）；本文件的**正文说明是中文**。
 
@@ -53,14 +53,14 @@ MultiMediaGrep 是一个 **stdio MCP server**。它给任何 MCP client 的 agen
 
 | mediaType | 后端 | 关键组成 |
 |---|---|---|
-| `video` | **视频后端** | vendor 进来的 `dsh-video-storyboard` 管线：`probe.js`（ffprobe）、`scan`/`plan`（镜头检测与分格）、`frames`/`sheet`（取帧与拼图）、`segments`/`asr`（转写） |
+| `video` | **视频后端** | 本项目自己的视频管线（部分模块派生自 `dsh-video-storyboard`）：`probe.js`（ffprobe）、`shots.js`/`storyboard.js`（镜头检测与分格）、`frames.js`/`sheet.js`（取帧与拼图）、`transcript.js`（转写） |
 | `audio` | **录音后端** | ffmpeg 抽 16 kHz 单声道 WAV → ASR provider → 带时间轴的 segments；可选音频包络图 |
 | `document` | **文档后端** | 页面栅格化（页图）＋ 可选文档解析 provider（每页文字） |
 
 ```mermaid
 flowchart TD
   A["media_* tool call<br/>path = 本地绝对路径"] --> B{"mediaType?<br/>扩展名 + 容器嗅探"}
-  B -->|video| V["视频后端<br/>vendor dsh-video-storyboard"]
+  B -->|video| V["视频后端<br/>本项目 video 模块<br/>（部分派生自上游）"]
   B -->|audio| AU["录音后端<br/>ffmpeg → WAV → ASR"]
   B -->|document| D["文档后端<br/>页面栅格化"]
   B -->|无法判定| E["✗ UNSUPPORTED_MEDIA_TYPE"]
@@ -260,6 +260,29 @@ progress token 形如 `media_overview 3/5 · scanning 0-300s`，让宿主 UI 能
 | 落盘产物 | `content.md` + `segments.jsonl` + `manifest.json`（三个必备）+ `document.json`（可选，cangjie `SourceDocument Contract v1`） |
 
 细节见 §9。
+
+### 2.8 传输方式：stdio 与 HTTP
+
+| | stdio（默认） | Streamable HTTP（显式开启） |
+|---|---|---|
+| 怎么开 | 不传 `--http`、不设 `MMGREP_TRANSPORT` | `--http` 或 `MMGREP_TRANSPORT=http` |
+| 监听 | 不监听端口；宿主用 stdin/stdout 通信 | `POST /mcp`，默认 `127.0.0.1:3927` |
+| 鉴权 | 无（进程由宿主拉起，边界是宿主） | 可选 Bearer 令牌；配了令牌后每个请求都要带 `Authorization: Bearer <令牌>` |
+| 凭据 | 只读 server 启动时的环境变量 / 配置 | 可用 `x-mmgrep-*` 请求头逐请求覆盖（见 §12.7） |
+| 生命周期 | 进程阻塞到 client 关闭 stdin | 无状态：每个请求新建 server + transport，处理完即关 |
+| 工具语义 | 完全相同 | 完全相同 |
+
+两边的差异只影响「怎么连、用谁的 key」，不影响任何工具的参数、返回结构、错误码或图片预算。
+HTTP 模式下，带了凭据头的请求会用本次请求解析出的配置新建 provider；**凭据不按请求缓存**，
+请求结束即丢弃。没带任何凭据头的请求复用启动时的 runtime。
+
+HTTP 端点对 `Accept` / `Content-Type` 有要求：请求必须同时接受 `application/json` 与
+`text/event-stream`（否则 406），`Content-Type` 必须是 `application/json`（否则 415）。
+端点只接受 `POST /mcp`；其它路径 404，其它方法 405。配了令牌时，缺失或错误的 `Authorization`
+返回 401（`WWW-Authenticate: Bearer realm="multimediagrep"`），且鉴权在方法判断之前执行。
+请求体上限 1 MiB（超出 413）；单次请求超时 120 s，超时会中止在途工具调用，响应尚未开始时回 504。
+
+> HTTP 模式是 **opt-in**：不显式开启时 server 不监听任何端口，现有的 stdio 接入方式不需要改动。
 
 ---
 
@@ -1329,20 +1352,27 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 
 | 变量 | 类型 | 默认值 | 作用 | 没配 / 配错时的行为 |
 |---|---|---|---|---|
-| `MMGREP_ASR_PROVIDER` | string | `none` | 生效的 ASR 后端。`none` = 完全不做转写；`elevenlabs` = ElevenLabs；其余值按 OpenAI `/audio/transcriptions` 方言的兼容服务处理 | `none` → `capabilities.asr.available = false`，`reason` 写「MMGREP_ASR_PROVIDER is \"none\"」。此时**只出画面**。另外：音频体检判定 `too-quiet` / `silent` 时**即使配了 provider 也不跑 ASR**（见 §4.3.1） |
-| `MMGREP_ASR_API_KEY` | string | 空 | provider 的 API key | 云端 provider 缺 key → `PROVIDER_NOT_CONFIGURED`（不猜、不匿名试）。若 `MMGREP_ASR_BASE_URL` 指向回环地址（`127.0.0.1` / `localhost` / `[::1]`），则**不需要** key |
-| `MMGREP_ASR_BASE_URL` | string | `https://api.elevenlabs.io/v1` | provider 的 API 基址 | 用默认值。填回环地址即视为本地服务，免 key |
-| `MMGREP_ASR_MODEL` | string | `scribe_v1` | 转写模型名 | 用默认值。模型不被 provider 接受 → `PROVIDER_FAILED`，并把 provider 的原话带上 |
+| `MMGREP_ASR_PROVIDER` | string | `none` | 生效的 ASR 后端。`none` = 完全不做转写；`elevenlabs` = ElevenLabs；`openai-compatible` = 按 OpenAI `/audio/transcriptions` 方言的兼容服务。选定后只读取该 provider 自己那组 key / baseUrl / model 变量 | `none` → `capabilities.asr.available = false`，`reason` 写「MMGREP_ASR_PROVIDER is \"none\"」。此时**只出画面**。另外：音频体检判定 `too-quiet` / `silent` 时**即使配了 provider 也不跑 ASR**（见 §4.3.1）。未知 provider id → 记 warning 并回落到 `none` |
+| `MMGREP_ELEVENLABS_API_KEY` | string | 空 | `elevenlabs` 的 API key | 云端 provider 缺 key → `PROVIDER_NOT_CONFIGURED`（不猜、不匿名试）。若 `MMGREP_ELEVENLABS_BASE_URL` 指向回环地址（`127.0.0.1` / `localhost` / `[::1]`），则**不需要** key |
+| `MMGREP_ELEVENLABS_BASE_URL` | string | `https://api.elevenlabs.io/v1` | ElevenLabs 的 API 基址 | 用默认值。填回环地址即视为本地服务，免 key |
+| `MMGREP_ELEVENLABS_MODEL` | string | `scribe_v1` | ElevenLabs 转写模型名 | 用默认值。模型不被 provider 接受 → `PROVIDER_FAILED`，并把 provider 的原话带上 |
+| `MMGREP_OPENAI_COMPATIBLE_API_KEY` | string | 空 | `openai-compatible` 的 API key | 缺 key → `PROVIDER_NOT_CONFIGURED`；回环地址免 key |
+| `MMGREP_OPENAI_COMPATIBLE_BASE_URL` | string | `https://api.openai.com/v1` | OpenAI 兼容服务的 API 基址 | 用默认值；自建服务显式填自己的地址 |
+| `MMGREP_OPENAI_COMPATIBLE_MODEL` | string | `whisper-1` | OpenAI 兼容服务的转写模型名 | 用默认值。**不会**继承 ElevenLabs 的 `scribe_v1`；模型不被接受 → `PROVIDER_FAILED` |
 | `MMGREP_ASR_LANGUAGE` | string | `auto` | 强制语言（BCP-47，如 `zh` / `en`）。`auto` = 由 provider 自动判定 | 用默认值。填了不被支持的语言 → `PROVIDER_FAILED`（provider 原话） |
+
+> 兼容兜底：`MMGREP_ASR_API_KEY` / `MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 在对应的 provider 专属变量未设置时仍然生效，但会在 `config.warnings` 里记一条弃用提示；计划在 0.2.0 删除。旧 `MMGREP_ASR_MODEL` 与 `openai-compatible` 同用时还会额外警告该值可能不适配。
 
 ### 12.3 文档解析 provider
 
 | 变量 | 类型 | 默认值 | 作用 | 没配 / 配错时的行为 |
 |---|---|---|---|---|
-| `MMGREP_DOC_PROVIDER` | string | `none` | 文档解析后端。`none` = 不抽文字层；`mineru` = MinerU | `none` → 文档**只出页缩略图**，`pages[].text` 为空，`reason` 写明「MMGREP_DOC_PROVIDER is \"none\"」 |
-| `MMGREP_DOC_API_KEY` | string | 空 | provider 的 API key | 云端 provider 缺 key → `PROVIDER_NOT_CONFIGURED`；回环地址免 key |
-| `MMGREP_DOC_BASE_URL` | string | 见 §13 待确认项 | provider 的 API 基址 | 用内置默认值 |
-| `MMGREP_DOC_MODEL` | string | 见 §13 待确认项 | 解析模型名 | 用内置默认值 |
+| `MMGREP_DOC_PROVIDER` | string | `none` | 文档解析后端。`none` = 不抽文字层；`mineru` = MinerU | `none` → 文档**只出页缩略图**，`pages[].text` 为空，`reason` 写明「MMGREP_DOC_PROVIDER is \"none\"」。未知 provider id → 记 warning 并回落到 `none` |
+| `MMGREP_MINERU_API_KEY` | string | 空 | MinerU 的 API token | 云端 provider 缺 key → `PROVIDER_NOT_CONFIGURED`；回环地址免 key |
+| `MMGREP_MINERU_BASE_URL` | string | `https://mineru.net/api/v4` | MinerU 的 API 基址 | 用内置默认值 |
+| `MMGREP_MINERU_MODEL` | string | 空 | MinerU 的解析模型名；留空 = 服务端默认 | 用内置默认值 |
+
+> 兼容兜底：`MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL` 在 `MMGREP_MINERU_*` 未设置时仍然生效，并记一条弃用提示；计划在 0.2.0 删除。
 
 ### 12.4 OCR provider
 
@@ -1368,6 +1398,46 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 
 > **MCP 的 stdout 是协议通道**：日志一律走 stderr，`LOG_LEVEL` 控制不了这一点。
 
+### 12.6 传输（HTTP 模式）
+
+| 变量 | 类型 | 默认值 | 作用 | 没配 / 配错时的行为 |
+|---|---|---|---|---|
+| `MMGREP_TRANSPORT` | string | `stdio` | 传输方式：`stdio`（默认）或 `http` | 写错 → 记 warning 并回落 `stdio` |
+| `MMGREP_HTTP_HOST` | string | `127.0.0.1` | HTTP 监听地址 | 非回环地址且没配令牌 → 记 warning（仍会启动并接受未认证请求） |
+| `MMGREP_HTTP_PORT` | integer | `3927` | HTTP 监听端口（1–65535） | 非法值 → 记 warning 并用 `3927` |
+| `MMGREP_HTTP_TOKEN` | string | 空 | Bearer 令牌；设置后每个请求必须带 `Authorization: Bearer <令牌>`。任意 UTF-8 字符都可以（比较时按原始字节做，不走字符串编码） | 空 = 不鉴权。只认 Authorization 头，不接受 query string |
+
+命令行 `--http` / `--host` / `--port` / `--token` 优先于环境变量；`--host` / `--port` / `--token`
+不带 `--http` 时不会改变传输方式。端点的 `Accept` / `Content-Type` 要求与状态码见 §2.8。
+
+### 12.7 每请求凭据头（仅 HTTP）
+
+请求头名与 provider 专属环境变量一一对应（`MMGREP_FOO_BAR` → `x-mmgrep-foo-bar`）：
+
+| 请求头 | 作用 | 对应环境变量 |
+|---|---|---|
+| `x-mmgrep-asr-provider` | 本次请求的 ASR provider：`elevenlabs` / `openai-compatible` | `MMGREP_ASR_PROVIDER` |
+| `x-mmgrep-elevenlabs-api-key` | ElevenLabs key | `MMGREP_ELEVENLABS_API_KEY` |
+| `x-mmgrep-elevenlabs-base-url` | ElevenLabs 基址 | `MMGREP_ELEVENLABS_BASE_URL` |
+| `x-mmgrep-elevenlabs-model` | ElevenLabs 模型 | `MMGREP_ELEVENLABS_MODEL` |
+| `x-mmgrep-openai-compatible-api-key` | OpenAI 兼容服务 key | `MMGREP_OPENAI_COMPATIBLE_API_KEY` |
+| `x-mmgrep-openai-compatible-base-url` | OpenAI 兼容服务基址 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` |
+| `x-mmgrep-openai-compatible-model` | OpenAI 兼容服务模型 | `MMGREP_OPENAI_COMPATIBLE_MODEL` |
+| `x-mmgrep-asr-api-key` | 通用兜底 key（旧共用变量语义） | `MMGREP_ASR_API_KEY` |
+| `x-mmgrep-doc-provider` | 本次请求的文档解析 provider：`mineru` | `MMGREP_DOC_PROVIDER` |
+| `x-mmgrep-mineru-api-key` | MinerU token | `MMGREP_MINERU_API_KEY` |
+| `x-mmgrep-mineru-base-url` | MinerU 基址 | `MMGREP_MINERU_BASE_URL` |
+| `x-mmgrep-mineru-model` | MinerU 模型 | `MMGREP_MINERU_MODEL` |
+| `x-mmgrep-doc-api-key` | 通用兜底 token（旧共用变量语义） | `MMGREP_DOC_API_KEY` |
+
+优先级（逐字段计算）：该 provider 的专属请求头 > 通用 `x-mmgrep-<kind>-api-key`（只作用于 apiKey）
+> 该 provider 的环境变量 > 启动配置（仅当 provider 相同）> provider 内置默认值。
+
+- 请求头里的 provider 选择**只对当前请求生效**；未知 provider id → HTTP 400 / JSON-RPC `-32602`。
+- 空头（空串或全空白）等于没带，不会覆盖服务器配置。
+- 只带 provider 专属 key 头、却没选中该 provider（`x-mmgrep-asr-provider` 缺失且服务器 provider 为 `none`）时，该头不会自动启用 provider。
+- 这些头的**值**不写日志、不进缓存、不出现在响应里；日志中出现的头值统一替换为 `[redacted]`。
+
 ---
 
 ## 13. 与上游 `dsh-video-storyboard` 的差异
@@ -1380,7 +1450,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 |---|---|---|---|
 | 1 | 按**媒体**命名：`video_probe` / `video_storyboard` / `video_zoom` / `video_locate` / `video_subtitles` | 按**动作**命名：`media_probe` / `media_overview` / `media_zoom` / `media_locate` / `video_subtitles` | 跨媒体复用：同一动作在视频 / 录音 / 文档上语义一致，agent 学一套动词就够。`video_storyboard` → `media_overview`（"storyboard" 是视频特有的词，录音没故事板）。`video_subtitles` 是唯一保留媒体前缀的，因为「字幕轨 / 字幕文件」本身就是媒体专属概念 |
 | 2 | 参数名 `input` | 参数名 `path` | `path` 直接表达「本地路径」这条硬约束；`input` 什么都能装 |
-| 3 | `input` 接受 http(s) 链接；另有 `cookies` / `allowAnonymous` / `quality` / `scanHeight` / `zoomHeight` / `size` | **全部删除** | server 不做取数、不碰凭据。这些参数是为 yt-dlp 下载链路的清晰度服务的，本地文件用不上 |
+| 3 | `input` 接受 http(s) 链接；另有 `cookies` / `allowAnonymous` / `quality` / `scanHeight` / `zoomHeight` / `size` | **全部删除** | server 不做取数、不碰 cookie、不下载。这些参数是为 yt-dlp 下载链路的清晰度服务的，本地文件用不上 |
 | 4 | `from` / `to` | `start` / `end` | 与 `at`（时刻）、`pages`（页码）在语义上更整齐；`from` 在 JS/DB 里含义太多 |
 | 5 | 无 `pages` | 新增 `pages` | 文档没有「秒」，只有页码。上游完全没有文档概念 |
 | 6 | 无裁切参数（只有字幕用的 `band`） | 新增 `crop` | 特写的核心能力就是取局部 |
@@ -1395,7 +1465,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | 15 | 返回 `{ images: [attachment], text }`，图片走 DSH `attachments` 服务 | 返回标准 MCP content blocks：`{type:"image", data: base64, mimeType}` + `structuredContent` | 我们是标准 MCP server，不依赖 DSH 宿主。附带收益：任何 MCP client 都能直接看到图 |
 | 16 | `video_subtitles` = 把**硬字幕**裁成一条竖长图（`subtitle-strip.js` / `buildSubtitleStrip`） | `video_subtitles` = 读字幕文件 / 内嵌字幕轨，解析成**带时间轴的文本段落**，不出图 | 需求定位不同。我们先做「读已有字幕」这件高频事；裁硬字幕带的能力可以由 `media_zoom` 的 `crop` 部分覆盖，属于可后置项 |
 | 17 | `transcriptFile` 只吃 SRT 与 JSON（`[{start,end,text}]` / `[{from,to,text}]` / B 站 `{body:[…]}`） | 吃 `.srt` / `.vtt` / `.ass` / `.ssa` | 字幕文件更通用。**注意**：VTT/ASS 的解析是**新代码**，上游没有现成实现（上游 `transcript-file.js` 只有 SRT + JSON） |
-| 18 | `video_locate` 用 LCS 归一化匹配（`locate.js` 的 `matchSegments`，中英文同构、忽略标点空白） | 沿用同一套打分（直接复用 vendor 进来的实现） | 上游行为已验证（阈值 `minScore=0.34`、同分短句优先），不重写 |
+| 18 | `video_locate` 用 LCS 归一化匹配（上游 `locate.js` 的 `matchSegments`，中英文同构、忽略标点空白） | 沿用同一套打分（由本项目 `src/media/match.js` 独立实现，思路来自上游） | 上游行为已验证（阈值 `minScore=0.34`、同分短句优先），不重写 |
 | 19 | `video_locate` 纯文本、永不出图 | 默认纯文本，`includeFrame: true` 时附一张最佳匹配处的画面 | 保持上游的「定位不花像素」哲学，同时给需要看图的 agent 一个出口 |
 | 20 | 无文档形态的 locate | `media_locate` 支持文档（返回页码 + 可选页图） | 跨媒体统一 |
 | 21 | 无进度通知 | 长任务发 MCP progress notification | 上游靠 DSH 宿主；我们是标准 MCP，用标准机制 |
@@ -1413,7 +1483,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | URL 解析与下载（yt-dlp 集成） | `src/storyboard/fetch.js`（`resolveInput`）、`src/storyboard/ytdlp.js`、`src/storyboard/direct-url.js` | server 不做取数。取数在取数层（skills / 其它 agent），本 server 只处理已经落到本地的文件 |
 | 浏览器时间线抓取 | `src/storyboard/browser-time.js` | 同上，属取数层 |
 | 站点字幕轨抓取（如 C 站 CC） | `src/storyboard/subtitles.js`（`fetchRemoteSubtitles`） | 同上 |
-| cookies / `allowAnonymous` / `DSH_VIDEO_COOKIES` | `src/storyboard/tool-spec.js` | 不碰凭据 |
+| cookies / `allowAnonymous` / `DSH_VIDEO_COOKIES` | `src/storyboard/tool-spec.js` | 不碰 cookie |
 | 下载清晰度控制（`quality` / `scanHeight` / `zoomHeight` / `size`） | 同上 | 本地文件永远读原分辨率，这些旋钮无意义 |
 | 硬字幕带裁切（把画面上的字幕裁成竖长图） | `src/storyboard/subtitle-strip.js` | 与本契约 `video_subtitles` 的语义不同（见 §13.1 #16）。作为 `media_zoom` + `crop` 的后置项 |
 | 字幕带自动检测（`band` 参数 + 检测逻辑） | `src/storyboard/subtitle-strip.js` | 同上 |
@@ -1455,15 +1525,15 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | # | 问题 | 我的建议 | 影响面 |
 |---|---|---|---|
 | 1 | **图片预算的四个数**（4 张 / 16 格 / 1600 px / 4000 token）是推导值，不是实测值 | 等 beads `9z5.3`（Claude Code / Hermes 实测）出来后按实测收紧 | §10 全部；实现必须先复核 |
-| 2 | **`MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 的默认值** | 建议保留 `https://api.elevenlabs.io/v1` + `scribe_v1`，但**本仓库未联网验证** ElevenLabs 当前的转写 endpoint 与模型名，落地前需人工核对 | §12.2；配错会直接 `PROVIDER_FAILED` |
-| 3 | **`MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL` 的默认值** | 同上，MinerU 的接入方式与模型名**未在本仓库确认**（上游无文档后端，无从参照） | §12.3 |
+| 2 | **`MMGREP_ELEVENLABS_BASE_URL` / `MMGREP_ELEVENLABS_MODEL` / `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_MODEL` 的默认值** | ElevenLabs 保留 `https://api.elevenlabs.io/v1` + `scribe_v1`，OpenAI 兼容保留 `https://api.openai.com/v1` + `whisper-1`；但**本仓库未联网验证**各家当前的转写 endpoint 与模型名，落地前需人工核对 | §12.2；配错会直接 `PROVIDER_FAILED` |
+| 3 | **`MMGREP_MINERU_BASE_URL` / `MMGREP_MINERU_MODEL` 的默认值** | 基址默认 `https://mineru.net/api/v4`、模型默认留空；MinerU 的接入方式与模型名**未在本仓库确认**（上游无文档后端，无从参照） | §12.3 |
 | 4 | **同目录字幕自动发现是否默认开启** | 我选了**默认开启**（§8.5），因为它命中率高，且命中的文件路径一定会在返回值里报出来，不是静默行为 | §8.5；若嫌意外，可改为默认关闭、需显式 `transcriptFile` |
 | 5 | **`media_locate` 默认是否出图** | 我选了**默认不出图**（`includeFrame` 默认 `false`），沿用上游「定位不花像素」的定位 | §7.2 |
 | 6 | **文档 `cells` 的默认 6** | 视频默认 9、文档默认 6。文档格是页缩略图，6 页一张比 9 页一张更容易看清页内排版 | §10.3；可调 |
 | 7 | **`media_zoom` 的选帧规则** | 时间窗内选「最清晰的一帧」（上游 `pick: sharp` 的 Laplacian 方差口径）。也可改成「取中点帧」——更可预测但可能落在转场上 | §6.3 `target.selection` |
 | 8 | **`structuredContent` 的宿主兼容性** | 契约里定义了结构化 payload，但**是否所有宿主都消费** `structuredContent` 需要实现时按 SDK 版本验证；不支持时退化为只返回 content 文本块（内容不变） | §4.3 / §5.3 / §6.3 / §7.3 / §8.3 |
 | 9 | **ASR 的分片策略与长音频** | 建议沿用上游「≤45 s 切片、切在静音中点」的口径（上游 `asr-contract.md` 明确警告固定长度切分会切词） | §12.2 |
-| 10 | **vendor 代码的许可与署名** | 上游 v0.5.0 起为 **Apache-2.0**（v0.5.0 之前是 MIT）。vendor 进来必须保留 `LICENSE` / `NOTICE` / `CREDITS.md`，并在 README 里署名 | 打包与分发 |
+| 10 | **派生代码的许可与署名** | 上游 v0.5.0 起为 **Apache-2.0**（v0.5.0 之前是 MIT）。派生进来的部分必须保留上游署名：根目录 `NOTICE` 按 §4(d) 复现版权与授权，每个改动文件顶部按 §4(b) 标注修改；完整清单见 `CREDITS.md` | 打包与分发 |
 | 11 | **音频体检的阈值** | 我选了 `meanDbfs >= -35` 且 `speechRatio >= 0.05` 为「有有效声音」。这两个数是拍的，没有实测样本支撑；不同录音（手机远讲、会议室、播客）差别很大 | §4.3.1 / §12.5；上线前最好用一批真实录音回归 |
 | 12 | **`speechRatio` 的静音门限（-45 dBFS）** | 短时 RMS 门限取 -45 dBFS。同样没实测 | §4.3.1；环境噪声大的录音需要调 |
 | 13 | **`source = "ocr"` 的独立 provider** | 文档 provider（MinerU）自带 OCR，`MMGREP_OCR_PROVIDER` 只用于独立本地 OCR 路径（tesseract）。两条路是否要并存，需要产品定 | §12.4 |

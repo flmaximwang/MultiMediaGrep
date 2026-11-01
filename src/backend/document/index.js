@@ -27,6 +27,7 @@ import { ffprobeJson } from '../../media/ffmpeg.js';
 import { ToolError, validateCrop } from '../../media/interface.js';
 import { matchSegments } from '../../media/match.js';
 import { IMAGE_LIMITS, layoutForCells } from '../../server/images.js';
+import { providerApiKeyEnv } from '../../server/config.js';
 import { createPdfSupport, normalizePageText } from './pdf.js';
 import {
   DEFAULT_LOCATE_FRAME_MAX_EDGE,
@@ -81,7 +82,7 @@ const DOCUMENT_FORMATS_HINT =
   + 'and plain text (.txt .md .markdown).';
 
 const OCR_HINT =
-  'Configure a document parser with MMGREP_DOC_PROVIDER=mineru and MMGREP_DOC_API_KEY, '
+  'Configure a document parser with MMGREP_DOC_PROVIDER=mineru and MMGREP_MINERU_API_KEY, '
   + 'or use media_overview to work from the page images.';
 
 /* ------------------------------------------------------------------ *
@@ -306,7 +307,7 @@ function docProviderState(ctx) {
       available: false,
       id: provider.id ?? null,
       provider: null,
-      reason: `MMGREP_DOC_API_KEY is not set for provider "${config.provider ?? provider.id ?? 'unknown'}".`,
+      reason: `${providerApiKeyEnv('doc', config.provider)} is not set for provider "${config.provider ?? provider.id ?? 'unknown'}".`,
     };
   }
   return {
@@ -339,7 +340,7 @@ function toProviderFailure(error, secret = null) {
   // 已知的 key 原文先整段抹掉，再做通用的 Bearer / sk- / api_key 模式脱敏。
   if (secret) message = message.split(String(secret)).join('***');
   message = redactSecrets(message);
-  const code = /MMGREP_DOC_API_KEY.*(?:missing|not set)|api[ _-]?key.*(?:missing|not set)/i.test(message)
+  const code = /MMGREP_[A-Z0-9_]+_API_KEY.*(?:missing|not set)|api[ _-]?key.*(?:missing|not set)/i.test(message)
     ? 'PROVIDER_NOT_CONFIGURED'
     : 'PROVIDER_FAILED';
   return { code, message };
@@ -347,8 +348,8 @@ function toProviderFailure(error, secret = null) {
 
 function providerFailureHint(code) {
   return code === 'PROVIDER_NOT_CONFIGURED'
-    ? 'Set MMGREP_DOC_API_KEY, or unset MMGREP_DOC_PROVIDER to fall back to page images.'
-    : 'Retry, check MMGREP_DOC_BASE_URL / MMGREP_DOC_MODEL, or unset MMGREP_DOC_PROVIDER to fall back to page images.';
+    ? 'Set the provider-specific API key (for MinerU: MMGREP_MINERU_API_KEY), or unset MMGREP_DOC_PROVIDER to fall back to page images.'
+    : 'Retry, check MMGREP_MINERU_BASE_URL / MMGREP_MINERU_MODEL, or unset MMGREP_DOC_PROVIDER to fall back to page images.';
 }
 
 /** provider 的 pages 参数：连续区间用 {from,to}，离散页用 {list}。 */

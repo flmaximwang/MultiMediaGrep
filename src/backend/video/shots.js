@@ -1,23 +1,42 @@
 /**
- * scan.js — HSV 加权镜头切分（PySceneDetect ContentDetector 思路的独立实现）。
+ * shots.js — HSV 加权镜头切分（PySceneDetect ContentDetector 思路的独立实现）。
  *
  * 为什么不用 `ffmpeg scdet`：它算的是 MAFD（亮度类），对"同亮度换色"失明。
  * 实测同一段测试片：scdet 默认阈值召回 4/9，本实现 9/9，零误检。
  *
  * 做法：ffmpeg 把画面缩到 64×36 rawvideo 喂进来（2304 像素/帧，解码量极小），
  * 逐像素转 HSV，与上一帧求三通道绝对差均值，得到 0–255 的分数。
+ *
+ * 来源与改编说明（Apache-2.0 §4(b) 变更声明）：
+ *   派生自 dsh-video-storyboard v0.5.9 的 `src/storyboard/scan.js`，
+ *   © 2026 SAOS-3624，Apache-2.0 许可。
+ *
+ *   保留（逻辑逐字照搬，上游的中文"为什么"注释原样保留）：
+ *   常量 SCAN_W / SCAN_H / DEFAULT_THRESHOLD / HUE_WEIGHT / SAT_WEIGHT /
+ *   VAL_WEIGHT / REF_V / GAIN_MAX / V_FLOOR / MIN_CUT_SCORE / BAR_MEAN /
+ *   BAR_MAX / BAR_CAP / LONG_SEC；
+ *   frameToHsv、scorePair、barFraction、normalizeScores、cutBudget、
+ *   autoThreshold、suppressClose、cutsFromEvents、decideCuts、assessDegraded、
+ *   quantile、detectGradual；以及 scanShots 的 ffmpeg 调用参数、长时差环形缓冲、
+ *   逐行 V 累加与"渐变转场并入切点"的合并逻辑。
+ *
+ *   变更：
+ *   - scanShots 只返回 `{ cuts, threshold, degraded, frames }`；
+ *     逐帧指纹（FP_W/FP_H/PRINT_FPS、packPrints/unpackPrints/packedFps）、
+ *     细扫重判（refineCutsByWindow）、黑场检测（detectDarkRuns）与
+ *     统计摘要（scanSummary 及结果里的 longStats/means/summary/bars 字段）
+ *     在本项目没有消费者，已删除。
+ *   - `rgbToHsv`（上游只有测试用）与 `spikeCuts`（已被 decideCuts 取代）删除。
+ *   - ffmpeg 改由本仓库 `media/ffmpeg.js` 的 `resolveBinary('ffmpeg')` 解析，
+ *     以尊重 MMGREP_FFMPEG_PATH。
  */
 
 import { spawn } from 'node:child_process';
 
-import { DEFAULT_FFMPEG } from './probe.js';
-import { describeMediaSearch } from './binaries.js';
+import { resolveBinary } from '../../media/ffmpeg.js';
 
 export const SCAN_W = 64;
 export const SCAN_H = 36;
-/** 指纹尺寸（供 flash.js 判闪光）：16×9 = 144 字节/帧，60 分钟片子约 13 MB */
-export const FP_W = 16;
-export const FP_H = 9;
 export const DEFAULT_THRESHOLD = 15;
 export const HUE_WEIGHT = 1;
 export const SAT_WEIGHT = 1;
@@ -45,24 +64,6 @@ export const BAR_MAX = 24;
 export const BAR_CAP = 0.35;
 /** 长时差窗口（秒）。相邻帧差看不见渐变转场（叠化/淡入淡出），隔这么久看才看得见 */
 export const LONG_SEC = 0.4;
-/** RGB(0-255) → HSV，各通道归一到 0-255（H 由角度缩放到 0-255） */
-export function rgbToHsv(r, g, b) {
-  const rn = r / 255;
-  const gn = g / 255;
-  const bn = b / 255;
-  const max = Math.max(rn, gn, bn);
-  const min = Math.min(rn, gn, bn);
-  const d = max - min;
-  let h = 0;
-  if (d !== 0) {
-    if (max === rn) h = ((gn - bn) / d) % 6;
-    else if (max === gn) h = (bn - rn) / d + 2;
-    else h = (rn - gn) / d + 4;
-    h *= 60;
-    if (h < 0) h += 360;
-  }
-  return [(h / 360) * 255, (max === 0 ? 0 : d / max) * 255, max * 255];
-}
 
 /**
  * 把整帧 RGB 缓冲转成 HSV 缓冲。out 可复用，避免每帧分配。
@@ -114,7 +115,6 @@ export function scorePair(prev, cur) {
   const totalWeight = HUE_WEIGHT + SAT_WEIGHT + VAL_WEIGHT;
   return sum / ((cur.length / 3) * totalWeight);
 }
-
 
 /**
  * 黑边占比：整窗里"一直是黑的"顶部/底部行占多少。
@@ -173,94 +173,6 @@ export function normalizeScores(stats, means, {
     // （概念 PV 22.25s 那一刀就是这么丢的：两个版本在这一帧都是 48 分，门槛却从 47 涨到 79）。
     return { ...s, raw: s.score, score: (s.score * gain) / content, gain: +gain.toFixed(2) };
   });
-}
-
-/** 逐帧指纹存进缓存时要抽稀到这么多 fps。0.125s 一帧 = 最短格子（0.5s）里也够分 4 张。 */
-export const PRINT_FPS = 8;
-
-/**
- * 把逐帧指纹压成**稀疏序列 + base64**，供缓存。
- *
- * 为什么要压：原样存 7500 个 `Uint8Array`，`JSON.stringify` 会写成 `{"0":12,"1":34,…}`，
- * 60 分钟片子几十 MB 且读回来类型全丢（缓存注释里记过）。抽稀到 8fps 之后：
- * 144 B × 8fps × 7200s ≈ 8 MB 原始、base64 后 11 MB —— 而它是 `frameDiv` 判据的唯一来源，
- * **不存就等于"第一次跑和第二次跑摊开方式不一样"**，那种 bug 最难查。
- *
- * @param {Uint8Array[]} prints 逐帧 16×9
- * @param {number} fps 原视频帧率
- */
-export function packPrints(prints, fps) {
-  if (!Array.isArray(prints) || prints.length === 0) return null;
-  const step = Math.max(1, Math.round((fps || 25) / PRINT_FPS));
-  const kept = [];
-  for (let i = 0; i < prints.length; i += step) {
-    if (prints[i]?.length === FP_W * FP_H) kept.push(prints[i]);
-  }
-  if (kept.length === 0) return null;
-  const buf = Buffer.alloc(kept.length * FP_W * FP_H);
-  kept.forEach((p, i) => buf.set(p, i * FP_W * FP_H));
-  // step 要**真的**记下来：解包后 fps = 原 fps / step，算错一位整条时间轴就偏了。
-  return { step, fps: +(fps || 25).toFixed(3), data: buf.toString('base64') };
-}
-
-/** 解回 `Uint8Array[]`（抽稀后的版本，实际帧率 = packed.fps / packed.step）。 */
-export function unpackPrints(packed) {
-  if (!packed?.data) return null;
-  const buf = Buffer.from(String(packed.data), 'base64');
-  const size = FP_W * FP_H;
-  const n = Math.floor(buf.length / size);
-  if (n === 0) return null;
-  const out = new Array(n);
-  for (let i = 0; i < n; i++) out[i] = new Uint8Array(buf.subarray(i * size, (i + 1) * size));
-  return out;
-}
-
-/** 抽稀后的实际帧率（给 frameDiversityOf 的时间→下标换算用） */
-export function packedFps(packed, fallback = 0) {
-  if (!packed) return fallback;
-  const step = Math.max(1, Number(packed.step) || 1);
-  return (Number(packed.fps) || fallback) / step;
-}
-
-/**
- * 按"相对本地基线"找切点：分数（= 相邻两帧的画面变化百分比）突然**比它附近的常态高很多**才算一刀。
- *
- * 为什么需要它：固定阈值对两种内容无解 ——
- *  - PPT/网课：平时变化 0.6，换页瞬间 40。固定阈值 15 能抓到换页，但"只多出一个要点"这种
- *    小改动只有 5，被阈值挡掉；而 5 其实是基线（0.6）的 8 倍。
- *  - 匀速运镜/长镜头：每帧都在变，基线本身就有 20，固定阈值要么全放过要么全挡掉；
- *    真要在这段里找剪辑，只能看"比这段自己的常态高多少"。
- *
- * 所以判据从"分数 > 15"改成"分数 > max(绝对下限, k × 本地中位数)"。
- * 返回的每一刀都带 ratio（相对基线的倍数），可以用来说明"这一刀有多确信"。
- *
- * @param {Array<{t:number, score:number}>} stats 逐帧分数
- * @param {{k?:number, minAbs?:number, halfWindow?:number}} opts
- * @returns {Array<{t:number, score:number, ratio:number}>}
- */
-export function spikeCuts(stats, { k = 3, minAbs = 6, halfWindow = 15 } = {}) {
-  if (!Array.isArray(stats) || stats.length < 3) return [];
-  const scores = stats.map((s) => s.score);
-  const sorted = [...scores].sort((a, b) => a - b);
-  const q = (p) => sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(sorted.length * p)))];
-  // 基线取"本地中位数"和"全片中位数"里更小的那个：本地安静就用本地，
-  // 本地本来就很吵（运镜）就退回全片，避免把运镜的常态当成基线而漏掉真正的剪切。
-  const global = q(0.5);
-  const out = [];
-  for (let i = 0; i < stats.length; i++) {
-    const lo = Math.max(0, i - halfWindow);
-    const hi = Math.min(stats.length, i + halfWindow + 1);
-    // 旧写法 `slice(lo,hi).slice(0,i-lo).concat(slice(i-lo+1, hi-lo))` 在 lo > 0 时
-    // 会取到**全数组**的 16..30 号元素（而不是 63..hi 的邻居），于是 i 这一刀被漏掉。
-    const around = scores.slice(lo, i).concat(scores.slice(i + 1, hi));
-    const local = around.length ? around.sort((a, b) => a - b)[Math.floor(around.length / 2)] : global;
-    const base = Math.max(0.2, Math.min(local, global));
-    const need = Math.max(minAbs, base * k);
-    if (scores[i] > need) {
-      out.push({ ...stats[i], ratio: +(scores[i] / base).toFixed(1) });
-    }
-  }
-  return out;
 }
 
 /** 抑制过密切点：同窗口内只保留分数最高的那个 */
@@ -385,7 +297,6 @@ export function cutsFromEvents(above, step, { minGap = 0.35, adaptive = true } =
   return suppressClose(events, effGap);
 }
 
-/** 分数分布的摘要，供 suggest() 判断"内容有多密" */
 /**
  * 从逐帧分数里"判定切点"。纯函数：同一份 stats 可以反复用不同参数重判，不需要再读一次视频。
  *
@@ -501,31 +412,18 @@ export function quantile(scores, q) {
   return s[i];
 }
 
-export function scanSummary(scores) {
-  if (!Array.isArray(scores) || scores.length === 0) {
-    return { p50: 0, p90: 0, p95: 0, p99: 0, max: 0, frames: 0 };
-  }
-  const s = [...scores].sort((a, b) => a - b);
-  const q = (p) => s[Math.min(s.length - 1, Math.floor(s.length * p))];
-  return {
-    p50: +q(0.5).toFixed(2), p90: +q(0.9).toFixed(2), p95: +q(0.95).toFixed(2),
-    p99: +q(0.99).toFixed(2), max: +s[s.length - 1].toFixed(2), frames: s.length,
-  };
-}
-
 /**
  * 扫描整条视频，返回切点与逐帧分数。
- * @param {{input:string, fps:number, ffmpegPath?:string, width?:number, height?:number,
+ * @param {{input:string, fps:number, width?:number, height?:number,
  *          threshold?:number|'auto', minGap?:number, signal?:AbortSignal, onProgress?:Function}} opts
- *   threshold='auto' 时按 p95×3 自适应（推荐，真实素材与合成素材都能用）
- * @returns {Promise<{cuts:Array<{t:number,score:number}>, stats:Array<{t:number,score:number}>,
- *                    frames:number, threshold:number}>}
+ *   threshold='auto' 时按"每秒切点数"自适应（推荐，真实素材与合成素材都能用）
+ * @returns {Promise<{cuts:Array<{t:number,score:number}>, threshold:number,
+ *                    degraded:'motion'|null, frames:number}>}
  */
 export function scanShots(opts) {
   const {
     input,
     fps,
-    ffmpegPath = DEFAULT_FFMPEG,
     width = SCAN_W,
     height = SCAN_H,
     threshold = 'auto',
@@ -545,7 +443,7 @@ export function scanShots(opts) {
 
   return new Promise((resolve, reject) => {
     const child = spawn(
-      ffmpegPath,
+      resolveBinary('ffmpeg'),
       ['-hide_banner', '-v', 'error', '-nostdin',
         ...(start > 0 ? ['-ss', String(start)] : []),
         ...(end !== undefined ? ['-t', String(Math.max(0.1, end - start))] : []),
@@ -568,12 +466,9 @@ export function scanShots(opts) {
     let hasPrev = false;
     let frame = 0;
     const stats = [];
-    // 顺便采集两个几乎免费的量，供 flash.js 判断「亮度闪一下又回来」：
-    //   means[i]  整帧 V 均值（平移/摇镜不改变它）
-    //   prints[i] 16×9 的 V 指纹（比 means 多一点点空间信息，用来确认"结构没变"）
-    // 实测代价：解码占 95–98%，这两样只占 1–2%。
+    // 整帧 V 均值：`normalizeScores` 按它做暗场增益（平移/摇镜不改变它）。
+    // 上游同时在这里采 16×9 指纹给 flash.js，本项目没有消费者，已删除。
     const means = [];
-    const prints = [];
     // 逐行 V 累加/峰值：黑边检测用（见 barFraction）。黑边那几行的均值永远很低、
     // 峰值也永远不高，和"这一帧恰好是黑的"能分开。
     const rowV = new Float64Array(height);
@@ -608,10 +503,7 @@ export function scanShots(opts) {
         ringIdx = (ringIdx + 1) % lag;
         {
           let sum = 0;
-          const acc = new Float64Array(FP_W * FP_H);
-          const cnt = new Uint16Array(FP_W * FP_H);
           for (let y = 0; y < height; y++) {
-            const by = Math.min(FP_H - 1, Math.floor((y * FP_H) / height));
             let rowSum = 0;
             let rowMax = 0;
             for (let x = 0; x < width; x++) {
@@ -620,17 +512,11 @@ export function scanShots(opts) {
               sum += v;
               rowSum += v;
               if (v > rowMax) rowMax = v;
-              const bi = by * FP_W + Math.min(FP_W - 1, Math.floor((x * FP_W) / width));
-              acc[bi] += v;
-              cnt[bi] += 1;
             }
             rowV[y] += rowSum / width;
             if (rowMax > rowVMax[y]) rowVMax[y] = rowMax;
           }
-          const fp = new Uint8Array(FP_W * FP_H);
-          for (let i = 0; i < FP_W * FP_H; i++) fp[i] = Math.round(acc[i] / (cnt[i] || 1));
           means.push(sum / n);
-          prints.push(fp);
         }
         // 交换缓冲，避免每帧分配
         const tmp = prev;
@@ -644,7 +530,7 @@ export function scanShots(opts) {
 
     child.stderr.on('data', (d) => { stderr += d.toString(); });
     child.on('error', (err) => reject(new Error(
-      `ffmpeg spawn failed: ${err.message} (${describeMediaSearch('ffmpeg')})`,
+      `ffmpeg spawn failed: ${err.message} (set MMGREP_FFMPEG_PATH to an absolute path if ffmpeg is not on PATH)`,
     )));
     child.on('close', (code) => {
       if (code !== 0) {
@@ -655,7 +541,6 @@ export function scanShots(opts) {
       // ---- 归一化：把"绝对差"换成"同等亮度下的差"，再补掉黑边占掉的分母。
       // 必须在下判定之前做 —— 否则暗场/黑边的片子会被常数门槛 12 系统性漏掉。
       const bar = barFraction({ rowV, rowVMax, frames: frame });
-      const normMeans = bar > 0 ? means.map((m) => m / (1 - bar)) : means;
       const normStats = normalizeScores(stats, means, { barFrac: bar });
       const normLong = normalizeScores(longStats, means, { barFrac: bar, offset: lag });
       const decided = decideCuts(normStats, { threshold, minGap, duration: span });
@@ -671,129 +556,12 @@ export function scanShots(opts) {
 
       resolve({
         cuts: merged,
-        stats: normStats,
-        longStats: normLong,
-        frames: frame,
         threshold: decided.threshold,
         degraded: decided.degraded,
-        summary: scanSummary(normStats.map((s) => s.score)),
-        // 逐帧的亮度均值与 16×9 指纹（供 flash.js / 转场分类用）。
-        // 老调用方不读它们也不会受影响。
-        means: normMeans,
-        prints,
-        // 黑边占比（0 = 没检测到）。清单能据此说明"这是 2.39:1 的遮幅片"
-        bars: bar,
+        frames: frame,
       });
     });
   });
-}
-
-const MIN_REFINE_SCORE = 25;
-// 整窗平均分高于这个值 → 认为"几乎每帧都在大改"（每帧一剪）。
-// 实测：真每帧一剪 44.5，概念 PV 的快剪窗口 12–18，所以 30 能把两者分开。
-const PER_FRAME_MEAN = 30;
-/**
- * 逐窗口重判：**先算画面差异，再按窗口决定用多细的间隔去数刀。**
- *
- * 早先的版本靠 `findBursts` 找爆点再细判，那有个死穴：整片都快时，"到处一样快"就没有爆点，
- * 于是全片都被 0.35s 的间隔压扁（实测 3 秒 18 镜的素材只数出 4 刀）。
- *
- * 改成逐个 2 秒窗口判断，问的问题变成"**这个窗口的刀，粗间隔看得见吗**"，是局部且绝对的，
- * 跟全片平均无关。采纳条件三条：
- *   1) 细判（一帧间隔）确实数出更多刀
- *   2) 没被判成 motion（连续运镜每帧都在变，但幅度小）
- *   3) 这些刀的分数均值 ≥ 25（真剪辑一次性换画面，运镜每帧只挪一点）
- *
- * 细判不需要重新读盘：两套判定都跑在同一份逐帧分数上。
- *
- * @returns {{cuts:Array, refined:Array<{from:number,to:number,coarse:number,fine:number}>}}
- */
-export function refineCutsByWindow({
-  stats, fps, coarseCuts, winStart = 0, winDur, winSec = 2, minScore = MIN_REFINE_SCORE,
-  coarseThreshold = 0,
-}) {
-  // 间隔要按内容选：
-  //   - 普通快闪：间隔略大于一帧（1.02/fps），避免同一个镜头的相邻帧被判成两刀；
-  //   - **每帧一剪**：整窗平均分很高（实测 44，普通快闪只有 12–18），这时才把间隔压到一帧以下，
-  //     否则 23 刀只会数出 9 刀。
-  // 用固定的小间隔会把普通动画的快镜放成 19 刀/秒（实测概念 PV 48 → 164），所以必须按窗口内容分流。
-  const out = [];
-  const refined = [];
-  let open = null;
-  let finalGap = Math.max(1.02 / Math.max(1, fps), 0.04);   // 收尾合并用的间隔（遇到每帧一剪会调小）                                          // 正在进行的采纳区间
-
-  // 按下标切窗口：stats 是等间隔的，用 slice 比每窗 filter 全量快几个量级
-  // （60 分钟片子 90k 帧、1800 个窗口，原来每窗都扫全量 = 1.6 亿次比较）
-  const perWin = Math.max(4, Math.round(winSec * Math.max(1, fps)));
-  for (let i0 = 0; i0 < stats.length; i0 += perWin) {
-    const windowStats = stats.slice(i0, i0 + perWin);
-    const from = windowStats[0].t;
-    const to = windowStats[windowStats.length - 1].t + 1 / Math.max(1, fps);
-    const coarse = coarseCuts.filter((c) => c.t >= from && c.t < to);
-    if (windowStats.length < 4) { out.push(...coarse); continue; }
-
-    // 这两道闸都用**原始分数**（与 0.5.4 同刻度）：亮度归一化只用来"让暗场更容易过线"，
-    // 不该顺带抬高"整窗是不是每帧都在大改"的判据 —— 那会让暗底片子被细扫过度采纳。
-    const rawOf = (x) => (x.raw ?? x.score);
-    const meanScoreAll = windowStats.reduce((a, s) => a + rawOf(s), 0) / windowStats.length;
-    const perFrame = meanScoreAll >= PER_FRAME_MEAN;            // 整窗几乎每帧都在大改
-    const gap = perFrame
-      ? Math.max(0.9 / Math.max(1, fps), 0.03)              // 一帧以下：每帧一剪也数得出
-      : Math.max(1.02 / Math.max(1, fps), 0.04);            // 略大于一帧：不把同镜头的相邻帧算两刀
-    if (perFrame) finalGap = Math.min(finalGap, gap);
-    const fineRaw = decideCuts(windowStats, { threshold: 'auto-low', minGap: gap, duration: to - from });
-    // 细扫的阈值是"本窗低分位"，可能低到 4 —— 那会把 4 分的鬼影也当刀（实测概念 PV 里
-    // 57.3s/57.4s 这种 4 分的刀，画面根本没换）。刀本身必须过全局下限，否则不认。
-    // 细扫的刀还要**够得着粗阈值的 3/4**：纯按"本窗低分位"判，2–4 分的抖动也会被收进来，
-    // 实测概念 PV 里 23.9/24.0/35.9/55.0 四个"刀"画面几乎没变（同一镜头里换张画）。
-    const fineFloor = Math.max(MIN_CUT_SCORE, coarseThreshold * 0.75);
-    const fine = { ...fineRaw, cuts: fineRaw.cuts.filter((c) => (c.raw ?? c.score ?? 0) >= fineFloor) };
-    const mean = fine.cuts.reduce((a, c) => a + rawOf(c), 0) / Math.max(1, fine.cuts.length);
-    // 采纳门槛**保持绝对阈值**（minScore=25），不改成"相对本窗基线"。
-    // 试过相对判据（`max(6, 3×窗内中位分)`）：暗场/低对比快剪能多救回几刀，但代价是
-    // **逐帧动画（一拍二/一拍三）的片子全线崩** —— 记管概念 PV 上细扫从 44 刀涨到 122 刀，
-    // 抽 8 个新增点逐个看前后帧，6 个是同一个镜头里换张画（硬币在手里转、白剪影摆姿势），
-    // 不是剪辑。相邻帧差这种信号分不开"整帧换场"和"局部换画"，靠调门槛只会两头晃。
-    // 要放宽必须先有**空间证据**（改了多少块/多少像素），那是下一版的事。
-    const need = minScore;
-    // **逐帧动画的坑**（记管概念 PV 实测）：动画经常"一拍二/一拍三"，画面每 2–3 帧换一张画，
-    // 帧差于是每隔两帧出现一个不小的峰。整窗又不是"每帧都在大改"（meanScoreAll 只有 5–8），
-    // 相对门槛会把这一串峰全当成剪辑点 —— 8 秒里数出 20 刀，而那些帧其实是同一个镜头里
-    // 手里那枚硬币在动（抽样看过）。
-    // 所以非 perFrame 的窗口要求细判出的刀**至少隔 3.5 帧**：真人剪辑不会 2 帧一剪。
-    const gaps = fine.cuts.slice(1).map((c, i) => c.t - fine.cuts[i].t).sort((a, b) => a - b);
-    const medianGap = gaps.length ? gaps[Math.floor(gaps.length / 2)] : null;
-    const minShot = Math.max(0.13, 3.5 / Math.max(1, fps));
-    const tooTight = !perFrame && medianGap !== null && medianGap < minShot;
-    const adopt = fine.cuts.length > coarse.length
-      && fine.degraded !== 'motion'
-      && !tooTight
-      && mean >= need;
-
-    if (adopt) {
-      out.push(...fine.cuts);
-      const n = out.length;
-      if (open && Math.abs(open.to - from) < 1e-6) { open.to = to; open.fine = n; }
-      else {
-        if (open) refined.push({ from: open.from, to: open.to, coarse: open.coarse, fine: open.count });
-        open = { from, to, coarse: coarse.length, count: 0, fine: 0 };
-      }
-      open.count += fine.cuts.length;
-    } else {
-      out.push(...coarse);
-      if (open) { refined.push({ from: open.from, to: open.to, coarse: open.coarse, fine: open.count }); open = null; }
-    }
-  }
-  if (open) refined.push({ from: open.from, to: open.to, coarse: open.coarse, fine: open.count });
-
-  return {
-    // 收尾再并一次：跨窗口边界可能留下贴得很近的两刀。
-    // 间隔取"所有窗口用过的最小值"，否则每帧一剪的结果会在这一步被并回去（实测 21 → 9）。
-    cuts: suppressClose(out.sort((a, b) => a.t - b.t), finalGap),
-    refined: refined.map((r) => ({
-      from: +r.from.toFixed(2), to: +r.to.toFixed(2), coarse: r.coarse, fine: r.fine,
-    })),
-  };
 }
 
 /**
@@ -903,36 +671,4 @@ export function detectGradual(longStats, frameStats, {
     } else out2.push(g);
   }
   return out2;
-}
-
-
-/**
- * 找出**黑场区间**（片头黑屏、转场黑场、片尾字幕前的黑）。
- *
- * 为什么需要：黑场在分数上几乎为 0（前后都是黑的，没有"变化"），所以永远不会被当成切点。
- * 结果它就和后面的 logo / 正片挤在同一格里，那一段的代表帧取中点 —— 正好落在黑里，
- * 整格变成一张纯黑图，片头的内容全丢。
- *
- * 实测概念 PV：前 5 秒亮度只有 1（全黑），第一个切点在 5.71 秒（logo 出现），
- * 而 0–37.6 秒那一格的中点 18.8 秒亮度是 0 —— 整格黑。
- *
- * @param {number[]} means 逐帧亮度均值（0–255）
- * @param {{threshold?:number, minFrames?:number, fps?:number}} opts
- *   threshold: 低于它算黑（默认 12）
- *   minFrames: 至少持续这么多帧才算一段黑场（默认 0.4 秒），避免把暗场镜头误判
- * @returns {Array<{from:number, to:number}>} 黑场区间（秒）
- */
-export function detectDarkRuns(means, { threshold = 12, minFrames = 10, fps = 25 } = {}) {
-  if (!Array.isArray(means) || means.length === 0) return [];
-  const runs = [];
-  let start = -1;
-  for (let i = 0; i <= means.length; i++) {
-    const dark = i < means.length && means[i] < threshold;
-    if (dark && start < 0) start = i;
-    if (!dark && start >= 0) {
-      if (i - start >= minFrames) runs.push({ from: start / fps, to: i / fps });
-      start = -1;
-    }
-  }
-  return runs;
 }

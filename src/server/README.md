@@ -17,6 +17,7 @@
 |---|---|
 | `../index.js` | 入口：建 runtime → 建 server → 接 `StdioServerTransport`；启动横幅写 stderr；SIGINT/SIGTERM 优雅退出 |
 | `index.js` | `createServer()` / `createRuntime()`；加载 cache、provider、后端；组装 dispatcher |
+| `http.js` | Streamable HTTP 传输（`POST /mcp`，无状态）：每个请求新建 server + transport，用完即关；Bearer 鉴权、请求体上限与超时 |
 | `tools.js` | 5 个工具的 zod schema、参数×媒体校验、handler、进度上报、全文落盘、文本清单 |
 | `backends.js` | 三个后端的集中动态导入；缺失/损坏 → 占位后端（调用时报 `INTERNAL`） |
 | `images.js` | 图片 → MCP image content；契约 §10 的 token 计价、硬上限、软预算降级 |
@@ -44,9 +45,9 @@ node --test "test/server/**/*.test.js"
       "args": ["/absolute/path/to/MultiMediaGrep/src/index.js"],
       "env": {
         "MMGREP_ASR_PROVIDER": "elevenlabs",
-        "MMGREP_ASR_API_KEY": "…",
+        "MMGREP_ELEVENLABS_API_KEY": "…",
         "MMGREP_DOC_PROVIDER": "mineru",
-        "MMGREP_DOC_API_KEY": "…"
+        "MMGREP_MINERU_API_KEY": "…"
       }
     }
   }
@@ -263,13 +264,20 @@ INTERNAL: <type> backend is not implemented yet.
 
 全部在 `config.js` 的 `loadConfig(env)` 里解析，非法值回落默认并记入 `config.warnings`（不崩 server）：
 
-`MMGREP_CACHE_DIR` · `MMGREP_CACHE_MAX_BYTES` · `MMGREP_ASR_PROVIDER` · `MMGREP_ASR_API_KEY` ·
-`MMGREP_ASR_BASE_URL` · `MMGREP_ASR_MODEL` · `MMGREP_ASR_LANGUAGE` · `MMGREP_ASR_TIMEOUT_MS` ·
-`MMGREP_DOC_PROVIDER` · `MMGREP_DOC_API_KEY` · `MMGREP_DOC_BASE_URL` · `MMGREP_DOC_MODEL` ·
-`MMGREP_DOC_TIMEOUT_MS` · `MMGREP_OCR_PROVIDER` · `MMGREP_MAX_IMAGE_TOKENS` · `MMGREP_MAX_IMAGE_EDGE` ·
+`MMGREP_CACHE_DIR` · `MMGREP_CACHE_MAX_BYTES` · `MMGREP_ASR_PROVIDER` ·
+`MMGREP_ELEVENLABS_API_KEY` · `MMGREP_ELEVENLABS_BASE_URL` · `MMGREP_ELEVENLABS_MODEL` ·
+`MMGREP_OPENAI_COMPATIBLE_API_KEY` · `MMGREP_OPENAI_COMPATIBLE_BASE_URL` ·
+`MMGREP_OPENAI_COMPATIBLE_MODEL` · `MMGREP_ASR_LANGUAGE` · `MMGREP_ASR_TIMEOUT_MS` ·
+`MMGREP_DOC_PROVIDER` · `MMGREP_MINERU_API_KEY` · `MMGREP_MINERU_BASE_URL` ·
+`MMGREP_MINERU_MODEL` · `MMGREP_DOC_TIMEOUT_MS` · `MMGREP_OCR_PROVIDER` ·
+`MMGREP_MAX_IMAGE_TOKENS` · `MMGREP_MAX_IMAGE_EDGE` ·
 `MMGREP_MAX_TEXT_INLINE_CHARS` · `MMGREP_MAX_CONCURRENCY` · `MMGREP_AUDIO_MIN_DBFS` ·
 `MMGREP_AUDIO_MIN_SPEECH_RATIO` · `MMGREP_FFMPEG_PATH` · `MMGREP_FFPROBE_PATH` · `MMGREP_LOG_LEVEL` ·
 `MMGREP_PROGRESS_NOTIFICATIONS`（本 server 的扩展，默认 `on`）。
+
+传输方式（`http.js`）：`MMGREP_TRANSPORT`（`stdio` 默认 / `http`）· `MMGREP_HTTP_HOST`（默认 `127.0.0.1`）·
+`MMGREP_HTTP_PORT`（默认 `3927`）· `MMGREP_HTTP_TOKEN`（可选 Bearer 令牌；只说 `set` / `unset`，绝不打值）。
+命令行 `--http` / `--host` / `--port` / `--token` 的优先级高于环境变量。
 
 API key 只留在 runtime 里：`describeConfig()` 输出 `set` / `unset`，日志与错误结果不会出现原值。
 
@@ -281,6 +289,7 @@ test/server/errors.test.js    # §2.4 错误映射
 test/server/images.test.js    # §10 计价 / 硬上限 / 软预算 / 降级
 test/server/tools.test.js     # stub 后端：schema、适用性、5 个工具、进度、落盘
 test/server/server.test.js    # spawn node src/index.js，StdioClientTransport 端到端
+test/server/http.test.js      # Streamable HTTP：协议面、鉴权、路由、配置、超时中止
 ```
 
 `test/server/server.test.js` 同时是「stdout 干净」的守门员：任何写进 stdout 的非 JSON-RPC 内容都会让

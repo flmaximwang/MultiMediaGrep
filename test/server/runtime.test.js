@@ -4,7 +4,7 @@
 //   1. 用户配置的 ASR provider 被装进 runtime（不联网、只用 127.0.0.1）；
 //   2. provider 真正按 OpenAI 协议发 multipart 请求，响应被归一化成毫秒；
 //   3. key 不会出现在 describe() / 日志里；
-//   4. provider 名拼错时 runtime 不崩，错误记进 providerErrors。
+//   4. provider 名拼错时 runtime 不崩，config 记 warning 并回落到 none。
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -77,9 +77,9 @@ test('createRuntime：ASR provider 接上 stub 端点，transcribe 走 multipart
     const runtime = await createRuntime(runtimeOptions({
       MMGREP_CACHE_DIR: path.join(dir, 'cache'),
       MMGREP_ASR_PROVIDER: 'openai-compatible',
-      MMGREP_ASR_API_KEY: SECRET,
-      MMGREP_ASR_BASE_URL: stub.baseUrl,
-      MMGREP_ASR_MODEL: 'whisper-1',
+      MMGREP_OPENAI_COMPATIBLE_API_KEY: SECRET,
+      MMGREP_OPENAI_COMPATIBLE_BASE_URL: stub.baseUrl,
+      MMGREP_OPENAI_COMPATIBLE_MODEL: 'whisper-1',
       MMGREP_ASR_LANGUAGE: 'zh',
     }));
 
@@ -108,7 +108,7 @@ test('createRuntime：ASR provider 接上 stub 端点，transcribe 走 multipart
   }
 });
 
-test('createRuntime：provider=none → null；provider 拼错 → 不崩，记进 providerErrors', async () => {
+test('createRuntime：provider=none → null；provider 拼错 → 不崩，warning 后回落到 none', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-runtime-'));
   try {
     const none = await createRuntime(runtimeOptions({
@@ -123,8 +123,9 @@ test('createRuntime：provider=none → null；provider 拼错 → 不崩，记�
       MMGREP_ASR_PROVIDER: 'elevenlabz',
     }));
     assert.equal(typo.asrProvider, null);
-    assert.match(typo.providerErrors.asr, /elevenlabz/);
-    assert.match(typo.providerErrors.asr, /could not be configured/);
+    assert.deepEqual(typo.providerErrors, {});
+    assert.ok(typo.config.warnings.some((warning) => /elevenlabz/.test(warning)));
+    assert.ok(typo.config.warnings.some((warning) => /falling back to "none"/.test(warning)));
 
     // 选了 provider 但缺 key → provider 对象仍在，真正调用时才报错（三态降级）
     const missingKey = await createRuntime(runtimeOptions({
@@ -134,7 +135,7 @@ test('createRuntime：provider=none → null；provider 拼错 → 不崩，记�
     assert.ok(missingKey.asrProvider);
     await assert.rejects(
       () => missingKey.asrProvider.transcribe({ audioPath: path.join(dir, 'missing.mp3') }),
-      /MMGREP_ASR_API_KEY/,
+      /MMGREP_ELEVENLABS_API_KEY/,
     );
   } finally {
     await rm(dir, { recursive: true, force: true });

@@ -15,7 +15,7 @@ import {
   parseRational,
   parseSar,
   uprightSize,
-} from '../../../vendor/dsh-video-storyboard/src/storyboard/probe.js';
+} from './geometry.js';
 
 const NO_AUDIO_HEALTH = Object.freeze({
   verdict: 'no-audio-track',
@@ -240,7 +240,8 @@ export async function shapeProbe({ media, audioHealth, input, ctx }) {
     asrAvailable = false;
     asrReason = 'This file has no audio track.';
   } else if (!provider) {
-    asrReason = 'No ASR provider is configured (set MMGREP_ASR_PROVIDER and MMGREP_ASR_API_KEY).';
+    asrReason = 'No ASR provider is configured (set MMGREP_ASR_PROVIDER and the matching provider key: '
+      + 'MMGREP_ELEVENLABS_API_KEY or MMGREP_OPENAI_COMPATIBLE_API_KEY).';
   } else if (!audioHealth.effective) {
     asrReason = audioHealth.note;
   }

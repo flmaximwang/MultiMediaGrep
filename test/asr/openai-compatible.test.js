@@ -247,7 +247,7 @@ describe('createAsrProvider（OpenAI 兼容相关）', () => {
   test('provider = openai-compatible 且有 key → 造出 provider，默认 baseUrl / model 正确', () => {
     const provider = createAsrProvider({
       MMGREP_ASR_PROVIDER: 'openai-compatible',
-      MMGREP_ASR_API_KEY: FAKE_KEY,
+      MMGREP_OPENAI_COMPATIBLE_API_KEY: FAKE_KEY,
     });
     assert.equal(provider.id, 'openai-compatible');
     assert.deepEqual(provider.describe(), {
@@ -260,9 +260,9 @@ describe('createAsrProvider（OpenAI 兼容相关）', () => {
   test('自定义 baseUrl / model / language 生效', () => {
     const provider = createAsrProvider({
       MMGREP_ASR_PROVIDER: 'openai-compatible',
-      MMGREP_ASR_API_KEY: FAKE_KEY,
-      MMGREP_ASR_BASE_URL: 'http://127.0.0.1:8000/v1/',
-      MMGREP_ASR_MODEL: 'FunAudioLLM/SenseVoiceSmall',
+      MMGREP_OPENAI_COMPATIBLE_API_KEY: FAKE_KEY,
+      MMGREP_OPENAI_COMPATIBLE_BASE_URL: 'http://127.0.0.1:8000/v1/',
+      MMGREP_OPENAI_COMPATIBLE_MODEL: 'FunAudioLLM/SenseVoiceSmall',
     });
     assert.deepEqual(provider.describe(), {
       id: 'openai-compatible',
@@ -281,7 +281,7 @@ describe('createAsrProvider（OpenAI 兼容相关）', () => {
       (err) => err,
     );
     assert.ok(error instanceof Error);
-    assert.match(error.message, /MMGREP_ASR_API_KEY/);
+    assert.match(error.message, /MMGREP_OPENAI_COMPATIBLE_API_KEY/);
     assert.ok(!/sk-/.test(error.message), '错误信息里不能出现任何看起来像 key 的东西');
   });
 

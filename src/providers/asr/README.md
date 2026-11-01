@@ -51,9 +51,12 @@ if (asr) {
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `MMGREP_ASR_PROVIDER` | `none` | `elevenlabs` / `openai-compatible` / `none` |
-| `MMGREP_ASR_API_KEY` | — | 服务 key。`none` 时不需要 |
-| `MMGREP_ASR_BASE_URL` | ElevenLabs `https://api.elevenlabs.io/v1`；OpenAI 兼容 `https://api.openai.com/v1` | 自建服务填自己的地址 |
-| `MMGREP_ASR_MODEL` | ElevenLabs `scribe_v1`；OpenAI 兼容 `whisper-1` | |
+| `MMGREP_ELEVENLABS_API_KEY` | — | ElevenLabs 的 key。`none` 时不需要 |
+| `MMGREP_ELEVENLABS_BASE_URL` | `https://api.elevenlabs.io/v1` | ElevenLabs 接口地址 |
+| `MMGREP_ELEVENLABS_MODEL` | `scribe_v1` | ElevenLabs 模型名 |
+| `MMGREP_OPENAI_COMPATIBLE_API_KEY` | — | OpenAI 兼容服务的 key |
+| `MMGREP_OPENAI_COMPATIBLE_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容服务接口地址；自建服务填自己的地址 |
+| `MMGREP_OPENAI_COMPATIBLE_MODEL` | `whisper-1` | OpenAI 兼容服务模型名 |
 | `MMGREP_ASR_LANGUAGE` | — | 语言代码，如 `zh` / `en`。不填就交给服务自己判断 |
 | `MMGREP_ASR_TIMEOUT_MS` | `120000` | 单次请求超时 |
 | `MMGREP_ASR_MAX_BYTES` | `104857600`（100MB） | 单次请求的音频体积上限 |
@@ -61,8 +64,11 @@ if (asr) {
 | `MMGREP_ASR_RESPONSE_FORMAT` | `verbose_json` | 仅 OpenAI 兼容 |
 | `MMGREP_ASR_TIMESTAMP_GRANULARITIES` | 模型名含 `whisper` 时为 `segment` | 仅 OpenAI 兼容，逗号分隔 |
 
+旧的 `MMGREP_ASR_API_KEY` / `MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 仅在对应
+provider 专属变量未设置时兜底（0.2.0 删除）。
+
 环境变量值外面带了成对的引号会被自动剥掉（Windows `setx` 的老坑：
-`setx MMGREP_ASR_BASE_URL "http://127.0.0.1:8000/v1"` 在某些 shell 转发后会带上引号）。
+`setx MMGREP_ELEVENLABS_BASE_URL "http://127.0.0.1:8000/v1"` 在某些 shell 转发后会带上引号）。
 
 ## 降级语义（server 集成必须照着写）
 
@@ -71,7 +77,7 @@ if (asr) {
 | 情况 | 返回 | server 应该怎么办 |
 |---|---|---|
 | 没设 `MMGREP_ASR_PROVIDER`，或设成 `none` | `null` | **不报错**，只返回画面内容 |
-| provider 选了，但没给 `MMGREP_ASR_API_KEY` | 一个 provider（构造**不抛错**） | 真正要转写时，`transcribe()` 会抛一条说清「缺 `MMGREP_ASR_API_KEY`」的错误；server 应当把这条错误原样告诉用户，而不是让整个请求崩掉 |
+| provider 选了，但没给当前 provider 的专属 key（`MMGREP_ELEVENLABS_API_KEY` / `MMGREP_OPENAI_COMPATIBLE_API_KEY`） | 一个 provider（构造**不抛错**） | 真正要转写时，`transcribe()` 会抛一条说清「缺哪个环境变量」的错误；server 应当把这条错误原样告诉用户，而不是让整个请求崩掉 |
 | `MMGREP_ASR_PROVIDER` 是个不认识的值 | **抛错** | 拼写错误要在启动时吵醒用户。server 构造 provider 时建议 `try/catch` 包一下，退化成「只有画面」 |
 
 想显式拿到那个「明确不启用 ASR」的 provider（`id: 'none'`），用：

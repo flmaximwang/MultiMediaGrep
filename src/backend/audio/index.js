@@ -43,7 +43,8 @@ function shapeProbe({ info, audioHealth, input, ctx, stats, durationSec, subtitl
     asrAvailable = false;
     asrReason = 'Transcription was disabled for this call (transcript: "off").';
   } else if (!asrProvider) {
-    asrReason = 'No ASR provider is configured (set MMGREP_ASR_PROVIDER and MMGREP_ASR_API_KEY).';
+    asrReason = 'No ASR provider is configured (set MMGREP_ASR_PROVIDER and the matching provider key: '
+      + 'MMGREP_ELEVENLABS_API_KEY or MMGREP_OPENAI_COMPATIBLE_API_KEY).';
   } else if (!audioHealth.effective) {
     asrReason = audioHealth.note;
   }

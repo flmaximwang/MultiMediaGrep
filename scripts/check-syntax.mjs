@@ -4,8 +4,9 @@
 // `for f in src/*.js; do ... done` 是 POSIX 语法，在那里会直接失败，
 // 于是 `npm run check` 在 Windows 上等于不可用。
 //
-// 扫的目录：`src/`（本项目的 MCP server）与 `vendor/`（vendored 上游源码）。
-// **必须递归**：src/providers/、vendor/dsh-video-storyboard/src/storyboard/ 这种
+// 扫的目录：`src/`（本项目的 MCP server）、`test/`（单测）、`scripts/`（仓库脚本）
+// 与 `fixtures/`（测试素材生成器）。
+// **必须递归**：src/providers/、src/backend/video/、test/backend/、fixtures/lib/ 这种
 // 子目录里的文件不扫，等于给自己留了个"语法错了但 check 通过"的洞。
 import { execFile } from 'node:child_process';
 import { readdir } from 'node:fs/promises';
@@ -14,7 +15,7 @@ import { promisify } from 'node:util';
 
 const run = promisify(execFile);
 
-const DIRS = ['src', 'vendor'];
+const DIRS = ['src', 'test', 'scripts', 'fixtures'];
 const EXT = /\.(mjs|js)$/;
 
 async function walk(dir) {

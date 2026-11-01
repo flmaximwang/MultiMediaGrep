@@ -7,6 +7,40 @@ import { ToolError } from './interface.js';
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_BUFFER = 32 * 1024 * 1024;
+// runBuffer 的 stdout 上限：rawvideo 一帧就有几 MB，64 MiB 足以覆盖正常帧流；
+// 超限时只保留前 64 MiB 并继续排空管道，避免子进程因管道写满而卡死。
+const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+
+/** 环境变量覆盖：把工具名映射到部署机上的绝对路径 */
+const ENV_BY_BINARY = Object.freeze({
+  ffmpeg: 'MMGREP_FFMPEG_PATH',
+  ffprobe: 'MMGREP_FFPROBE_PATH',
+});
+
+/**
+ * 把 'ffmpeg' / 'ffprobe' 解析成实际要 spawn 的命令。
+ * 环境变量在调用时读取（而不是模块加载时），这样 server 启动后改配置、
+ * 以及测试在 import 之后再设置 env 都能生效。空白值视同未设置，
+ * 避免 `MMGREP_FFMPEG_PATH=" "` 把 PATH 查找弄坏。
+ */
+export function resolveBinary(name) {
+  const envVar = ENV_BY_BINARY[name];
+  if (!envVar) return name;
+  const raw = process.env[envVar];
+  if (typeof raw !== 'string') return name;
+  const trimmed = raw.trim();
+  return trimmed || name;
+}
+
+/** ENOENT 时的提示：点名覆盖用的环境变量，否则用户只会看到「not on PATH」而不知道还能显式指定 */
+function toolNotFoundMessage(name, command) {
+  const envVar = ENV_BY_BINARY[name];
+  if (!envVar) return `${name} is not installed or not on PATH.`;
+  if (command !== name) {
+    return `${name} was not found at "${command}" (from ${envVar}). Point ${envVar} at the binary or unset it to fall back to PATH.`;
+  }
+  return `${name} is not installed or not on PATH (set ${envVar} to an absolute path if it lives elsewhere).`;
+}
 
 /**
  * 跑一个子进程，收集 stdout/stderr。
@@ -14,11 +48,12 @@ const MAX_BUFFER = 32 * 1024 * 1024;
  */
 export function run(bin, args, { timeoutMs = DEFAULT_TIMEOUT_MS, signal, allowNonZero = false } = {}) {
   return new Promise((resolve, reject) => {
+    const command = resolveBinary(bin);
     let child;
     try {
       // signal 可能是 null（server 的调用上下文用 null 表示「没有取消信号」）；
       // 直接传给 spawn 会抛 TypeError，被误报成 TOOL_NOT_FOUND。
-      child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], ...(signal ? { signal } : {}) });
+      child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], ...(signal ? { signal } : {}) });
     } catch (err) {
       reject(new ToolError('TOOL_NOT_FOUND', `${bin} is not available: ${err.message}`));
       return;
@@ -44,7 +79,7 @@ export function run(bin, args, { timeoutMs = DEFAULT_TIMEOUT_MS, signal, allowNo
       settled = true;
       clearTimeout(timer);
       if (err.code === 'ENOENT') {
-        reject(new ToolError('TOOL_NOT_FOUND', `${bin} is not installed or not on PATH.`));
+        reject(new ToolError('TOOL_NOT_FOUND', toolNotFoundMessage(bin, command)));
       } else {
         reject(new ToolError('INTERNAL', `${bin} failed to start: ${err.message}`));
       }
@@ -59,6 +94,73 @@ export function run(bin, args, { timeoutMs = DEFAULT_TIMEOUT_MS, signal, allowNo
         return;
       }
       resolve({ code, stdout, stderr });
+    });
+  });
+}
+
+/**
+ * 与 run() 相同，但 stdout 以 Buffer 收集，并可通过 input 往 stdin 写入二进制。
+ * rawvideo 帧流不能经过 UTF-8 字符串：chunk.toString() 会把非法字节替换成 U+FFFD，
+ * 后续按字节解析像素就会错位，所以这里全程保持 Buffer。
+ * 错误映射与 run() 一致：ENOENT → TOOL_NOT_FOUND，超时/非零退出 → INTERNAL。
+ */
+export function runBuffer(bin, args, { input = null, timeoutMs = DEFAULT_TIMEOUT_MS, signal = null } = {}) {
+  return new Promise((resolve, reject) => {
+    const command = resolveBinary(bin);
+    let child;
+    try {
+      child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'], ...(signal ? { signal } : {}) });
+    } catch (err) {
+      reject(new ToolError('TOOL_NOT_FOUND', `${bin} is not available: ${err.message}`));
+      return;
+    }
+
+    const chunks = [];
+    let stdoutBytes = 0;
+    let stderr = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill('SIGKILL');
+      reject(new ToolError('INTERNAL', `${bin} timed out after ${timeoutMs} ms.`));
+    }, timeoutMs);
+
+    // 子进程提前退出（例如参数错误）时写 stdin 会得到 EPIPE；
+    // 吞掉该错误，结果统一由 close/error 事件决定。
+    child.stdin.on('error', () => {});
+    child.stdin.end(input == null ? undefined : Buffer.isBuffer(input) ? input : Buffer.from(input));
+
+    child.stdout.on('data', (chunk) => {
+      const remaining = MAX_OUTPUT_BYTES - stdoutBytes;
+      if (remaining <= 0) return; // 超限后继续排空管道，但不占内存
+      const kept = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining);
+      chunks.push(kept);
+      stdoutBytes += kept.length;
+    });
+    child.stderr.on('data', (chunk) => {
+      if (stderr.length < MAX_BUFFER) stderr += chunk.toString();
+    });
+    child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err.code === 'ENOENT') {
+        reject(new ToolError('TOOL_NOT_FOUND', toolNotFoundMessage(bin, command)));
+      } else {
+        reject(new ToolError('INTERNAL', `${bin} failed to start: ${err.message}`));
+      }
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        const tail = stderr.trim().split('\n').slice(-4).join(' | ');
+        reject(new ToolError('INTERNAL', `${bin} exited with code ${code}: ${tail}`));
+        return;
+      }
+      resolve({ code, stdout: Buffer.concat(chunks, stdoutBytes), stderr });
     });
   });
 }
@@ -162,7 +264,7 @@ export async function assertFfmpegAvailable(opts = {}) {
     if (err instanceof ToolError && err.code === 'TOOL_NOT_FOUND') {
       throw new ToolError(
         'TOOL_NOT_FOUND',
-        'ffprobe is required but was not found on PATH. Install ffmpeg (which bundles ffprobe) and retry.',
+        'ffprobe is required but was not found on PATH. Install ffmpeg (which bundles ffprobe), or set MMGREP_FFPROBE_PATH to an absolute path, and retry.',
       );
     }
     throw err;

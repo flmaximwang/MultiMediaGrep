@@ -49,8 +49,8 @@ winget install Gyan.FFmpeg
 
 ## 2. 宿主配置
 
-server **只支持 stdio 传输**：它没有 HTTP 端点、没有端口、不监听任何东西。
-所有宿主都用同一种方式拉起它：给一条命令 + 一组环境变量。
+server **默认走 stdio**：宿主用一条命令拉起它，不用开端口。需要多个进程共用一个 server
+或跨机器访问时，可以显式开启 Streamable HTTP（`POST /mcp`），见 §2.6。不开启时它不监听任何东西。
 
 ### 2.1 Claude Code
 
@@ -60,7 +60,7 @@ server **只支持 stdio 传输**：它没有 HTTP 端点、没有端口、不�
 # 用户级：所有项目都能用
 claude mcp add --scope user multimediagrep \
   -e MMGREP_ASR_PROVIDER=elevenlabs \
-  -e MMGREP_ASR_API_KEY=sk-你的key \
+  -e MMGREP_ELEVENLABS_API_KEY=sk-你的key \
   -- npx -y multimediagrep-mcp
 
 # 项目级：写进项目里的 .mcp.json，随仓库提交给团队
@@ -80,7 +80,7 @@ claude mcp add --scope project multimediagrep -- npx -y multimediagrep-mcp
       "args": ["-y", "multimediagrep-mcp"],
       "env": {
         "MMGREP_ASR_PROVIDER": "elevenlabs",
-        "MMGREP_ASR_API_KEY": "sk-替换成你的key"
+        "MMGREP_ELEVENLABS_API_KEY": "sk-替换成你的key"
       }
     }
   }
@@ -97,7 +97,7 @@ Hermes 的 MCP 管理是 `hermes mcp` 这一组子命令，stdio server 走 `--c
 ```bash
 hermes mcp add multimediagrep \
   --command npx \
-  --env MMGREP_ASR_PROVIDER=elevenlabs MMGREP_ASR_API_KEY=sk-你的key \
+  --env MMGREP_ASR_PROVIDER=elevenlabs MMGREP_ELEVENLABS_API_KEY=sk-你的key \
   --args -y multimediagrep-mcp
 ```
 
@@ -117,7 +117,7 @@ mcp_servers:
       - multimediagrep-mcp
     env:
       MMGREP_ASR_PROVIDER: elevenlabs
-      MMGREP_ASR_API_KEY: sk-替换成你的key
+      MMGREP_ELEVENLABS_API_KEY: sk-替换成你的key
     enabled: true
 ```
 
@@ -184,9 +184,84 @@ npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.1.0/
 }
 ```
 
-> A / B 会把整个仓库拉下来（含 vendor 源码与文档），首次安装比 npm 慢一些；
+> A / B 会把整个仓库拉下来（源码与文档），首次安装比 npm 慢一些；
 > C 只含运行时。`npx` 会在本地缓存，第二次启动就快了。
 > 注意：GitHub 源的安装不走 npm registry 的版本号管理，升级要自己 `git pull` 或换回 npm 包。
+
+### 2.6 HTTP 模式：远程访问与反向代理
+
+HTTP 是**显式开启**的选项；不传 `--http` / 不设 `MMGREP_TRANSPORT=http` 时行为与以前完全一样。
+
+```bash
+# 只给本机用：默认监听 127.0.0.1:3927
+multimediagrep-mcp --http
+
+# 指定端口 + 令牌（命令行优先于环境变量）
+multimediagrep-mcp --http --port 43927 --token '<你的令牌>'
+
+# 等价的环境变量写法
+MMGREP_TRANSPORT=http MMGREP_HTTP_HOST=127.0.0.1 MMGREP_HTTP_PORT=43927 \
+  MMGREP_HTTP_TOKEN='<你的令牌>' multimediagrep-mcp
+```
+
+端点地址是 `http://<host>:<port>/mcp`，只接受 `POST`。请求必须同时接受 JSON 和 SSE：
+`Accept: application/json, text/event-stream`；请求体用 `Content-Type: application/json`。
+
+**令牌：非回环地址必须配。** `MMGREP_HTTP_HOST` 不是 `127.0.0.1` / `localhost` / `::1`
+（包括 `0.0.0.0`）时，必须设置 `--token` / `MMGREP_HTTP_TOKEN`。注意：server **不会拒绝启动**，
+只会在启动横幅里记一条 warning——没配令牌的端点对任何能连到该地址的人开放。
+令牌只认 `Authorization: Bearer <令牌>`，query string 里的令牌会被忽略（仍然回 401）。
+令牌可以是任意 UTF-8 字符串（服务端按原始字节比较）。
+
+**不要在没有 TLS 的网络上裸跑。** 让 server 继续监听 `127.0.0.1`，由反向代理终结 TLS：
+
+```nginx
+# nginx 片段：TLS 在 nginx 终结；向上游只走本机回环的明文 HTTP
+location /mcp {
+    proxy_pass http://127.0.0.1:3927/mcp;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Authorization $http_authorization;
+    proxy_read_timeout 125s;   # server 的请求超时是 120s
+}
+```
+
+```bash
+# Caddy：自动签证书；把整站反代到本机回环（路径原样保留）
+caddy reverse-proxy --from mcp.example.com --to 127.0.0.1:3927
+```
+
+> 代理要原样转发 `Authorization` 头，不要把它改写成 query string。
+> 跨机器调用时，客户端必须同时接受 `application/json` 与 `text/event-stream`。
+
+**curl 自测**（两个头缺一不可）：
+
+```bash
+curl -sS -X POST http://127.0.0.1:3927/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'Authorization: Bearer <你的令牌>' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0.0.0"}}}'
+```
+
+返回值与错误码：
+
+| 情况 | HTTP 状态 |
+|---|---|
+| 正常 | 200 |
+| 缺 / 错 `Authorization`（配了令牌时） | 401，带 `WWW-Authenticate: Bearer realm="multimediagrep"` |
+| `Accept` 没同时包含 `application/json` 和 `text/event-stream` | 406 |
+| `Content-Type` 不是 `application/json` | 415 |
+| 路径不是 `/mcp` | 404 |
+| 方法不是 `POST` | 405（`Allow: POST`） |
+| JSON 解析失败 | 400（JSON-RPC `-32700`） |
+| 请求体超过 1 MiB | 413 |
+| 请求头里的 provider id 不认识 | 400（JSON-RPC `-32602`） |
+| 单次请求超过 120 s | 504（响应尚未开始时；在途工具调用会先被中止） |
+
+检查顺序是：先看路径（不是 `/mcp` → 404），再验令牌（配了令牌时 → 401），最后看方法（→ 405）。
+
+每请求凭据头（`x-mmgrep-*`）见 README 的「每请求凭据」与契约 §12.7。
 
 ---
 
@@ -207,10 +282,10 @@ npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.1.0/
 
 ```bash
 MMGREP_ASR_PROVIDER=elevenlabs
-MMGREP_ASR_API_KEY=sk-你的key
-# 下面三个都有默认值，一般不用动
-MMGREP_ASR_BASE_URL=https://api.elevenlabs.io/v1
-MMGREP_ASR_MODEL=scribe_v1
+MMGREP_ELEVENLABS_API_KEY=sk-你的key
+# 下面几个都有默认值，一般不用动
+MMGREP_ELEVENLABS_BASE_URL=https://api.elevenlabs.io/v1
+MMGREP_ELEVENLABS_MODEL=scribe_v1
 MMGREP_ASR_LANGUAGE=auto
 ```
 
@@ -222,19 +297,19 @@ server 打的是 `POST {baseUrl}/speech-to-text`，认证头是 `xi-api-key`（�
 
 ```bash
 MMGREP_ASR_PROVIDER=openai-compatible
-MMGREP_ASR_API_KEY=你的key
-MMGREP_ASR_BASE_URL=https://your-service/v1
-MMGREP_ASR_MODEL=whisper-1
+MMGREP_OPENAI_COMPATIBLE_API_KEY=你的key
+MMGREP_OPENAI_COMPATIBLE_BASE_URL=https://your-service/v1
+MMGREP_OPENAI_COMPATIBLE_MODEL=whisper-1
 ```
 
-> ⚠️ **`MMGREP_ASR_BASE_URL` 和 `MMGREP_ASR_MODEL` 必须显式写。**
-> server 层的这两个默认值是**写死的 ElevenLabs 值**（`https://api.elevenlabs.io/v1` + `scribe_v1`），
-> **不会**跟着 `MMGREP_ASR_PROVIDER` 变。不改的话，请求会带着 `scribe_v1` 打到你填的地址上，
-> 然后被对方拒掉。
+> ⚠️ **`MMGREP_OPENAI_COMPATIBLE_BASE_URL` 默认是 `https://api.openai.com/v1`。**
+> 用自建 / 第三方兼容服务时改成自己的地址；`MMGREP_OPENAI_COMPATIBLE_MODEL` 默认 `whisper-1`，
+> 按服务实际支持的模型名改。默认值按 provider 分组，**不会**再把 ElevenLabs 的 `scribe_v1`
+> 发给 OpenAI 兼容服务。
 
-> ⚠️ **自建本地服务也必须给一个非空 `MMGREP_ASR_API_KEY`**：provider 层是「key 为空就当没配置」，
-> 即使 `MMGREP_ASR_BASE_URL` 指向 `127.0.0.1`。本地服务不校验 key 时，随便填一个占位串即可
-> （例如 `MMGREP_ASR_API_KEY=local`）。
+> ⚠️ **自建本地服务也必须给一个非空 `MMGREP_OPENAI_COMPATIBLE_API_KEY`**：provider 层是「key 为空就当没配置」，
+> 即使 `MMGREP_OPENAI_COMPATIBLE_BASE_URL` 指向 `127.0.0.1`。本地服务不校验 key 时，随便填一个占位串即可
+> （例如 `MMGREP_OPENAI_COMPATIBLE_API_KEY=local`）。
 > 另外：只有本地地址时 `MMGREP_ASR_PROVIDER` 要写 `openai-compatible`，别写 `elevenlabs`。
 
 ### 3.3 文档解析：MinerU
@@ -244,10 +319,10 @@ MMGREP_ASR_MODEL=whisper-1
 
 ```bash
 MMGREP_DOC_PROVIDER=mineru
-MMGREP_DOC_API_KEY=你的token
+MMGREP_MINERU_API_KEY=你的token
 # 默认值，一般不用动
-MMGREP_DOC_BASE_URL=https://mineru.net/api/v4
-MMGREP_DOC_MODEL=          # 留空 = 用服务端默认模型；也可填 pipeline / vlm / MinerU-HTML
+MMGREP_MINERU_BASE_URL=https://mineru.net/api/v4
+MMGREP_MINERU_MODEL=          # 留空 = 用服务端默认模型；也可填 pipeline / vlm / MinerU-HTML
 MMGREP_DOC_TIMEOUT_MS=180000
 ```
 
@@ -266,6 +341,10 @@ MMGREP_DOC_TIMEOUT_MS=180000
 - key 只写在**你自己的**宿主配置或环境变量里，**不要提交进仓库**。
 - server 从不打印 key：日志和错误里只会出现 `set` / `unset`，返回值里的 `describe()` 也不含 key。
 - 错误信息里的 `sk-…` / `Bearer …` 会被脱敏成 `sk-***` / `Bearer ***`。
+- HTTP 模式下，provider key 也可以放在 `x-mmgrep-*` 请求头里（见 README「每请求凭据」）：
+  只对该请求生效，不缓存、不落盘、不出现在响应里；日志中出现的头值统一替换成 `[redacted]`。
+  多人共享的端点不要让大家把真实 key 写进客户端配置——优先让宿主连一个你自己控制的代理，
+  由代理注入凭据头。
 
 ---
 
@@ -346,12 +425,12 @@ rm -rf ~/.cache/multimediagrep/ab/abcdef.../
 | `TOOL_NOT_FOUND: ffmpeg is not installed or not on PATH.` | 同上 | 同上 |
 | `TOOL_NOT_FOUND: no PDF page rasterizer is available on this machine (pdftoppm, mutool, and gs were all missing).` | 没装 PDF 栅格化工具 | 装 `poppler-utils` / `mupdf-tools` / `ghostscript` 任意一个 |
 | `TOOL_NOT_FOUND: cannot read PDF metadata: no PDF tool is installed (pdfinfo, mutool, or qpdf).` | 同上（缺的是元信息工具） | 同上 |
-| probe 说 `asr: unavailable — No ASR provider is configured (set MMGREP_ASR_PROVIDER and MMGREP_ASR_API_KEY).` | 没配 ASR | 配 `MMGREP_ASR_PROVIDER` + `MMGREP_ASR_API_KEY`（§3.1 / §3.2），或传一个本地字幕文件 |
-| probe 说 `ocr: unavailable — No document parser is configured (MMGREP_DOC_PROVIDER is "none"). Scanned pages and images are returned as page images only.` | 没配文档解析 | 配 `MMGREP_DOC_PROVIDER=mineru` + `MMGREP_DOC_API_KEY`（§3.3）；扫描件没 OCR 就只能看页图 |
-| `PROVIDER_NOT_CONFIGURED`（文档） | 选了 provider 但缺 key | `MMGREP_DOC_API_KEY` 填上，或把 `MMGREP_DOC_PROVIDER` 去掉退回「只有页图」 |
+| probe 说 `asr: unavailable — No ASR provider is configured (set MMGREP_ASR_PROVIDER and the matching provider key: MMGREP_ELEVENLABS_API_KEY or MMGREP_OPENAI_COMPATIBLE_API_KEY).` | 没配 ASR | 配 `MMGREP_ASR_PROVIDER` + 对应 provider 的 key（§3.1 / §3.2），或传一个本地字幕文件 |
+| probe 说 `ocr: unavailable — No document parser is configured (MMGREP_DOC_PROVIDER is "none"). Scanned pages and images are returned as page images only.` | 没配文档解析 | 配 `MMGREP_DOC_PROVIDER=mineru` + `MMGREP_MINERU_API_KEY`（§3.3）；扫描件没 OCR 就只能看页图 |
+| `PROVIDER_NOT_CONFIGURED`（文档） | 选了 provider 但缺 key | `MMGREP_MINERU_API_KEY` 填上，或把 `MMGREP_DOC_PROVIDER` 去掉退回「只有页图」 |
 | `PROVIDER_FAILED: … HTTP 401/403 …` | key 不对 / token 过期 | 换 key；MinerU 常见业务码 `A0202`（token 错）、`A0211`（token 过期） |
-| `PROVIDER_FAILED`，但我明明用的是自己的服务 | `MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 没改 | 这两个的默认值是**写死的 ElevenLabs 值**，不跟 provider 变；显式写上（见 §3.2） |
-| `PROVIDER_FAILED: … HTTP 404 …` | 基址写错 | 检查 `MMGREP_ASR_BASE_URL` / `MMGREP_DOC_BASE_URL` |
+| `PROVIDER_FAILED`，但我明明用的是自己的服务 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_MODEL` 没改 | 这两个的默认值是 OpenAI 官方的 `https://api.openai.com/v1` + `whisper-1`；用自己的服务时显式写上（见 §3.2） |
+| `PROVIDER_FAILED: … HTTP 404 …` | 基址写错 | 检查 `MMGREP_ELEVENLABS_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_MINERU_BASE_URL` |
 | `PROVIDER_FAILED: ASR request timed out after 120000 ms.` | ASR 超时 | 调大 `MMGREP_ASR_TIMEOUT_MS`；或换更快的模型 |
 | `PROVIDER_FAILED` + 排队很久 | MinerU 排队 | 调大 `MMGREP_DOC_TIMEOUT_MS`（默认 180000） |
 | `NO_TRANSCRIPT: no transcript available for this file and no ASR provider is configured (MMGREP_ASR_PROVIDER="none"). …` | `media_locate` / `video_subtitles` 要文字但没有 | 配 ASR，或给 `transcriptFile` 传一个本地 `.srt`/`.vtt` |

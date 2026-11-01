@@ -54,8 +54,17 @@ async function loadCache(config, logger) {
  *   - 没配（none）→ null，功能降级为「只有画面」；
  *   - 配了但缺 key → provider 对象存在，真正转写时才抛清晰错误（由 provider 自己负责）；
  *   - provider 名拼错 / 模块缺失 → 记进 providerErrors，probe 的 capabilities 会说明原因。
+ *
+ * `pinCredentials` 供 HTTP 的逐请求路径使用：config 已经是「本请求最终生效」的凭据，
+ * 传空串也会原样钉住，从而阻止各 provider 工厂再去环境变量里找 key —— 否则请求头切到
+ * 另一个 provider 时，工厂的兜底逻辑可能把服务器上另一组凭据又捡回来。
+ *
+ * @param {object} config
+ * @param {object} env
+ * @param {object} logger
+ * @param {{ pinCredentials?: boolean }} [options]
  */
-async function loadProviders(config, env, logger) {
+export async function loadProviders(config, env, logger, { pinCredentials = false } = {}) {
   const providerErrors = {};
   let asrProvider = null;
   let docProvider = null;
@@ -69,10 +78,12 @@ async function loadProviders(config, env, logger) {
       } else {
         asrProvider = mod.createAsrProvider(env, {
           provider: config.asr.provider,
-          apiKey: config.asr.apiKey || undefined,
+          apiKey: pinCredentials ? config.asr.apiKey : (config.asr.apiKey || undefined),
           baseUrl: config.asr.baseUrl,
           model: config.asr.model,
-          language: config.asr.language === 'auto' ? undefined : config.asr.language,
+          language: pinCredentials && config.asr.language === 'auto'
+            ? ''
+            : (config.asr.language === 'auto' ? undefined : config.asr.language),
           timeoutMs: config.asr.timeoutMs,
         });
       }
@@ -93,9 +104,9 @@ async function loadProviders(config, env, logger) {
       } else {
         docProvider = mod.createDocProvider(env, {
           provider: config.doc.provider,
-          apiKey: config.doc.apiKey || undefined,
+          apiKey: pinCredentials ? config.doc.apiKey : (config.doc.apiKey || undefined),
           baseUrl: config.doc.baseUrl,
-          model: config.doc.model || undefined,
+          model: pinCredentials ? config.doc.model : (config.doc.model || undefined),
           timeoutMs: config.doc.timeoutMs,
         });
       }
@@ -204,8 +215,16 @@ export function createServer(runtimeOrOptions = {}) {
   return server;
 }
 
-/** 启动信息（只写 stderr；绝不写 stdout） */
-export function logStartupBanner(runtime) {
+/**
+ * 启动信息（只写 stderr；绝不写 stdout）。
+ *
+ * @param {object} runtime
+ * @param {object} [options]
+ * @param {string} [options.url] HTTP 模式下的真实地址；不给就走原来的 stdio 横幅（逐字不变）
+ * @param {boolean} [options.tokenSet] 是否配了 Bearer 令牌（**只说 set / unset，不说值**）
+ * @param {string|null} [options.warn] 需要额外提醒的一行（例如对外暴露且没有令牌）
+ */
+export function logStartupBanner(runtime, options = {}) {
   const { logger, config, backends } = runtime;
   const backendLabels = Object.entries(backends ?? {})
     .map(([mediaType, backend]) => {
@@ -213,7 +232,13 @@ export function logStartupBanner(runtime) {
       return `${mediaType}=${status?.placeholder === false ? 'ready' : 'placeholder'}`;
     })
     .join(' ');
-  logger.info(`${config.server.name}@${config.server.version} ready on stdio`);
+  if (options.url) {
+    logger.info(`${config.server.name}@${config.server.version} ready on ${options.url}`);
+    logger.info(`auth: bearer ${options.tokenSet ? 'set' : 'unset'}`);
+    if (options.warn) logger.warn(options.warn);
+  } else {
+    logger.info(`${config.server.name}@${config.server.version} ready on stdio`);
+  }
   logger.info(`cache: ${config.cache.dir} (max ${config.cache.maxBytes} bytes)`);
   logger.info(`asr: ${config.asr.provider}${config.asr.apiKey ? '' : ' (no API key)'} · doc: ${config.doc.provider} · ocr: ${config.ocr.provider}`);
   logger.info(`backends: ${backendLabels || '(none)'}`);

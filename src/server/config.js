@@ -30,11 +30,165 @@ export const DEFAULT_AUDIO_MIN_SPEECH_RATIO = 0.05;
 /** 契约 §12.5：provider 超时 */
 export const DEFAULT_ASR_TIMEOUT_MS = 120000;
 export const DEFAULT_DOC_TIMEOUT_MS = 180000;
-/** 契约 §12.2 / §12.3：默认基址与模型 */
+/** 契约 §12.2 / §12.3：默认基址与模型（按 provider 分组） */
 export const DEFAULT_ASR_BASE_URL = 'https://api.elevenlabs.io/v1';
 export const DEFAULT_ASR_MODEL = 'scribe_v1';
+export const DEFAULT_OPENAI_COMPATIBLE_BASE_URL = 'https://api.openai.com/v1';
+export const DEFAULT_OPENAI_COMPATIBLE_MODEL = 'whisper-1';
 export const DEFAULT_DOC_BASE_URL = 'https://mineru.net/api/v4';
 export const DEFAULT_DOC_MODEL = '';
+
+/* ------------------------------------------------------------------ *
+ * 传输方式（stdio / http）
+ * ------------------------------------------------------------------ */
+
+/** 默认走 stdio：MCP 客户端最常见的方式，不用开端口、不用鉴权 */
+export const DEFAULT_TRANSPORT_MODE = 'stdio';
+/** 目前只支持这两种传输方式 */
+export const TRANSPORT_MODES = Object.freeze(['stdio', 'http']);
+/** HTTP 默认只监听回环地址：本机自用不该暴露到网络上 */
+export const DEFAULT_HTTP_HOST = '127.0.0.1';
+/** HTTP 默认端口 */
+export const DEFAULT_HTTP_PORT = 3927;
+
+/**
+ * provider → 环境变量组。选哪个 provider 就只读哪一组，互不串用。
+ *
+ * 键名固定为 apiKey / baseUrl / model，值是**该 provider 专属**的环境变量名；
+ * defaultBaseUrl / defaultModel 是该 provider 自己的默认值。
+ */
+export const PROVIDER_ENV = Object.freeze({
+  asr: Object.freeze({
+    elevenlabs: Object.freeze({
+      apiKey: 'MMGREP_ELEVENLABS_API_KEY',
+      baseUrl: 'MMGREP_ELEVENLABS_BASE_URL',
+      model: 'MMGREP_ELEVENLABS_MODEL',
+      defaultBaseUrl: DEFAULT_ASR_BASE_URL,
+      defaultModel: DEFAULT_ASR_MODEL,
+    }),
+    'openai-compatible': Object.freeze({
+      apiKey: 'MMGREP_OPENAI_COMPATIBLE_API_KEY',
+      baseUrl: 'MMGREP_OPENAI_COMPATIBLE_BASE_URL',
+      model: 'MMGREP_OPENAI_COMPATIBLE_MODEL',
+      defaultBaseUrl: DEFAULT_OPENAI_COMPATIBLE_BASE_URL,
+      defaultModel: DEFAULT_OPENAI_COMPATIBLE_MODEL,
+    }),
+  }),
+  doc: Object.freeze({
+    mineru: Object.freeze({
+      apiKey: 'MMGREP_MINERU_API_KEY',
+      baseUrl: 'MMGREP_MINERU_BASE_URL',
+      model: 'MMGREP_MINERU_MODEL',
+      defaultBaseUrl: DEFAULT_DOC_BASE_URL,
+      defaultModel: DEFAULT_DOC_MODEL,
+    }),
+  }),
+});
+
+/** 旧的「所有 provider 共用一个」变量：专属变量未设置时兜底，并记弃用 warning。 */
+const LEGACY_ENV = Object.freeze({
+  asr: Object.freeze({
+    apiKey: 'MMGREP_ASR_API_KEY',
+    baseUrl: 'MMGREP_ASR_BASE_URL',
+    model: 'MMGREP_ASR_MODEL',
+  }),
+  doc: Object.freeze({
+    apiKey: 'MMGREP_DOC_API_KEY',
+    baseUrl: 'MMGREP_DOC_BASE_URL',
+    model: 'MMGREP_DOC_MODEL',
+  }),
+});
+
+const PROVIDER_ENV_VAR = Object.freeze({
+  asr: 'MMGREP_ASR_PROVIDER',
+  doc: 'MMGREP_DOC_PROVIDER',
+});
+
+/** provider=none 时仍保持旧内部形状的默认值（不读任何 provider 变量）。 */
+const NONE_DEFAULTS = Object.freeze({
+  asr: Object.freeze({ baseUrl: DEFAULT_ASR_BASE_URL, model: DEFAULT_ASR_MODEL }),
+  doc: Object.freeze({ baseUrl: DEFAULT_DOC_BASE_URL, model: DEFAULT_DOC_MODEL }),
+});
+
+/**
+ * 取某个 provider 的某个配置项：专属变量优先，旧的通用变量兜底。
+ * warning 里只出现变量名 / provider id，**永远不含变量值**。
+ */
+function readProviderSetting(env, kind, provider, field, warnings) {
+  const spec = PROVIDER_ENV[kind][provider];
+  const primary = spec[field];
+  const legacy = LEGACY_ENV[kind][field];
+
+  const primaryValue = readString(env, primary);
+  if (primaryValue !== undefined) return { value: primaryValue, source: primary };
+
+  const legacyValue = readString(env, legacy);
+  if (legacyValue === undefined) return { value: undefined, source: null };
+
+  warnings.push(`${legacy} is deprecated for provider "${provider}"; use ${primary} instead.`);
+  if (kind === 'asr' && provider === 'openai-compatible' && field === 'model') {
+    warnings.push(
+      `${legacy} was shared across ASR providers and may not be valid for "openai-compatible"; ` +
+        `use ${primary} instead (default: ${spec.defaultModel}).`,
+    );
+  }
+  return { value: legacyValue, source: legacy };
+}
+
+/**
+ * 解析一个 provider 分组（asr / doc），产出旧内部形状：
+ * { provider, apiKey, apiKeySource, baseUrl, model }。
+ */
+function resolveProviderSection(kind, requestedProvider, env, warnings) {
+  const noneDefaults = NONE_DEFAULTS[kind];
+  if (requestedProvider === 'none') {
+    return {
+      provider: 'none',
+      apiKey: '',
+      apiKeySource: null,
+      baseUrl: noneDefaults.baseUrl,
+      model: noneDefaults.model,
+    };
+  }
+
+  const spec = PROVIDER_ENV[kind][requestedProvider];
+  if (!spec) {
+    const envName = PROVIDER_ENV_VAR[kind];
+    warnings.push(
+      `${envName} is "${requestedProvider}", which is not a supported provider ` +
+        `(${Object.keys(PROVIDER_ENV[kind]).join(', ')}, none); falling back to "none".`,
+    );
+    return {
+      provider: 'none',
+      apiKey: '',
+      apiKeySource: null,
+      baseUrl: noneDefaults.baseUrl,
+      model: noneDefaults.model,
+    };
+  }
+
+  const apiKey = readProviderSetting(env, kind, requestedProvider, 'apiKey', warnings);
+  const baseUrl = readProviderSetting(env, kind, requestedProvider, 'baseUrl', warnings);
+  const model = readProviderSetting(env, kind, requestedProvider, 'model', warnings);
+
+  return {
+    provider: requestedProvider,
+    apiKey: apiKey.value ?? '',
+    apiKeySource: apiKey.source,
+    baseUrl: baseUrl.value ?? spec.defaultBaseUrl,
+    model: model.value ?? spec.defaultModel,
+  };
+}
+
+/** 取某 provider 的变量组（未知 provider 返回 null）。 */
+export function providerEnv(kind, providerId) {
+  return PROVIDER_ENV[kind]?.[String(providerId ?? '').toLowerCase()] ?? null;
+}
+
+/** 缺 key 报错时应点名的环境变量；未知 provider 回落到旧的通用名。 */
+export function providerApiKeyEnv(kind, providerId) {
+  return providerEnv(kind, providerId)?.apiKey ?? LEGACY_ENV[kind]?.apiKey ?? 'MMGREP_API_KEY';
+}
 
 /** server 身份（与 package.json 保持一致的硬编码，避免运行时读包信息） */
 export const SERVER_NAME = 'multimediagrep';
@@ -85,6 +239,38 @@ function readBool(env, key, fallback, { warnings } = {}) {
   return fallback;
 }
 
+/**
+ * 读传输方式：只认 stdio / http，写错就回落 stdio 并记 warning。
+ * 传输方式写错时**绝不能崩**——回落到 stdio 至少还能正常服务。
+ */
+function readTransportMode(env, warnings) {
+  const raw = readString(env, 'MMGREP_TRANSPORT');
+  if (raw === undefined) return DEFAULT_TRANSPORT_MODE;
+  const mode = raw.toLowerCase();
+  if (TRANSPORT_MODES.includes(mode)) return mode;
+  warnings.push(
+    `MMGREP_TRANSPORT is invalid ("${raw}"); using the default "${DEFAULT_TRANSPORT_MODE}" `
+      + `(supported: ${TRANSPORT_MODES.join(', ')}).`,
+  );
+  return DEFAULT_TRANSPORT_MODE;
+}
+
+/**
+ * 判断监听地址是不是「只有本机能连」。
+ *
+ * 与 src/server/index.js 的 isLoopbackUrl **故意不同**：那里 0.0.0.0 当作「本地基址」，
+ * 但这里 0.0.0.0 / :: 意味着绑定所有网卡——那是对外暴露，必须当成非回环。
+ */
+export function isLoopbackHost(host) {
+  if (!host) return false;
+  const text = String(host).trim().toLowerCase();
+  if (text === 'localhost') return true;
+  // 去掉 IPv6 的方括号与 zone id（fe80::1%en0）
+  const bare = text.replace(/^\[/, '').replace(/\]$/, '').split('%')[0];
+  if (bare === '::1') return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(bare);
+}
+
 /** 缓存目录：`~` 展开；相对路径按 cwd 解析（与 cache 模块的语义一致） */
 function readCacheDir(env, warnings) {
   const raw = readString(env, 'MMGREP_CACHE_DIR');
@@ -131,25 +317,43 @@ export function loadConfig(env = process.env) {
     warnings.push(`MMGREP_LOG_LEVEL is invalid ("${logLevelRaw}"); using "info".`);
   }
 
+  const asrSection = resolveProviderSection('asr', asrProvider, env, warnings);
+  const docSection = resolveProviderSection('doc', docProvider, env, warnings);
+
+  const transportMode = readTransportMode(env, warnings);
+  const httpHost = readString(env, 'MMGREP_HTTP_HOST') ?? DEFAULT_HTTP_HOST;
+  const httpPort = readInt(env, 'MMGREP_HTTP_PORT', DEFAULT_HTTP_PORT, { min: 1, max: 65535, warnings });
+  // 令牌本身是敏感值：这里只存原文给鉴权用，**任何日志路径都不许打印它**
+  // （describeConfig 只回答 set / unset）。
+  const httpToken = readString(env, 'MMGREP_HTTP_TOKEN') ?? '';
+
+  // 监听非回环地址又不配令牌 = 端点裸奔在网络上，必须提醒。
+  if (!isLoopbackHost(httpHost) && !httpToken) {
+    warnings.push(
+      `MMGREP_HTTP_HOST is not a loopback address ("${httpHost}") and MMGREP_HTTP_TOKEN is not set; `
+        + 'the HTTP endpoint would accept unauthenticated requests.',
+    );
+  }
+
   const config = {
     server: Object.freeze({ name: SERVER_NAME, version: SERVER_VERSION }),
+    transport: Object.freeze({
+      mode: transportMode,
+      host: httpHost,
+      port: httpPort,
+      token: httpToken,
+    }),
     cache: Object.freeze({
       dir: readCacheDir(env, warnings),
       maxBytes: readCacheMaxBytes(env, warnings),
     }),
     asr: Object.freeze({
-      provider: asrProvider,
-      apiKey: readString(env, 'MMGREP_ASR_API_KEY') ?? '',
-      baseUrl: readString(env, 'MMGREP_ASR_BASE_URL') ?? DEFAULT_ASR_BASE_URL,
-      model: readString(env, 'MMGREP_ASR_MODEL') ?? DEFAULT_ASR_MODEL,
+      ...asrSection,
       language: readString(env, 'MMGREP_ASR_LANGUAGE') ?? 'auto',
       timeoutMs: readInt(env, 'MMGREP_ASR_TIMEOUT_MS', DEFAULT_ASR_TIMEOUT_MS, { min: 1, warnings }),
     }),
     doc: Object.freeze({
-      provider: docProvider,
-      apiKey: readString(env, 'MMGREP_DOC_API_KEY') ?? '',
-      baseUrl: readString(env, 'MMGREP_DOC_BASE_URL') ?? DEFAULT_DOC_BASE_URL,
-      model: readString(env, 'MMGREP_DOC_MODEL') ?? DEFAULT_DOC_MODEL,
+      ...docSection,
       timeoutMs: readInt(env, 'MMGREP_DOC_TIMEOUT_MS', DEFAULT_DOC_TIMEOUT_MS, { min: 1, warnings }),
     }),
     ocr: Object.freeze({ provider: ocrProvider }),
@@ -183,11 +387,39 @@ export function loadConfig(env = process.env) {
 }
 
 /**
+ * 用命令行参数覆盖传输配置：**CLI > 环境变量 > 默认值**。
+ *
+ * 只覆盖 transport 这一段——后端、provider、缓存这些跟传输方式无关，
+ * 命令行也管不着。
+ *
+ * @param {object} config loadConfig() 的结果
+ * @param {object} [overrides] { mode?, host?, port?, token? }；值为 undefined 表示「不覆盖」
+ * @returns {Readonly<object>} 新的配置对象（原来那个保持不变）
+ */
+export function applyTransportOverrides(config, overrides = {}) {
+  const current = config.transport ?? {};
+  const next = {
+    mode: overrides.mode ?? current.mode ?? DEFAULT_TRANSPORT_MODE,
+    host: overrides.host ?? current.host ?? DEFAULT_HTTP_HOST,
+    port: overrides.port ?? current.port ?? DEFAULT_HTTP_PORT,
+    token: overrides.token ?? current.token ?? '',
+  };
+  return Object.freeze({ ...config, transport: Object.freeze(next) });
+}
+
+/**
  * 给日志/启动信息用的脱敏视图：**永远不含 apiKey 原文**。
  */
 export function describeConfig(config) {
   return {
     server: `${config.server.name}@${config.server.version}`,
+    transport: {
+      mode: config.transport?.mode ?? DEFAULT_TRANSPORT_MODE,
+      host: config.transport?.host ?? DEFAULT_HTTP_HOST,
+      port: config.transport?.port ?? DEFAULT_HTTP_PORT,
+      // 只回答「有没有配」，永远不回答「配的是什么」
+      token: config.transport?.token ? 'set' : 'unset',
+    },
     cache: { dir: config.cache.dir, maxBytes: config.cache.maxBytes },
     asr: {
       provider: config.asr.provider,

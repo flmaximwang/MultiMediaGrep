@@ -491,7 +491,7 @@ test('a 401 response is diagnosable and never leaks the token', async () => {
       () => withTempFile('doc.pdf', 'x', (filePath) => provider.parse({ filePath })),
       (err) => {
         assert.match(err.message, /401/);
-        assert.match(err.message, /MMGREP_DOC_API_KEY/);
+        assert.match(err.message, /MMGREP_MINERU_API_KEY/);
         assert.match(err.message, /A0202/);
         assert.ok(!err.message.includes('super-secret-token'), 'error message must not contain the token');
         return true;
@@ -524,7 +524,7 @@ test('a missing token produces a clear error naming the environment variable', a
   await assert.rejects(
     () => withTempFile('doc.pdf', 'x', (filePath) => provider.parse({ filePath })),
     (err) => {
-      assert.match(err.message, /MMGREP_DOC_API_KEY/);
+      assert.match(err.message, /MMGREP_MINERU_API_KEY/);
       assert.match(err.message, /MMGREP_DOC_PROVIDER/);
       return true;
     },
