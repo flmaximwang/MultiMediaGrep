@@ -1,9 +1,9 @@
-// src/server/tools.js —— 5 个 MCP 工具的定义与 handler
+// src/server/tools.js —— 4 个 MCP 工具的定义与 handler
 //
 // 分工（重要）：
 //   - 本文件负责**参数校验 + 分派 + 结果信封**（content blocks / structuredContent / 文本清单）。
 //   - 真正的媒体处理（取帧、转写、栅格化）由 src/backend/<type>/ 负责，见 backends.js。
-//   - 工具描述逐字来自 docs/mcp-contract.md §4.1 / §5.1 / §6.1 / §7.1 / §8.1，不要改写。
+//   - 工具描述逐字来自 docs/mcp-contract.md §4.1 / §5.1 / §6.1 / §7.1，不要改写。
 //
 // 校验一律复用 src/media/interface.js：validatePath / parsePages / validateTimeRange / validateCrop。
 
@@ -17,7 +17,7 @@ import { z } from 'zod';
 
 import { formatTimestamp } from '../export/format.js';
 import { exportAnalysis } from '../export/index.js';
-import { detectMediaType, isSubtitlePath } from '../media/detect.js';
+import { detectMediaType } from '../media/detect.js';
 import {
   METHOD_MATRIX,
   ToolError,
@@ -43,7 +43,7 @@ import {
 } from './images.js';
 
 /* ------------------------------------------------------------------ *
- * 工具描述（契约 §4.1–§8.1，逐字复制）
+ * 工具描述（契约 §4.1–§7.1，逐字复制）
  * ------------------------------------------------------------------ */
 
 export const PROBE_DESCRIPTION = `Inspect a local media file — video, audio recording, or document — and report what it is:
@@ -77,8 +77,12 @@ What you get depends on the media:
 - document : a grid of page thumbnails plus the text of each page, when a document parser is
              configured
 
+Pass images: 0 for a text-only, zero-pixel overview: no grid is rendered and no frame is
+decoded (a video costs no ffmpeg work at all), so you get only the transcript — or the page
+text for a document — and the reported budget is all zeros. Use it when you only need the words.
+
 TEXT SOURCE ORDER — subtitles first, ASR only as a fallback:
-1. a transcriptFile you pass in (external subtitle file),
+1. a subtitle you select explicitly (external subtitle file, track index or language code),
 2. the subtitle track embedded in the container,
 3. a subtitle file with the same base name in the same directory (a.srt next to a.mp4),
 4. ASR — only when none of the above exists and an ASR provider is configured.
@@ -133,25 +137,13 @@ and works for both Chinese and English. Long phrases match better than single ch
 Text only by default — no image, no pixels spent. Add includeFrame: true to also get the
 picture at the best match (one image, roughly 1,900 vision tokens).
 
-A transcript is required: the embedded subtitle track, a transcriptFile you pass in, or ASR
+A transcript is required: the embedded subtitle track, a subtitle you select explicitly, or ASR
 configured via MMGREP_ASR_PROVIDER. Subtitles win over ASR. If none is available this tool
 says so instead of guessing. Use media_overview if you only need the visuals.
 
 Each match is tagged with its source. A match whose source is "asr" came from machine
 transcription, so the wording may be wrong (names, numbers, jargon) — do not present it as the
 speaker's exact words.`;
-
-export const SUBTITLES_DESCRIPTION = `Read subtitles for a local media file and return them as timestamped segments.
-(读取本地字幕文件或视频内嵌字幕轨，解析成带时间轴的段落列表。)
-
-Two sources, in this order: an explicit transcriptFile (a local .srt, .vtt, .ass or .ssa file),
-or the subtitle track embedded in the container. Auto-discovery also picks up a sibling file
-with the same base name in the same directory (a.srt next to a.mp4) when neither of the above
-is available — the source and the exact path are always reported back, never silently.
-
-No image and no pixels spent: the result is text with millisecond and second timestamps.
-Use media_locate to search inside the subtitles. Use media_overview if you also want to see
-what is on screen.`;
 
 /* ------------------------------------------------------------------ *
  * 参数 schema
@@ -165,12 +157,20 @@ const PATH_PARAM = z.string().describe(
   'Absolute path to a LOCAL file: video, audio recording, or document. URLs and relative paths are rejected — this server never downloads anything. (本地文件绝对路径)',
 );
 
-const TRANSCRIPT_FILE_PARAM = z.string().optional().describe(
-  'Absolute path to a local subtitle/transcript file (.srt, .vtt, .ass, .ssa). Applicable to video and audio only. (本地字幕/转写文件)',
+const SUBTITLE_PARAM = z.union([z.string(), z.number()]).optional().describe(
+  'Choose the subtitle source explicitly (video and audio only, one parameter for all forms). '
+  + 'An absolute path to a local subtitle file (.srt, .vtt, .ass, .ssa); '
+  + 'a non-negative integer = the ffprobe stream index of a text subtitle track; '
+  + 'any other string = a language code matched against track tags.language (case-insensitive; "zh" also matches '
+  + '"chi"/"zho", "en" matches "eng"). An explicit choice never falls back: if it cannot be used, media_probe '
+  + 'only reports the reason and the other tools fail with INVALID_ARGUMENT. Omit it for the automatic order '
+  + '(embedded text track, then a sibling subtitle file, then ASR). (显式选择字幕来源：文件路径 / 字幕轨序号 / 语言码)',
 );
 
-const TRANSCRIPT_PARAM = z.enum(['auto', 'off']).optional().describe(
-  '"auto" (default): use subtitles first, ASR only as a fallback. "off": no transcription at all, visuals only. Applicable to video and audio only.',
+const TRANSCRIPT_PARAM = z.enum(['auto', 'subtitle', 'off']).optional().describe(
+  '"auto" (default): use subtitles first (explicit subtitle selection, embedded track, sibling file), ASR only as a fallback. '
+  + '"subtitle": read subtitles only and never call ASR; if there is no subtitle source the result is empty and says why. '
+  + '"off": no transcription at all, neither subtitles nor ASR; visuals only. Applicable to video and audio only.',
 );
 
 const START_PARAM = z.number().optional().describe(
@@ -194,7 +194,9 @@ const CELLS_PARAM = z.number().optional().describe(
 );
 
 const IMAGES_PARAM = z.number().optional().describe(
-  'How many puzzle images to return: 1-4, default 2. Applicable to video and document only. (返回几张拼图)',
+  'How many puzzle images to return: 0-4, default 2. Use 0 for the text-only mode: zero pixels — for video nothing is scanned '
+  + 'and no frame is decoded, for audio no waveform is drawn, for document no page is rendered; only the transcript '
+  + '(or page text) comes back and the budget is all zeros. Applicable to video and document; audio accepts 0 only. (返回几张拼图；0 = 纯文本模式)',
 );
 
 const MAX_EDGE_PARAM = z.number().optional().describe(
@@ -238,12 +240,12 @@ const INCLUDE_FRAME_PARAM = z.boolean().optional().describe(
 export const TOOL_SHAPES = Object.freeze({
   media_probe: {
     path: PATH_PARAM,
-    transcriptFile: TRANSCRIPT_FILE_PARAM,
+    subtitle: SUBTITLE_PARAM,
     transcript: TRANSCRIPT_PARAM,
   },
   media_overview: {
     path: PATH_PARAM,
-    transcriptFile: TRANSCRIPT_FILE_PARAM,
+    subtitle: SUBTITLE_PARAM,
     transcript: TRANSCRIPT_PARAM,
     start: START_PARAM,
     end: END_PARAM,
@@ -267,20 +269,13 @@ export const TOOL_SHAPES = Object.freeze({
     path: PATH_PARAM,
     query: QUERY_PARAM,
     max: MAX_MATCHES_PARAM,
-    transcriptFile: TRANSCRIPT_FILE_PARAM,
+    subtitle: SUBTITLE_PARAM,
     transcript: TRANSCRIPT_PARAM,
     start: START_PARAM,
     end: END_PARAM,
     segment: SEGMENT_PARAM,
     pages: PAGES_PARAM,
     includeFrame: INCLUDE_FRAME_PARAM,
-  },
-  video_subtitles: {
-    path: PATH_PARAM,
-    transcriptFile: TRANSCRIPT_FILE_PARAM,
-    start: START_PARAM,
-    end: END_PARAM,
-    pages: PAGES_PARAM,
   },
 });
 
@@ -298,11 +293,11 @@ export const PARAM_APPLICABILITY = Object.freeze({
   path: { media: ALL_MEDIA },
   query: { media: ALL_MEDIA },
   max: { media: ALL_MEDIA },
-  transcriptFile: {
+  subtitle: {
     media: ['video', 'audio'],
     message: (t) => (t === 'document'
-      ? 'transcriptFile is not applicable to document media. Documents have a page text layer, not a transcript.'
-      : `transcriptFile is not applicable to ${t} media.`),
+      ? 'subtitle is not applicable to document media. Documents have a page text layer, not a transcript.'
+      : `subtitle is not applicable to ${t} media.`),
   },
   transcript: {
     media: ['video', 'audio'],
@@ -358,6 +353,8 @@ export const PARAM_APPLICABILITY = Object.freeze({
   },
   images: {
     media: ['video', 'document'],
+    // 录音只认 images: 0（零像素纯文本模式）；其它取值对录音依然不适用。
+    allow: (value, mediaType) => mediaType === 'audio' && value === 0,
     message: (t) => `images is not applicable to ${t} media.`,
   },
   maxEdge: {
@@ -373,11 +370,13 @@ export const PARAM_APPLICABILITY = Object.freeze({
 /**
  * 契约 §2.2 的硬规则：**不适用的参数必须报错，不能静默忽略。**
  * 只检查调用方真的传了的参数（默认值不触发）。
+ * 规则的 `allow(value, mediaType)` 是值级豁免：参数对某媒体「部分适用」时用它放行。
  */
 export function checkApplicability(args, mediaType) {
   for (const [param, rule] of Object.entries(PARAM_APPLICABILITY)) {
     if (args?.[param] === undefined) continue;
     if (rule.media.includes(mediaType)) continue;
+    if (rule.allow?.(args[param], mediaType)) continue;
     throw new ToolError('INVALID_ARGUMENT', rule.message(mediaType));
   }
 }
@@ -461,33 +460,9 @@ function baseInput(base) {
 
 /** 内部 probe：overview / zoom / locate / subtitles 需要 durationSec / pageCount 做范围校验 */
 async function internalProbe(base, extraInput, call) {
-  const input = { ...baseInput(base), transcriptFile: null, transcript: 'auto', ...extraInput };
+  const input = { ...baseInput(base), subtitle: null, transcript: 'auto', ...extraInput };
   const result = await call.dispatcher.call(base.mediaType, 'probe', input, call.backendCtx);
   return result ?? {};
-}
-
-/**
- * transcriptFile 的校验（契约 §8.6）。
- * probe 除外（§4.5：probe 只报告、不报错），所以 probe 不走这里。
- */
-async function resolveTranscriptFile(value, { logger = null } = {}) {
-  if (value === undefined || value === null) return null;
-  const raw = String(value);
-  if (!isSubtitlePath(raw)) {
-    throw new ToolError(
-      'INVALID_ARGUMENT',
-      `transcriptFile must be one of .srt, .vtt, .ass, .ssa (got "${path.extname(raw) || raw}").`,
-      'Pass a local subtitle file path, e.g. "/abs/a.zh.srt".',
-    );
-  }
-  try {
-    return await validatePath(raw);
-  } catch (error) {
-    if (error instanceof ToolError && error.code === 'PATH_NOT_FOUND') {
-      throw new ToolError('PATH_NOT_FOUND', `transcriptFile does not exist: "${raw}".`);
-    }
-    throw error;
-  }
 }
 
 /** 时间窗参数 → 闭区间 [startMs, endMs]（契约 §2.3） */
@@ -532,6 +507,10 @@ function planOverviewImages(args, mediaType, config) {
   const limitEdge = config?.images?.maxEdge ?? IMAGE_LIMITS.maxMaxEdge;
 
   if (mediaType === 'audio') {
+    // images: 0 是零像素模式，压过 envelope：true —— 录音不出波形图。
+    if (args.images !== undefined && Number(args.images) === 0) {
+      return planImageBudget({ cells: 1, images: 0, maxEdge: 1280, explicit: true, limitTokens, limitEdge });
+    }
     if (!args.envelope) return null;
     return planImageBudget({ cells: 1, images: 1, maxEdge: 1280, explicit: false, limitTokens, limitEdge });
   }
@@ -603,11 +582,6 @@ function resolveTranscriptInfo(result, segments) {
  * 文本格式化（契约 §4.4 / §5.4 / §6.4 / §7.4 / §8.4）
  * ------------------------------------------------------------------ */
 
-function wrapText(text) {
-  const value = String(text ?? '');
-  return value ? `「${value}」` : '';
-}
-
 /** ASR 是机器转写：不加引号，避免看起来像原话（契约 §2.5 的硬约束） */
 function quoteBySource(text, source) {
   const value = String(text ?? '');
@@ -642,11 +616,12 @@ function truncateLines(headerLines, bodyLines, maxChars) {
   };
 }
 
-function formatOverviewSegmentLine(segment, mediaType) {
+function formatOverviewSegmentLine(segment, mediaType, textOnly = false) {
   if (mediaType === 'document') {
     return `${padLabel(`[page ${segment.page ?? segment.index}`)}] (${segment.source})  ${quoteBySource(segment.text, segment.source)}`.trimEnd();
   }
-  const label = mediaType === 'video' ? `[cell ${segment.index}` : `[seg ${segment.index}`;
+  // 纯文本模式（images: 0）没有宫格格位，段落是转写行而不是 cell。
+  const label = mediaType === 'video' && !textOnly ? `[cell ${segment.index}` : `[seg ${segment.index}`;
   const time = `${rangeLabel(segment.startMs, segment.endMs)}  `;
   return `${padLabel(label)}] ${time}(${segment.source})  ${quoteBySource(segment.text, segment.source)}`.trimEnd();
 }
@@ -706,6 +681,9 @@ function formatProbeText(result) {
   }
 
   lines.push(`transcript source: ${caps.transcriptSource ?? 'none'}${caps.transcriptPath ? ` (${caps.transcriptPath})` : ''}`);
+  if (caps.transcriptReason) {
+    lines.push(`transcript reason: ${caps.transcriptReason}`);
+  }
 
   const recommended = result.recommended ?? {};
   if (recommended.note) {
@@ -720,7 +698,7 @@ function formatProbeText(result) {
 }
 
 function formatOverviewText({
-  mediaType, base, window, pages, durationSec, segments, transcript, imageDescriptors, budget, hasAudio,
+  mediaType, base, window, pages, durationSec, segments, transcript, imageDescriptors, textOnly, budget, hasAudio,
 }) {
   const lines = [];
   const attrs = [`path="${base.path}"`, `type="${mediaType}"`];
@@ -761,14 +739,19 @@ function formatOverviewText({
     lines.push(`transcript: NONE (${transcript.reason ?? 'no transcript source is available for this file'})`);
   }
 
-  const bodyLines = segments.map((segment) => formatOverviewSegmentLine(segment, mediaType));
+  const bodyLines = segments.map((segment) => formatOverviewSegmentLine(segment, mediaType, textOnly));
   const truncated = truncateLines(lines, bodyLines, budget.maxInlineChars);
   const notes = [];
   if (imageDescriptors.length > 0) {
     notes.push(`cost: ${imageDescriptors.length} image(s) x ~${budget.perImageTokens ?? '-'} = ~${budget.estimatedTokens} vision tokens · transcript from ${transcript.source}${transcript.file ? ` (${transcript.file})` : ''}`);
   }
   if (mediaType === 'video') {
-    notes.push('note: the grids are for locating. To read text on screen, media_zoom({ path, at }) and read the cropped single frame.');
+    if (textOnly) {
+      notes.push('note: text-only mode (images: 0) — no storyboard grid was rendered and no frame was decoded; the list below is the transcript of this window.');
+      notes.push('note: to see the picture, call media_zoom({ path, at }) for a single frame.');
+    } else {
+      notes.push('note: the grids are for locating. To read text on screen, media_zoom({ path, at }) and read the cropped single frame.');
+    }
     if (transcript.source === 'asr') {
       notes.push('note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not quote these lines as the speaker\'s exact words.');
     }
@@ -779,6 +762,9 @@ function formatOverviewText({
       notes.push('note: source is subtitle — the author\'s own words, safe to quote.');
     }
   } else if (mediaType === 'document') {
+    if (textOnly) {
+      notes.push('note: text-only mode (images: 0) — no page thumbnail was rendered; the list below is the text of every requested page.');
+    }
     notes.push('note: page text comes from OCR of the rendered pages — verify names and numbers against the page image via media_zoom({ path, page }).');
   }
   if (budget.warning) notes.push(`budget: ${budget.warning}`);
@@ -858,23 +844,6 @@ function formatLocateText({ query, matches, totalSegments, mediaType }) {
   return lines.join('\n');
 }
 
-function formatSubtitlesText({ base, sourcePath, format, language, origin, segments }) {
-  const attrs = [
-    `path="${base.path}"`,
-    'source="subtitle"',
-    `origin="${origin}"`,
-    sourcePath ? `file="${sourcePath}"` : null,
-    format ? `format="${format}"` : null,
-    language ? `language="${language}"` : null,
-    `segments="${segments.length}"`,
-  ].filter(Boolean);
-  const lines = [`<subtitles ${attrs.join(' ')} />`];
-  for (const segment of segments) {
-    lines.push(`${padLabel(`[${segment.index}`, 4)}] ${rangeLabel(segment.startMs, segment.endMs)}  (subtitle)  ${wrapText(segment.text)}`.trimEnd());
-  }
-  return lines.join('\n');
-}
-
 /** 续读提示（契约 §5.3 的 continuation） */
 function buildContinuation({ mediaType, window, durationMs, pages, pageCount, truncated, lastSegment }) {
   if (mediaType === 'document') {
@@ -927,7 +896,7 @@ async function handleProbe(args, call) {
 
   const input = {
     ...baseInput(base),
-    transcriptFile: args.transcriptFile ?? null,
+    subtitle: args.subtitle ?? null,
     transcript: args.transcript ?? 'auto',
   };
   const result = (await call.dispatcher.call(base.mediaType, 'probe', input, call.backendCtx)) ?? {};
@@ -1020,6 +989,7 @@ function normalizeProbeResult(result, base, call) {
       transcriptSource: result.capabilities?.transcriptSource ?? 'none',
       transcriptOrigin: result.capabilities?.transcriptOrigin ?? 'none',
       transcriptPath: result.capabilities?.transcriptPath ?? null,
+      transcriptReason: result.capabilities?.transcriptReason ?? null,
     },
     recommended: defaultRecommended(mediaType, result.durationSec ?? null, result.pageCount ?? null),
   };
@@ -1091,7 +1061,7 @@ async function handleOverview(args, call) {
   await call.onProgress({ stage: 'scanning', used: describeWindowForProgress(args) });
 
   const probe = await internalProbe(base, {
-    transcriptFile: args.transcriptFile ?? null,
+    subtitle: args.subtitle ?? null,
     transcript: args.transcript ?? 'auto',
   }, call);
   const mediaType = refineMediaType(probe, base.mediaType);
@@ -1104,12 +1074,13 @@ async function handleOverview(args, call) {
   const pageCount = integerOrNull(probe.pageCount);
   const window = mediaType === 'document' ? null : computeTimeWindow(args, durationSec);
   const pages = mediaType === 'document' ? computePages(args, pageCount) : null;
-  const transcriptFile = mediaType === 'document' ? null : await resolveTranscriptFile(args.transcriptFile, { logger: call.logger });
 
   const plan = planOverviewImages(args, mediaType, call.config);
+  // images: 0 → 零像素纯文本模式：后端不出图，段落直接来自转写/页文字。
+  const textOnly = Boolean(plan && plan.requested.images === 0);
   const input = {
     ...baseInput({ ...base, mediaType }),
-    transcriptFile,
+    subtitle: args.subtitle ?? null,
     transcript: mediaType === 'document' ? undefined : (args.transcript ?? 'auto'),
     startMs: window?.startMs ?? null,
     endMs: window?.endMs ?? null,
@@ -1123,7 +1094,7 @@ async function handleOverview(args, call) {
     ...(plan ? { cells: plan.produced.cells, images: plan.produced.images, maxEdge: plan.produced.maxEdge } : {}),
   };
 
-  await call.onProgress({ stage: 'transcribing', used: transcriptFile ? path.basename(transcriptFile) : (args.transcript ?? 'auto') });
+  await call.onProgress({ stage: 'transcribing', used: args.subtitle !== undefined ? String(args.subtitle) : (args.transcript ?? 'auto') });
   const result = (await call.dispatcher.call(mediaType, 'overview', input, call.backendCtx)) ?? {};
   await call.onProgress({ stage: 'rendering', used: `${Array.isArray(result.images) ? result.images.length : 0} image(s)` });
 
@@ -1166,6 +1137,7 @@ async function handleOverview(args, call) {
     segments,
     transcript,
     imageDescriptors: descriptors,
+    textOnly,
     budget: {
       ...budget,
       maxInlineChars: call.config?.text?.maxInlineChars ?? DEFAULT_MAX_TEXT_INLINE_CHARS,
@@ -1507,7 +1479,7 @@ async function handleLocate(args, call) {
   }
 
   const probe = await internalProbe(base, {
-    transcriptFile: args.transcriptFile ?? null,
+    subtitle: args.subtitle ?? null,
     transcript: args.transcript ?? 'auto',
   }, call);
   const mediaType = refineMediaType(probe, base.mediaType);
@@ -1520,13 +1492,12 @@ async function handleLocate(args, call) {
   const pageCount = integerOrNull(probe.pageCount);
   const window = mediaType === 'document' ? null : computeTimeWindow(args, durationSec);
   const pages = mediaType === 'document' ? computePages(args, pageCount) : null;
-  const transcriptFile = mediaType === 'document' ? null : await resolveTranscriptFile(args.transcriptFile, { logger: call.logger });
 
   const input = {
     ...baseInput({ ...base, mediaType }),
     query: args.query,
     max,
-    transcriptFile,
+    subtitle: args.subtitle ?? null,
     transcript: mediaType === 'document' ? undefined : (args.transcript ?? 'auto'),
     startMs: window?.startMs ?? null,
     endMs: window?.endMs ?? null,
@@ -1622,77 +1593,16 @@ function normalizeMatches(rawMatches, pageCount) {
   });
 }
 
-async function handleSubtitles(args, call) {
-  const base = await resolveMedia(args);
-  if (base.mediaType === 'document') {
-    throw new ToolError(
-      'INVALID_ARGUMENT',
-      'video_subtitles is not applicable to document media. Documents have a page text layer, not a transcript.',
-    );
-  }
-  checkApplicability(args, base.mediaType);
-  checkMethod(base.mediaType, 'subtitles');
-
-  // 只有给了时间窗才需要 duration 做裁剪；没给就不额外 probe。
-  let durationSec = null;
-  if (args.start !== undefined || args.end !== undefined) {
-    const probe = await internalProbe(base, {}, call);
-    durationSec = numberOrNull(probe.durationSec);
-  }
-  const window = computeTimeWindow(args, durationSec);
-  const transcriptFile = await resolveTranscriptFile(args.transcriptFile, { logger: call.logger });
-
-  const input = {
-    ...baseInput(base),
-    transcriptFile,
-    startMs: window.startMs,
-    endMs: window.endMs,
-    startSec: window.startSec,
-    endSec: window.endSec,
-    clipped: window.clipped,
-  };
-  const result = (await call.dispatcher.call(base.mediaType, 'subtitles', input, call.backendCtx)) ?? {};
-  const segments = normalizeSegmentsSafe(result.segments);
-  const origin = result.origin ?? segments[0]?.origin ?? 'embedded';
-  const sourcePath = result.sourcePath ?? null;
-  const format = result.format ?? null;
-  const language = result.language ?? null;
-  const warnings = Array.isArray(result.warnings) ? result.warnings : [];
-
-  const text = formatSubtitlesText({ base, sourcePath, format, language, origin, segments });
-  const capped = truncateLines([], text.split('\n'), call.config?.text?.maxInlineChars);
-
-  const structuredContent = {
-    mediaType: base.mediaType,
-    path: base.path,
-    source: 'subtitle',
-    origin,
-    sourcePath,
-    format,
-    language,
-    segmentCount: segments.length,
-    segments,
-    ...(capped.truncated ? { truncated: true } : {}),
-    ...(warnings.length > 0 ? { warnings } : {}),
-  };
-
-  return {
-    content: [{ type: 'text', text: capped.text }],
-    structuredContent,
-  };
-}
-
 /* ------------------------------------------------------------------ *
  * 注册
  * ------------------------------------------------------------------ */
 
-/** 5 个工具的定义表（顺序即注册顺序） */
+/** 4 个工具的定义表（顺序即注册顺序） */
 export const TOOL_DEFINITIONS = Object.freeze([
   { name: 'media_probe', title: 'Probe media', description: PROBE_DESCRIPTION, shape: TOOL_SHAPES.media_probe, handler: handleProbe },
   { name: 'media_overview', title: 'Overview', description: OVERVIEW_DESCRIPTION, shape: TOOL_SHAPES.media_overview, handler: handleOverview },
   { name: 'media_zoom', title: 'Zoom', description: ZOOM_DESCRIPTION, shape: TOOL_SHAPES.media_zoom, handler: handleZoom },
   { name: 'media_locate', title: 'Locate', description: LOCATE_DESCRIPTION, shape: TOOL_SHAPES.media_locate, handler: handleLocate },
-  { name: 'video_subtitles', title: 'Subtitles', description: SUBTITLES_DESCRIPTION, shape: TOOL_SHAPES.video_subtitles, handler: handleSubtitles },
 ]);
 
 /**
@@ -1756,7 +1666,7 @@ export function createCallContext(runtime, extra, toolName) {
 }
 
 /**
- * 把 5 个工具注册到 McpServer。
+ * 把 4 个工具注册到 McpServer。
  *
  * @param {import('@modelcontextprotocol/sdk/server/mcp.js').McpServer} server
  * @param {object} runtime { config, logger, cache, asrProvider, docProvider, backends, dispatcher }

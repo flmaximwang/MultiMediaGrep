@@ -165,7 +165,7 @@ export function parseSubtitles(text, { format = null } = {}) {
   if (fmt === 'ass' || fmt === 'ssa') return parseAss(text);
   throw new ToolError(
     'TRANSCRIPT_UNREADABLE',
-    'transcriptFile format is not recognized. Supported formats: .srt, .vtt, .ass, .ssa.',
+    'subtitle format is not recognized. Supported formats: .srt, .vtt, .ass, .ssa.',
     'Pass a subtitle file with one of those extensions.',
   );
 }
@@ -176,7 +176,7 @@ export async function readSubtitleFile(filePath) {
   try {
     text = await readFile(filePath, 'utf8');
   } catch (err) {
-    throw new ToolError('PATH_NOT_FOUND', `transcriptFile does not exist or cannot be read: "${filePath}". (${err.code ?? err.message})`);
+    throw new ToolError('PATH_NOT_FOUND', `subtitle file does not exist or cannot be read: "${filePath}". (${err.code ?? err.message})`);
   }
   const format = detectSubtitleFormat(filePath) ?? detectSubtitleFormat(text);
   let segments;
@@ -188,7 +188,7 @@ export async function readSubtitleFile(filePath) {
   if (!segments || segments.length === 0) {
     throw new ToolError(
       'TRANSCRIPT_UNREADABLE',
-      `transcriptFile parsed to zero subtitles: "${filePath}" (detected format: ${format ?? 'unknown'}).`,
+      `subtitle file parsed to zero subtitles: "${filePath}" (detected format: ${format ?? 'unknown'}).`,
       'Check that the file is a real subtitle file with timestamps (srt/vtt/ass/ssa).',
     );
   }

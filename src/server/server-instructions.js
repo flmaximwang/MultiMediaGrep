@@ -22,11 +22,9 @@ READING ORDER
    or one page of a document, optionally cropped.
 4. media_locate — "where was X said" (timestamp) or "on which page" (page number). Text only
    by default; includeFrame adds one picture at the best match.
-5. video_subtitles — parse a local .srt/.vtt/.ass file or an embedded subtitle track into
-   timestamped segments.
 
 TEXT SOURCE ORDER — subtitles first, ASR only as a fallback
-1. a subtitle file you pass in (transcriptFile),
+1. a subtitle you select explicitly (subtitle: a file path, a track index, or a language code),
 2. the subtitle track embedded in the container,
 3. a subtitle file with the same base name in the same directory (a.srt next to a.mp4),
 4. ASR, and only when none of the above exists.

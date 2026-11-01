@@ -1,4 +1,4 @@
-// test/server/tools.test.js —— 5 个工具的参数校验、分派、返回信封与错误模型
+// test/server/tools.test.js —— 4 个工具的参数校验、分派、返回信封与错误模型
 //
 // 用本地 stub 后端（不碰 ffmpeg / 网络），通过 InMemoryTransport 走完整 MCP 协议：
 // listTools / callTool / notifications/progress 都是真实的 SDK 行为。
@@ -156,20 +156,6 @@ function makeBackend(kind, overrides = {}) {
         warnings: [],
       };
     },
-    async subtitles(input) {
-      calls.push({ method: 'subtitles', input });
-      return {
-        segments: [
-          { startMs: 1200, endMs: 4560, text: '第一行字幕', source: 'subtitle', origin: 'file' },
-          { startMs: 4560, endMs: 8100, text: '第二行字幕', source: 'subtitle', origin: 'file' },
-        ],
-        origin: 'file',
-        sourcePath: '/abs/a.zh.srt',
-        format: 'srt',
-        language: 'zh',
-        warnings: [],
-      };
-    },
   };
   return Object.assign(backend, overrides);
 }
@@ -202,13 +188,13 @@ function errorCode(result) {
  * 工具目录
  * ------------------------------------------------------------------ */
 
-test('listTools：5 个工具、描述带中文触发词、schema 完整', async () => {
+test('listTools：4 个工具、描述带中文触发词、schema 完整', async () => {
   const workspace = await makeWorkspace();
   try {
     await withClient(workspace, async (client) => {
       const listed = await client.listTools();
       assert.deepEqual(listed.tools.map((tool) => tool.name), [
-        'media_probe', 'media_overview', 'media_zoom', 'media_locate', 'video_subtitles',
+        'media_probe', 'media_overview', 'media_zoom', 'media_locate',
       ]);
       const byName = Object.fromEntries(listed.tools.map((tool) => [tool.name, tool]));
 
@@ -216,7 +202,6 @@ test('listTools：5 个工具、描述带中文触发词、schema 完整', async
       assert.match(byName.media_overview.description, /生成媒体总览/);
       assert.match(byName.media_zoom.description, /取本地视频/);
       assert.match(byName.media_locate.description, /定位：/);
-      assert.match(byName.video_subtitles.description, /读取本地字幕/);
 
       for (const tool of listed.tools) {
         assert.equal(tool.inputSchema.type, 'object');
@@ -229,13 +214,13 @@ test('listTools：5 个工具、描述带中文触发词、schema 完整', async
       }
 
       assert.deepEqual(Object.keys(byName.media_overview.inputSchema.properties).sort(), [
-        'cells', 'end', 'envelope', 'images', 'maxEdge', 'pages', 'path', 'segment', 'start', 'transcript', 'transcriptFile',
+        'cells', 'end', 'envelope', 'images', 'maxEdge', 'pages', 'path', 'segment', 'start', 'subtitle', 'transcript',
       ]);
       assert.deepEqual(Object.keys(byName.media_zoom.inputSchema.properties).sort(), [
         'at', 'crop', 'end', 'maxEdge', 'page', 'path', 'start',
       ]);
       assert.deepEqual(Object.keys(byName.media_locate.inputSchema.properties).sort(), [
-        'end', 'includeFrame', 'max', 'pages', 'path', 'query', 'segment', 'start', 'transcript', 'transcriptFile',
+        'end', 'includeFrame', 'max', 'pages', 'path', 'query', 'segment', 'start', 'subtitle', 'transcript',
       ]);
 
       // 参数 describe 里标注了适用媒体类型
@@ -382,8 +367,8 @@ test('不适用参数必须报契约原文案，不能静默忽略', async () =>
         ['media_overview', workspace.files.audio, { maxEdge: 1280 }, 'maxEdge is not applicable to audio media.'],
         ['media_overview', workspace.files.video, { envelope: true },
           'envelope is not applicable to video media. It only applies to audio recordings.'],
-        ['media_overview', workspace.files.document, { transcriptFile: '/abs/a.srt' },
-          'transcriptFile is not applicable to document media. Documents have a page text layer, not a transcript.'],
+        ['media_overview', workspace.files.document, { subtitle: '/abs/a.srt' },
+          'subtitle is not applicable to document media. Documents have a page text layer, not a transcript.'],
         ['media_overview', workspace.files.document, { transcript: 'off' },
           'transcript is not applicable to document media.'],
         ['media_locate', workspace.files.audio, { query: 'x', includeFrame: true },
@@ -545,6 +530,160 @@ test('media_overview（video）：先 text 后 image，全文落盘，budget 默
   }
 });
 
+test('media_overview：images: 0 是零像素纯文本模式——预算全零、零图片、全文照常落盘', async () => {
+  const workspace = await makeWorkspace();
+  try {
+    const overviewCalls = [];
+    const backends = stubBackends({
+      video: {
+        async overview(input) {
+          overviewCalls.push(input);
+          return {
+            segments: [
+              { startMs: 0, endMs: 30000, text: '第一句', source: 'subtitle', origin: 'file' },
+              { startMs: 30000, endMs: 60000, text: '第二句', source: 'subtitle', origin: 'file' },
+            ],
+            images: [],
+            transcript: { source: 'subtitle', origin: 'file', language: 'zh', provider: null, model: null },
+            warnings: [],
+          };
+        },
+      },
+    });
+    await withClient(workspace, async (client) => {
+      const result = await client.callTool({
+        name: 'media_overview',
+        arguments: { path: workspace.files.video, start: 0, end: 300, images: 0 },
+      });
+      assert.notEqual(result.isError, true);
+      assert.equal(result.content.length, 1, '纯文本模式不得带 image 块');
+      assert.equal(result.content[0].type, 'text');
+
+      const data = result.structuredContent;
+      assert.deepEqual(data.images, []);
+      assert.equal(data.budget.requestedImages, 0);
+      assert.equal(data.budget.producedImages, 0);
+      assert.equal(data.budget.requestedCells, 0);
+      assert.equal(data.budget.producedCells, 0);
+      assert.equal(data.budget.estimatedTokens, 0);
+      assert.equal(data.budget.limit, 4000);
+      assert.equal(data.budget.warning, null);
+      assert.equal(data.segments.length, 2);
+      assert.equal(data.segments[0].text, '第一句');
+      assert.equal(data.truncated, false);
+
+      // 传给后端的形状就是 images: 0（后端据此跳过镜头扫描与抽帧）
+      assert.equal(overviewCalls[0].images, 0);
+
+      // 全文照常落盘（契约 §9）
+      assert.ok(data.fullText.contentMd.endsWith('content.md'));
+      const contentMd = await readFile(data.fullText.contentMd, 'utf8');
+      assert.match(contentMd, /第一句/);
+      const segmentsJsonl = await readFile(data.fullText.segmentsJsonl, 'utf8');
+      assert.match(segmentsJsonl, /"text":"第一句"/);
+
+      // 续读提示在纯文本模式下依然可用
+      assert.equal(data.continuation.nextStartMs, 300000);
+      assert.match(data.continuation.note, /More media follows at 05:00\.000/);
+
+      // 文本清单：没有宫格就没有 cell，段落标成 seg
+      assert.match(result.content[0].text, /^<overview path=".*a\.mp4" type="video" window="0\.00-300\.00"/);
+      assert.match(result.content[0].text, /\[seg 1\s*\] 00:00\.000-00:30\.000\s+\(subtitle\)\s+「第一句」/);
+      assert.match(result.content[0].text, /text-only mode \(images: 0\)/);
+    }, { backends });
+  } finally {
+    await workspace.cleanup();
+  }
+});
+
+test('media_overview（audio）：images: 0 压过 envelope——不出波形图，预算全零', async () => {
+  const workspace = await makeWorkspace();
+  try {
+    const overviewCalls = [];
+    const backends = stubBackends({
+      audio: {
+        async overview(input) {
+          overviewCalls.push(input);
+          return {
+            segments: [{ startMs: 0, endMs: 4120, text: '第一段', source: 'asr', origin: 'asr' }],
+            images: [],
+            transcript: { source: 'asr', origin: 'asr', language: 'zh', provider: 'stub', model: 'stub-v1' },
+            warnings: [],
+          };
+        },
+      },
+    });
+    await withClient(workspace, async (client) => {
+      const result = await client.callTool({
+        name: 'media_overview',
+        arguments: { path: workspace.files.audio, images: 0, envelope: true },
+      });
+      assert.notEqual(result.isError, true);
+      assert.equal(result.content.length, 1, '纯文本模式不得带 image 块');
+
+      const data = result.structuredContent;
+      assert.deepEqual(data.images, []);
+      assert.equal(data.budget.requestedImages, 0);
+      assert.equal(data.budget.producedImages, 0);
+      assert.equal(data.budget.estimatedTokens, 0);
+      assert.equal(data.budget.warning, null);
+      assert.equal(data.segments.length, 1);
+
+      // images: 0 一路传到后端（后端据此压过 envelope: true）
+      assert.equal(overviewCalls[0].images, 0);
+      assert.equal(overviewCalls[0].envelope, true);
+    }, { backends });
+  } finally {
+    await workspace.cleanup();
+  }
+});
+
+test('media_overview（document）：images: 0 只回页文字，不出页缩略图', async () => {
+  const workspace = await makeWorkspace();
+  try {
+    const overviewCalls = [];
+    const backends = stubBackends({
+      document: {
+        async overview(input) {
+          overviewCalls.push(input);
+          return {
+            segments: [
+              { startMs: null, endMs: null, page: 3, text: 'page three text', source: 'ocr', origin: 'ocr' },
+              { startMs: null, endMs: null, page: 4, text: 'page four text', source: 'ocr', origin: 'ocr' },
+            ],
+            images: [],
+            transcript: { source: 'ocr', origin: 'ocr', language: 'en', provider: 'mineru', model: 'stub' },
+            warnings: [],
+          };
+        },
+      },
+    });
+    await withClient(workspace, async (client) => {
+      const result = await client.callTool({
+        name: 'media_overview',
+        arguments: { path: workspace.files.document, pages: '3-4', images: 0 },
+      });
+      assert.notEqual(result.isError, true);
+      assert.equal(result.content.length, 1, '纯文本模式不得带 image 块');
+
+      const data = result.structuredContent;
+      assert.deepEqual(data.images, []);
+      assert.equal(data.budget.requestedImages, 0);
+      assert.equal(data.budget.producedImages, 0);
+      assert.equal(data.budget.estimatedTokens, 0);
+      assert.equal(data.budget.warning, null);
+      assert.equal(data.pages.length, 2);
+      assert.equal(data.pages[0].page, 3);
+      assert.match(data.pages[0].text, /page three text/);
+      assert.equal(overviewCalls[0].images, 0);
+
+      assert.match(result.content[0].text, /text-only mode \(images: 0\)/);
+    }, { backends });
+  } finally {
+    await workspace.cleanup();
+  }
+});
+
 test('media_overview：end 超出时长裁剪到末尾并标记 clipped', async () => {
   const workspace = await makeWorkspace();
   try {
@@ -593,6 +732,20 @@ test('media_overview：范围/形状越界的契约错误', async () => {
       });
       assert.equal(errorCode(tooManyImages), 'BUDGET_EXCEEDED');
       assert.match(tooManyImages.content[0].text, /requested 5 images but the per-call limit is 4/);
+
+      // images 的下限是 0（零像素纯文本模式），负数仍然拒绝
+      const negativeImages = await client.callTool({
+        name: 'media_overview', arguments: { path: workspace.files.video, images: -1 },
+      });
+      assert.equal(errorCode(negativeImages), 'INVALID_ARGUMENT');
+      assert.equal(negativeImages.structuredContent.error.message, 'images must be an integer >= 0 (got -1).');
+
+      // 录音只认 images: 0：其它取值仍然不适用
+      const audioImages = await client.callTool({
+        name: 'media_overview', arguments: { path: workspace.files.audio, images: 2 },
+      });
+      assert.equal(errorCode(audioImages), 'INVALID_ARGUMENT');
+      assert.equal(audioImages.structuredContent.error.message, 'images is not applicable to audio media.');
     });
   } finally {
     await workspace.cleanup();
@@ -836,51 +989,34 @@ test('media_locate：零匹配不是错误（后端返回空数组）', async ()
 });
 
 /* ------------------------------------------------------------------ *
- * video_subtitles
+ * media_overview：字幕来源选择
  * ------------------------------------------------------------------ */
 
-test('video_subtitles：字幕段落、时间窗、document 不适用', async () => {
+test('media_overview：subtitle 与 transcript 参数原样转发给后端', async () => {
   const workspace = await makeWorkspace();
   try {
+    const backends = stubBackends();
     await withClient(workspace, async (client) => {
-      const result = await client.callTool({
-        name: 'video_subtitles', arguments: { path: workspace.files.video },
+      const byFile = await client.callTool({
+        name: 'media_overview',
+        arguments: {
+          path: workspace.files.video, images: 0, transcript: 'subtitle', subtitle: '/abs/a.zh.srt',
+        },
       });
-      assert.notEqual(result.isError, true);
-      const data = result.structuredContent;
-      assert.equal(data.source, 'subtitle');
-      assert.equal(data.origin, 'file');
-      assert.equal(data.format, 'srt');
-      assert.equal(data.language, 'zh');
-      assert.equal(data.segmentCount, 2);
-      assert.equal(data.segments[0].startMs, 1200);
-      assert.equal(data.segments[0].endSec, 4.56);
-      assert.match(result.content[0].text, /^<subtitles path=".*a\.mp4" source="subtitle" origin="file" file="\/abs\/a\.zh\.srt" format="srt" language="zh" segments="2" \/>/);
-      assert.match(result.content[0].text, /\[1\s+\] 00:01\.200-00:04\.560  \(subtitle\)  「第一行字幕」/);
+      assert.notEqual(byFile.isError, true, 'subtitle is forwarded to the backend');
 
-      const pages = await client.callTool({
-        name: 'video_subtitles', arguments: { path: workspace.files.video, pages: '1-3' },
+      const numeric = await client.callTool({
+        name: 'media_overview',
+        arguments: { path: workspace.files.video, images: 0, transcript: 'subtitle', subtitle: 2 },
       });
-      assert.equal(pages.structuredContent.error.message, 'pages is not applicable to video media. Use "start" and "end" (seconds) instead.');
+      assert.notEqual(numeric.isError, true);
 
-      const document = await client.callTool({
-        name: 'video_subtitles', arguments: { path: workspace.files.document },
-      });
-      assert.equal(errorCode(document), 'INVALID_ARGUMENT');
-      assert.match(document.content[0].text, /video_subtitles is not applicable to document media/);
-
-      const missingFile = await client.callTool({
-        name: 'video_subtitles', arguments: { path: workspace.files.video, transcriptFile: '/definitely/not/here.srt' },
-      });
-      assert.equal(errorCode(missingFile), 'PATH_NOT_FOUND');
-      assert.equal(missingFile.structuredContent.error.message, 'transcriptFile does not exist: "/definitely/not/here.srt".');
-
-      const badExt = await client.callTool({
-        name: 'video_subtitles', arguments: { path: workspace.files.video, transcriptFile: '/abs/a.txt' },
-      });
-      assert.equal(errorCode(badExt), 'INVALID_ARGUMENT');
-      assert.match(badExt.content[0].text, /transcriptFile must be one of \.srt, \.vtt, \.ass, \.ssa \(got "\.txt"\)\./);
-    });
+      const calls = backends.video.calls.filter((call) => call.method === 'overview');
+      assert.equal(calls[0].input.subtitle, '/abs/a.zh.srt');
+      assert.equal(calls[0].input.transcript, 'subtitle');
+      assert.equal(calls[0].input.images, 0);
+      assert.equal(calls[1].input.subtitle, 2);
+    }, { backends });
   } finally {
     await workspace.cleanup();
   }

@@ -406,7 +406,8 @@ rm -rf ~/.cache/multimediagrep/ab/abcdef.../
 | 2. 主体阅读 | `media_overview` | 0–4 张（默认 2 张：视频 9 格/张，文档 6 格/张） |
 | 3. 只放大有用的部分 | `media_zoom` | 1 张（~1900 token，**最贵**） |
 | 4. 「那句话在哪」 | `media_locate` | 0（`includeFrame: true` 才 +1 张） |
-| （可选）读字幕 | `video_subtitles` | 0 |
+
+> 只需要字幕文字时，用 `media_overview` + `images: 0` + `transcript: "subtitle"`（或带 `subtitle` 显式选择来源）：零图片，只回转写段落。
 
 **长素材先收窄**：超过 30 分钟的视频、超过 30 页的文档，先用 `start`/`end` 或 `pages` 取一小段，
 再跟着结果里的 `continuation.nextStartMs` / `continuation.nextPage` 一段段往下走。
@@ -433,7 +434,7 @@ rm -rf ~/.cache/multimediagrep/ab/abcdef.../
 | `PROVIDER_FAILED: … HTTP 404 …` | 基址写错 | 检查 `MMGREP_ELEVENLABS_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_MINERU_BASE_URL` |
 | `PROVIDER_FAILED: ASR request timed out after 120000 ms.` | ASR 超时 | 调大 `MMGREP_ASR_TIMEOUT_MS`；或换更快的模型 |
 | `PROVIDER_FAILED` + 排队很久 | MinerU 排队 | 调大 `MMGREP_DOC_TIMEOUT_MS`（默认 180000） |
-| `NO_TRANSCRIPT: no transcript available for this file and no ASR provider is configured (MMGREP_ASR_PROVIDER="none"). …` | `media_locate` / `video_subtitles` 要文字但没有 | 配 ASR，或给 `transcriptFile` 传一个本地 `.srt`/`.vtt` |
+| `NO_TRANSCRIPT: no transcript available for this file and no ASR provider is configured (MMGREP_ASR_PROVIDER="none"). …` | `media_locate` / `media_overview`（`transcript: "auto"`）要文字但没有 | 配 ASR，或给 `subtitle` 传一个本地 `.srt`/`.vtt` 文件、字幕轨 index 或语言码；也可以改用 `media_overview({ images: 0, transcript: "subtitle", subtitle })` 只读字幕 |
 | `NO_TRANSCRIPT: cannot search this document: no text layer and no OCR provider is configured. There is nothing to search.` | 扫描件没 OCR，又要定位文字 | 配文档 provider，或先把 PDF 转成带文字层的版本 |
 | 录音转写永远是空的 | 音频体检判定 `too-quiet` / `silent`（**故意的**） | 换一份清楚的录音；或调低 `MMGREP_AUDIO_MIN_DBFS` / `MMGREP_AUDIO_MIN_SPEECH_RATIO` |
 | `BUDGET_EXCEEDED: requested 5 images but the per-call limit is 4. …` | 一次要太多图 | 减 `images`/`cells`，或用 `start`/`end` / `pages` 分段 |

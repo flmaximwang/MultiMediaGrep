@@ -8,7 +8,12 @@ import { stat } from 'node:fs/promises';
 import { audioConfig, computeAudioHealth } from '../../media/audio-health.js';
 import { ffprobeJson, run } from '../../media/ffmpeg.js';
 import { ToolError } from '../../media/interface.js';
-import { discoverSiblingSubtitles, pickSubtitleStream } from '../../media/transcript.js';
+import {
+  analyzeSubtitleStreams,
+  bitmapSkippedWarnings,
+  describeSubtitleSelection,
+  discoverSiblingSubtitles,
+} from '../../media/transcript.js';
 import {
   displayAspect,
   normalizeRotation,
@@ -202,40 +207,38 @@ export async function getAudioHealth(media, ctx = {}) {
   return pending;
 }
 
-/** 显式 transcriptFile 在 probe 里只「报告」：不存在/不是文件时不报错，也不当作来源 */
-async function explicitSubtitleFile(filePath) {
-  if (!filePath) return null;
-  try {
-    const info = await stat(filePath);
-    return info.isFile() ? filePath : null;
-  } catch {
-    return null;
-  }
-}
-
+/** 显式 subtitle 在 probe 里只「报告」：不可用时不报错，也不拿自动来源冒充（契约 §4.5） */
 export async function shapeProbe({ media, audioHealth, input, ctx }) {
-  let subtitlePath = null;
-  let subtitleOrigin = null;
-  const explicit = await explicitSubtitleFile(input?.transcriptFile);
-  if (explicit) {
-    subtitlePath = explicit;
-    subtitleOrigin = 'file';
-  } else if (pickSubtitleStream(media.streams) !== null) {
-    subtitleOrigin = 'embedded';
-  } else {
-    const sibling = (await discoverSiblingSubtitles(input.path))[0] ?? null;
-    if (sibling) {
-      subtitlePath = sibling.path;
-      subtitleOrigin = 'file';
+  const subtitleAnalysis = analyzeSubtitleStreams(media.streams);
+  const explicit = await describeSubtitleSelection({
+    subtitle: input?.subtitle,
+    streams: media.streams,
+  });
+  const explicitError = explicit?.error ?? null;
+  let subtitlePath = explicit?.sourcePath ?? null;
+  let subtitleOrigin = explicit && !explicitError ? explicit.origin : null;
+  if (!explicit) {
+    if (subtitleAnalysis.stream !== null) {
+      subtitleOrigin = 'embedded';
+    } else {
+      const sibling = (await discoverSiblingSubtitles(input.path))[0] ?? null;
+      if (sibling) {
+        subtitlePath = sibling.path;
+        subtitleOrigin = 'file';
+      }
     }
   }
 
+  const transcriptMode = input?.transcript ?? 'auto';
   const provider = ctx.asrProvider ?? null;
   let asrAvailable = Boolean(provider) && audioHealth.effective;
   let asrReason = null;
-  if (input?.transcript === 'off') {
+  if (transcriptMode === 'off') {
     asrAvailable = false;
     asrReason = 'Transcription was disabled for this call (transcript: "off").';
+  } else if (transcriptMode === 'subtitle') {
+    asrAvailable = false;
+    asrReason = 'transcript is "subtitle": only subtitle sources are read and ASR is never called.';
   } else if (!media.hasAudio) {
     asrAvailable = false;
     asrReason = 'This file has no audio track.';
@@ -248,13 +251,21 @@ export async function shapeProbe({ media, audioHealth, input, ctx }) {
 
   let transcriptSource = 'none';
   let transcriptOrigin = 'none';
-  if (subtitleOrigin) {
+  if (explicitError) {
+    // 显式选择不可用：probe 只报告原因，不把 ASR 或自动发现的来源说成「已选中」
+  } else if (transcriptMode !== 'off' && subtitleOrigin) {
     transcriptSource = 'subtitle';
     transcriptOrigin = subtitleOrigin;
   } else if (asrAvailable) {
     transcriptSource = 'asr';
     transcriptOrigin = 'asr';
   }
+  // 有字幕轨却没用上（如只有图形字幕）时，probe 也要说明原因；
+  // 显式选择多条命中时，把「其余命中」一并交代出来。
+  const explicitNote = explicit?.warnings?.length ? explicit.warnings.join('; ') : null;
+  const bitmapReason = bitmapSkippedWarnings(subtitleAnalysis.bitmapSkipped).join('; ');
+  const transcriptReason = explicitError
+    ?? (transcriptSource === 'subtitle' ? explicitNote : (bitmapReason || null));
 
   const long = media.durationSec !== null && media.durationSec > 1800;
   return {
@@ -294,6 +305,7 @@ export async function shapeProbe({ media, audioHealth, input, ctx }) {
       transcriptSource,
       transcriptOrigin,
       transcriptPath: transcriptPathFor(transcriptOrigin, subtitlePath),
+      transcriptReason,
     },
     recommended: {
       mode: long ? 'sequence' : 'single',

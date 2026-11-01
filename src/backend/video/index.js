@@ -3,22 +3,21 @@
 // 职责：
 //   probe     容器/流信息 + 音频体检 + 转写来源判定（不扫镜头、不烧图）
 //   overview  分镜宫格 + 按格对齐的时间/文字清单（字幕优先，ASR 兜底）
+//              images: 0 时走零像素纯文本模式：不扫镜头、不抽帧，只回转写段落
 //   zoom      单帧特写（at 精确帧 / start+end 选最清晰帧，crop 在缩放后裁）
 //   locate    在转写里找短语，返回时间码；可选附带最佳匹配处的一帧
-//   subtitles 只读已有字幕，绝不跑 ASR
 //
 // 约定见 docs/mcp-contract.md §4–§8。这里不调用任何 LLM，也不下载任何东西。
 
 import { ToolError } from '../../media/interface.js';
 import { matchSegments, splitIntoSentences } from '../../media/match.js';
-import { resolveSubtitleSource } from '../../media/transcript.js';
 import { getAudioHealth, probeVideoMedia, readVideoInfo } from './probe.js';
 import { resolveTranscript } from './transcript.js';
 import { composeOverviewImages, detectCuts } from './storyboard.js';
 import { captureFrame, outputGeometry, pickSharpest } from './capture.js';
 
 const NO_TRANSCRIPT_MESSAGE = 'no transcript available for this file and no ASR provider is configured (MMGREP_ASR_PROVIDER="none"). '
-  + 'Pass transcriptFile with a local .srt/.vtt file, or configure an ASR provider. '
+  + 'Pass subtitle with a local .srt/.vtt file, a track index, or a language code, or configure an ASR provider. '
   + 'For visuals only, use media_overview instead.';
 
 function clampInt(value, min, max, fallback) {
@@ -74,7 +73,7 @@ function noTranscriptError(input, ctx, transcript) {
   return new ToolError(
     'NO_TRANSCRIPT',
     `no transcript available for this file: ${reason} `
-      + 'Pass transcriptFile with a local .srt/.vtt file, or use media_overview instead.',
+      + 'Pass subtitle with a local .srt/.vtt file, a track index, or a language code, or use media_overview instead.',
   );
 }
 
@@ -107,10 +106,10 @@ export function createVideoBackend(ctx = {}) {
     const warnings = [];
     const window = computeWindow(input, media, warnings);
     const cells = clampInt(input.cells, 1, 16, 9);
-    const images = clampInt(input.images, 1, 4, 2);
+    const images = clampInt(input.images, 0, 4, 2);
     const maxEdge = clampInt(input.maxEdge, 256, 1600, 1280);
 
-    c.onProgress?.({ stage: 'transcript', used: input.transcriptFile ? 'transcriptFile' : (input.transcript ?? 'auto') });
+    c.onProgress?.({ stage: 'transcript', used: input.subtitle !== undefined && input.subtitle !== null ? String(input.subtitle) : (input.transcript ?? 'auto') });
     const transcriptData = await resolveTranscript(input, c, media, {
       fromSec: window.startSec,
       toSec: window.endSec,
@@ -123,34 +122,50 @@ export function createVideoBackend(ctx = {}) {
       (segment) => overlapsWindow(segment, window.startMs, window.endMs),
     );
 
-    c.onProgress?.({ stage: 'scanning', used: `${window.startSec.toFixed(2)}-${window.endSec.toFixed(2)}s` });
-    const cuts = await detectCuts({
-      inputPath: input.path,
-      fps: media.fpsForScan,
-      startSec: window.startSec,
-      endSec: window.endSec,
-      signal: c.signal,
-      warnings,
-    });
+    // images: 0 = 零像素纯文本模式：完全不扫镜头、不抽帧，只回转写段落。
+    // 这条路径上不会有任何 ffmpeg 子进程（探针只走 ffprobe 读元信息）。
+    let composed = { images: [], segments: [] };
+    if (images > 0) {
+      c.onProgress?.({ stage: 'scanning', used: `${window.startSec.toFixed(2)}-${window.endSec.toFixed(2)}s` });
+      const cuts = await detectCuts({
+        inputPath: input.path,
+        fps: media.fpsForScan,
+        startSec: window.startSec,
+        endSec: window.endSec,
+        signal: c.signal,
+        warnings,
+      });
 
-    c.onProgress?.({ stage: 'frames', used: `${cells} cells x up to ${images} image(s)` });
-    const composed = await composeOverviewImages({
-      inputPath: input.path,
-      startSec: window.startSec,
-      endSec: window.endSec,
-      cuts,
-      capacity: cells,
-      maxImages: images,
-      maxEdge,
-      aspect: media.aspect,
-      transcriptSegments,
-      transcriptSource: transcriptData.transcript.source,
-      transcriptOrigin: transcriptData.transcript.origin,
-      concurrency: c.config?.runtime?.concurrency ?? 2,
-      signal: c.signal,
-      onProgress: c.onProgress,
-      warnings,
-    });
+      c.onProgress?.({ stage: 'frames', used: `${cells} cells x up to ${images} image(s)` });
+      composed = await composeOverviewImages({
+        inputPath: input.path,
+        startSec: window.startSec,
+        endSec: window.endSec,
+        cuts,
+        capacity: cells,
+        maxImages: images,
+        maxEdge,
+        aspect: media.aspect,
+        transcriptSegments,
+        transcriptSource: transcriptData.transcript.source,
+        transcriptOrigin: transcriptData.transcript.origin,
+        concurrency: c.config?.runtime?.concurrency ?? 2,
+        signal: c.signal,
+        onProgress: c.onProgress,
+        warnings,
+      });
+    } else {
+      // 没有宫格就没有 cell：段落直接就是转写行（字幕 / ASR），时间码原样保留。
+      composed.segments = transcriptSegments.map((segment, i) => ({
+        index: i + 1,
+        startMs: segment.startMs ?? null,
+        endMs: segment.endMs ?? null,
+        text: segment.text ?? '',
+        source: segment.source ?? transcriptData.transcript.source,
+        origin: segment.origin ?? transcriptData.transcript.origin,
+        page: null,
+      }));
+    }
 
     return {
       mediaType: 'video',
@@ -310,53 +325,7 @@ export function createVideoBackend(ctx = {}) {
     };
   }
 
-  /** 契约 §8：只用已有字幕，不跑 ASR；完全没有字幕来源 → NO_TRANSCRIPT */
-  async function subtitles(input, callCtx = backendCtx()) {
-    const c = callCtx;
-    const media = await readVideoInfo(input, c);
-    const warnings = [];
-    const subtitle = await resolveSubtitleSource({
-      mediaPath: input.path,
-      transcriptFile: input.transcriptFile,
-      streams: media.streams,
-      signal: c.signal,
-      warnings,
-    });
-    if (!subtitle) {
-      throw new ToolError(
-        'NO_TRANSCRIPT',
-        `no subtitle source for "${input.path}": no embedded subtitle track, no sibling .srt/.vtt/.ass/.ssa file, `
-          + 'and no ASR provider configured. Pass transcriptFile with a local subtitle file.',
-      );
-    }
-    mergeWarnings(warnings, subtitle.warnings);
-
-    let segments = subtitle.segments.map((segment, i) => ({
-      ...segment,
-      index: i + 1,
-      source: 'subtitle',
-      origin: subtitle.origin,
-    }));
-    const startMs = Number.isInteger(input.startMs) ? input.startMs : null;
-    const endMs = Number.isInteger(input.endMs) ? input.endMs : null;
-    if (startMs !== null || endMs !== null) {
-      segments = segments.filter((segment) => overlapsWindow(segment, startMs, endMs));
-    }
-    segments = segments.map((segment, i) => ({ ...segment, index: i + 1 }));
-
-    return {
-      mediaType: 'video',
-      path: input.path,
-      segments,
-      origin: subtitle.origin,
-      sourcePath: subtitle.sourcePath ?? null,
-      format: subtitle.format ?? null,
-      language: subtitle.language ?? null,
-      warnings,
-    };
-  }
-
-  return { probe, overview, zoom, locate, subtitles };
+  return { probe, overview, zoom, locate };
 }
 
 export default createVideoBackend;

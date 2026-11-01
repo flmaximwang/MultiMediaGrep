@@ -16,7 +16,7 @@ const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.t
 const TEXT_DOC_EXT = new Set(['.txt', '.md', '.markdown']);
 /** Office 文档：本版不解析，但归到 document，让后端给出「先转 PDF」的准确提示 */
 const OFFICE_DOC_EXT = new Set(['.docx', '.doc', '.pptx', '.ppt', '.xlsx', '.xls', '.odt', '.odp', '.ods']);
-/** 字幕文件不是「媒体」，是 transcriptFile 的输入 */
+/** 字幕文件不是「媒体」，是 subtitle 参数的输入 */
 export const SUBTITLE_EXT = new Set(['.srt', '.vtt', '.ass', '.ssa']);
 
 export function extOf(filePath) {

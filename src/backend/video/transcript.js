@@ -1,6 +1,6 @@
 // src/backend/video/transcript.js —— 视频的转写来源（字幕优先，ASR 兜底）
 //
-// 契约 §8.5 的顺序写死：显式 transcriptFile → 内嵌字幕轨 → 同目录同名文件 → ASR。
+// 契约 §8.5 的顺序写死：显式 subtitle 选择 → 内嵌字幕轨 → 同目录同名文件 → ASR。
 // 只要前三步命中，就**绝不**跑 ASR：字幕是作者写的、准确且免费。
 // ASR 只转写调用方关心的窗口（overview 的 start/end、locate 的搜索范围），
 // 长视频不会因为窗口只有 1 分钟就整片转写。
@@ -32,7 +32,7 @@ function clamp(value, min, max) {
 /**
  * 解析本次调用实际可用的转写。
  *
- * @param {object} input 后端输入（path/transcriptFile/transcript）
+ * @param {object} input 后端输入（path/subtitle/transcript）
  * @param {object} ctx backend call context
  * @param {object} media readVideoInfo() 的产物
  * @param {object} [opts]
@@ -48,10 +48,21 @@ export async function resolveTranscript(input, ctx, media, {
   warnings = [],
   healthProvider = null,
 } = {}) {
+  // transcript: "off" 是「完全不要文字」：字幕也不读，直接返回空。
+  if (input.transcript === 'off') {
+    warnings.push('transcript-disabled');
+    return {
+      segments: [],
+      transcript: noneTranscript('transcription was disabled for this call (transcript: "off").'),
+      warnings,
+      audioHealth: null,
+    };
+  }
+
   const subtitleWarnings = [];
   const subtitle = await resolveSubtitleSource({
     mediaPath: input.path,
-    transcriptFile: input.transcriptFile,
+    subtitle: input.subtitle,
     streams: media.streams,
     signal: ctx.signal,
     warnings: subtitleWarnings,
@@ -78,15 +89,20 @@ export async function resolveTranscript(input, ctx, media, {
     };
   }
 
-  if (input.transcript === 'off') {
-    warnings.push('transcript-disabled');
+  // 没有命中字幕来源时，也要把「字幕轨存在但用不上」的原因带进调用方 warnings
+  mergeWarnings(warnings, subtitleWarnings);
+
+  // transcript: "subtitle" 只读字幕，绝不回退到 ASR。
+  if (input.transcript === 'subtitle') {
+    warnings.push('no-subtitle-source');
     return {
       segments: [],
-      transcript: noneTranscript('transcription was disabled for this call (transcript: "off").'),
-      warnings,
+      transcript: noneTranscript('no subtitle source was found for this file (transcript: "subtitle"); ASR was not used.'),
+      warnings: mergeWarnings(warnings, subtitleWarnings),
       audioHealth: null,
     };
   }
+
   if (!media.hasAudio) {
     warnings.push('audio-no-audio-track');
     return {

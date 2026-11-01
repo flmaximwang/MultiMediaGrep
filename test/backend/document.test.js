@@ -344,6 +344,39 @@ test('overview：页子集、格数 / 图数 / maxEdge 与每页文字严格对�
   });
 });
 
+test('overview：images: 0 是零像素纯文本模式——不出页图，只回页文字', {
+  skip: skipPdfProbe,
+  timeout: 120000,
+}, async () => {
+  await withCache(async () => {
+    const backend = createDocumentBackend({ config: {} });
+    const result = await backend.overview({
+      path: TEXT_PDF,
+      pages: [2, 3],
+      cells: 2,
+      images: 0,
+      maxEdge: 800,
+    });
+
+    assert.deepEqual(result.images, [], '零像素模式不得渲染页图');
+    assert.deepEqual(result.segments.map((segment) => segment.page), [2, 3]);
+    for (const segment of result.segments) {
+      assert.equal(segment.startMs, null);
+      assert.equal(segment.endMs, null);
+      assert.equal(segment.source, 'ocr');
+      assert.equal(segment.origin, 'ocr');
+      for (const line of groundTruthLines(TEXT_GT, segment.page)) {
+        assert.ok(segment.text.includes(line), `page ${segment.page} must contain "${line}"`);
+      }
+    }
+    assert.ok(result.segments[0].text.includes('PAGE TWO HEADING'));
+    assert.ok(result.segments[1].text.includes('PAGE THREE HEADING'));
+    // 没出图就不该有「图片预算只覆盖了 N 页」的告警
+    assert.ok(!result.warnings.some((warning) => /image budget covers/.test(warning)));
+    assert.equal(result.transcript.source, 'ocr');
+  });
+});
+
 test('overview：请求页超过图片预算时均匀抽样，但文字覆盖全部请求页', {
   skip: skipPdfTextOverview,
   timeout: 120000,

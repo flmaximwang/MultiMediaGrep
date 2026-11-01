@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import { createAudioBackend, computeAudioHealth } from '../../src/backend/audio/index.js';
 import { mergeTranscripts, planChunks } from '../../src/backend/audio/chunks.js';
 import { matchSegments, splitIntoSentences } from '../../src/media/match.js';
-import { assertFfmpegAvailable, run } from '../../src/media/ffmpeg.js';
+import { assertFfmpegAvailable, ffprobeJson, run } from '../../src/media/ffmpeg.js';
 
 async function hasFfmpeg() {
   try {
@@ -28,6 +28,61 @@ async function makeAudio(dir, name, expr, durationSec) {
   await run('ffmpeg', [
     '-y', '-v', 'error',
     '-f', 'lavfi', '-i', `aevalsrc=${expr}:d=${durationSec}:s=16000`,
+    out,
+  ]);
+  return out;
+}
+
+/** 最小 PGS 段（PCS + END），让 ffmpeg 能 mux 出一条图形字幕轨 */
+function minimalPgs() {
+  const segment = (type, payload = Buffer.alloc(0)) => {
+    const buffer = Buffer.alloc(13 + payload.length);
+    buffer.write('PG', 0, 'latin1');
+    buffer.writeUInt32BE(0, 2);
+    buffer.writeUInt32BE(0, 6);
+    buffer[10] = type;
+    buffer.writeUInt16BE(payload.length, 11);
+    payload.copy(buffer, 13);
+    return buffer;
+  };
+  return Buffer.concat([segment(0x14), segment(0x80)]);
+}
+
+/** 现造一个带音轨与图形字幕轨（hdmv_pgs_subtitle）的录音容器 */
+async function makeBitmapSubtitleAudio(dir) {
+  const sup = path.join(dir, 'bitmap.sup');
+  const out = path.join(dir, 'bitmap-audio.mkv');
+  await writeFile(sup, minimalPgs());
+  await run('ffmpeg', [
+    '-y', '-v', 'error',
+    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=4',
+    '-f', 'sup', '-i', sup,
+    '-map', '0:a', '-map', '1:s',
+    '-c:a', 'aac', '-c:s', 'copy',
+    '-metadata:s:s:0', 'language=zho',
+    out,
+  ]);
+  return out;
+}
+
+/** 现造一个带三条文本字幕轨的录音容器：zho / chi / eng（语言码与多命中共用） */
+async function makeMultiTextSubtitleAudio(dir) {
+  const chi1 = path.join(dir, 'audio-chi1.srt');
+  const chi2 = path.join(dir, 'audio-chi2.srt');
+  const eng = path.join(dir, 'audio-eng.srt');
+  await writeFile(chi1, '1\n00:00:00,000 --> 00:00:02,000\n音频中文一轨\n');
+  await writeFile(chi2, '1\n00:00:00,000 --> 00:00:02,000\n音频中文二轨\n');
+  await writeFile(eng, '1\n00:00:00,000 --> 00:00:02,000\nAUDIO ENGLISH TRACK\n');
+  const out = path.join(dir, 'multi-subs.mkv');
+  await run('ffmpeg', [
+    '-y', '-v', 'error',
+    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=4',
+    '-i', chi1, '-i', chi2, '-i', eng,
+    '-map', '0:a', '-map', '1:s', '-map', '2:s', '-map', '3:s',
+    '-c:a', 'aac', '-c:s', 'srt',
+    '-metadata:s:s:0', 'language=zho',
+    '-metadata:s:s:1', 'language=chi',
+    '-metadata:s:s:2', 'language=eng',
     out,
   ]);
   return out;
@@ -142,7 +197,7 @@ test('后端 probe/overview/zoom/locate：字幕文件路径', { skip }, async (
     assert.equal(probe.capabilities.asr.available, false); // 没配 ASR
     assert.equal(probe.audioHealth.verdict, 'has-speech');
 
-    const overview = await backend.overview({ path: audio, transcriptFile: srt, envelope: true });
+    const overview = await backend.overview({ path: audio, subtitle: srt, envelope: true });
     assert.equal(overview.segments.length, 2);
     assert.equal(overview.segments[0].source, 'subtitle');
     assert.equal(overview.segments[0].origin, 'file');
@@ -151,24 +206,251 @@ test('后端 probe/overview/zoom/locate：字幕文件路径', { skip }, async (
     assert.ok(Buffer.isBuffer(overview.images[0].buffer), '图片必须带 buffer 交给 MCP 层');
     assert.equal(overview.images[0].width, 1200);
 
-    const subs = await backend.subtitles({ path: audio, transcriptFile: srt });
+    const subs = await backend.overview({ path: audio, subtitle: srt, images: 0, transcript: 'subtitle' });
     assert.equal(subs.segments.length, 2);
-    assert.equal(subs.format, 'srt');
-    assert.equal(subs.sourcePath, srt);
+    assert.equal(subs.transcript.file, srt);
     assert.equal(subs.segments[1].source, 'subtitle');
-    const clipped = await backend.subtitles({ path: audio, transcriptFile: srt, startMs: 3000, endMs: 6000 });
+    const clipped = await backend.overview({
+      path: audio, subtitle: srt, images: 0, transcript: 'subtitle', startMs: 3000, endMs: 6000,
+    });
     assert.equal(clipped.segments.length, 1);
     assert.match(clipped.segments[0].text, /柏氏矢量/);
 
     const bare = await makeAudio(dir, 'bare.wav', '0.5*sin(2*PI*440*t)', 3);
-    await assert.rejects(
-      () => backend.subtitles({ path: bare }),
-      (e) => e.code === 'NO_TRANSCRIPT' && /no subtitle source/.test(e.message),
-    );
+    const bareOverview = await backend.overview({ path: bare, images: 0, transcript: 'subtitle' });
+    assert.deepEqual(bareOverview.segments, []);
+    assert.equal(bareOverview.transcript.source, 'none');
+    assert.ok(bareOverview.warnings.includes('no-subtitle-source'));
 
-    const locate = await backend.locate({ path: audio, transcriptFile: srt, query: '位错理论' });
+    const locate = await backend.locate({ path: audio, subtitle: srt, query: '位错理论' });
     assert.equal(locate.matches.length, 1);
     assert.equal(locate.matches[0].startMs, 3000);
+  } finally {
+    if (prevCache === undefined) delete process.env.MMGREP_CACHE_DIR;
+    else process.env.MMGREP_CACHE_DIR = prevCache;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('后端 overview：images: 0 是零像素纯文本模式——即使 envelope: true 也不出波形图', { skip }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-audio-zero-'));
+  const prevCache = process.env.MMGREP_CACHE_DIR;
+  process.env.MMGREP_CACHE_DIR = path.join(dir, 'cache');
+  try {
+    const audio = await makeAudio(dir, 'tone.wav', '0.5*sin(2*PI*440*t)', 12);
+    await writeFile(path.join(dir, 'tone.srt'), `1
+00:00:00,000 --> 00:00:03,000
+零像素也要有文字
+
+2
+00:00:03,000 --> 00:00:06,000
+第二句
+`);
+
+    const backend = createAudioBackend({ config: {} });
+
+    // images: 0 压过 envelope: true：一张图都不出，文字照旧。
+    const zero = await backend.overview({ path: audio, images: 0, envelope: true });
+    assert.deepEqual(zero.images, [], '零像素模式不得出波形图');
+    assert.equal(zero.segments.length, 2);
+    assert.ok(zero.segments.some((segment) => /零像素也要有文字/.test(segment.text)));
+    assert.equal(zero.transcript.source, 'subtitle');
+
+    // 对照组：envelope: true（不带 images: 0）仍然出波形图。
+    const withWave = await backend.overview({ path: audio, envelope: true });
+    assert.equal(withWave.images.length, 1);
+    assert.equal(withWave.images[0].width, 1200);
+
+    // images: 0 且不要波形：同样零图。
+    const plain = await backend.overview({ path: audio, images: 0, envelope: false });
+    assert.deepEqual(plain.images, []);
+  } finally {
+    if (prevCache === undefined) delete process.env.MMGREP_CACHE_DIR;
+    else process.env.MMGREP_CACHE_DIR = prevCache;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('显式 subtitle：文件 / 轨 index / 语言码 / 失败不回退（录音）', { skip }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-audio-subtitle-'));
+  const prevCache = process.env.MMGREP_CACHE_DIR;
+  process.env.MMGREP_CACHE_DIR = path.join(dir, 'cache');
+  try {
+    const backend = createAudioBackend({ config: {} });
+    const multi = await makeMultiTextSubtitleAudio(dir);
+    const info = await ffprobeJson(multi);
+    const subs = info.streams.filter((stream) => stream.codec_type === 'subtitle');
+    const chi = subs.find((stream) => stream.tags?.language === 'zho');
+    const chi2 = subs.find((stream) => stream.tags?.language === 'chi');
+    const eng = subs.find((stream) => stream.tags?.language === 'eng');
+
+    // 文件路径
+    const srt = path.join(dir, 'picked.srt');
+    await writeFile(srt, '1\n00:00:00,000 --> 00:00:02,000\n显式文件字幕\n');
+    const byFile = await backend.overview({ path: multi, subtitle: srt, images: 0, transcript: 'subtitle' });
+    assert.equal(byFile.transcript.origin, 'file');
+    assert.equal(byFile.transcript.file, srt);
+    assert.match(byFile.segments[0].text, /显式文件字幕/);
+
+    // 轨 index
+    const byIndex = await backend.overview({
+      path: multi, subtitle: chi2.index, images: 0, transcript: 'subtitle',
+    });
+    assert.equal(byIndex.transcript.origin, 'embedded');
+    assert.match(byIndex.segments[0].text, /音频中文二轨/);
+
+    // 语言码：zh ≈ chi/zho；多条命中取靠前，其余写 warning；eng ≈ en
+    const byLanguage = await backend.overview({ path: multi, subtitle: 'zh', images: 0, transcript: 'subtitle' });
+    assert.match(byLanguage.segments[0].text, /音频中文一轨/);
+    assert.ok(
+      byLanguage.warnings.includes(
+        `subtitle-language-multiple-matches (language "zh": tracks ${chi.index}, ${chi2.index}; using track ${chi.index})`,
+      ),
+      JSON.stringify(byLanguage.warnings),
+    );
+    const byEnglish = await backend.overview({ path: multi, subtitle: 'eng', images: 0, transcript: 'subtitle' });
+    assert.match(byEnglish.segments[0].text, /AUDIO ENGLISH TRACK/);
+
+    // 不可用 → INVALID_ARGUMENT，不回退
+    await assert.rejects(
+      () => backend.overview({ path: multi, subtitle: 99, images: 0, transcript: 'subtitle' }),
+      (error) => error.code === 'INVALID_ARGUMENT' && /does not exist in this file/.test(error.message),
+    );
+    await assert.rejects(
+      () => backend.overview({ path: multi, subtitle: 'ja', images: 0, transcript: 'subtitle' }),
+      (error) => error.code === 'INVALID_ARGUMENT' && /no subtitle track matches language "ja"/.test(error.message),
+    );
+    const missing = path.join(dir, 'missing.srt');
+    await assert.rejects(
+      () => backend.overview({ path: multi, subtitle: missing, images: 0, transcript: 'subtitle' }),
+      (error) => error.code === 'INVALID_ARGUMENT' && error.message === `subtitle file does not exist: "${missing}".`,
+    );
+
+    // 图形字幕轨：index 与语言码都拒绝
+    const bitmap = await makeBitmapSubtitleAudio(dir);
+    const bitmapInfo = await ffprobeJson(bitmap);
+    const bitmapTrack = bitmapInfo.streams.find((stream) => stream.codec_type === 'subtitle');
+    await assert.rejects(
+      () => backend.overview({ path: bitmap, subtitle: bitmapTrack.index, images: 0, transcript: 'subtitle' }),
+      (error) => error.code === 'INVALID_ARGUMENT'
+        && error.message.includes(`embedded-subtitle-bitmap-skipped (hdmv_pgs_subtitle, track ${bitmapTrack.index})`),
+    );
+    await assert.rejects(
+      () => backend.overview({ path: bitmap, subtitle: 'zh', images: 0, transcript: 'subtitle' }),
+      (error) => error.code === 'INVALID_ARGUMENT' && /bitmap subtitle tracks cannot be read as text/i.test(error.message),
+    );
+
+    // probe：同样的失败只报告、不抛错（契约 §4.5）
+    const probe = await backend.probe({ path: multi, subtitle: missing });
+    assert.equal(probe.capabilities.transcriptSource, 'none');
+    assert.equal(probe.capabilities.transcriptReason, `subtitle file does not exist: "${missing}".`);
+    const bitmapProbe = await backend.probe({ path: bitmap, subtitle: bitmapTrack.index });
+    assert.equal(bitmapProbe.capabilities.transcriptSource, 'none');
+    assert.match(bitmapProbe.capabilities.transcriptReason, /bitmap subtitle track/);
+
+    // 不传 subtitle：保持自动顺序（同目录同名文件）
+    const auto = await makeAudio(dir, 'auto.wav', '0.5*sin(2*PI*440*t)', 3);
+    await writeFile(path.join(dir, 'auto.srt'), '1\n00:00:00,000 --> 00:00:01,000\n自动发现字幕\n');
+    const autoSubs = await backend.overview({ path: auto, images: 0, transcript: 'subtitle' });
+    assert.equal(autoSubs.transcript.origin, 'file');
+    assert.equal(autoSubs.transcript.file, path.join(dir, 'auto.srt'));
+  } finally {
+    if (prevCache === undefined) delete process.env.MMGREP_CACHE_DIR;
+    else process.env.MMGREP_CACHE_DIR = prevCache;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('后端 transcript 三值：subtitle 只读字幕、off 不读字幕，且都不调用 ASR', { skip }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-audio-modes-'));
+  const prevCache = process.env.MMGREP_CACHE_DIR;
+  process.env.MMGREP_CACHE_DIR = path.join(dir, 'cache');
+  try {
+    const audio = await makeAudio(dir, 'toned.wav', '0.5*sin(2*PI*440*t)', 12);
+    await writeFile(path.join(dir, 'toned.srt'), `1
+00:00:00,000 --> 00:00:03,000
+有字幕的录音
+
+2
+00:00:03,000 --> 00:00:06,000
+第二句
+`);
+    const bare = await makeAudio(dir, 'bare.wav', '0.5*sin(2*PI*440*t)', 3);
+
+    const calls = [];
+    const asrProvider = {
+      id: 'stub',
+      describe: () => ({ id: 'stub', model: 'stub', baseUrl: null }),
+      transcribe: async ({ audioPath }) => {
+        calls.push(audioPath);
+        throw new Error('ASR MUST NOT BE CALLED');
+      },
+    };
+    const backend = createAudioBackend({ asrProvider, config: {} });
+
+    // subtitle + 有字幕：正常读到
+    const withSubs = await backend.overview({ path: audio, transcript: 'subtitle', envelope: false });
+    assert.equal(calls.length, 0);
+    assert.equal(withSubs.transcript.source, 'subtitle');
+    assert.ok(withSubs.segments.some((segment) => /有字幕的录音/.test(segment.text)));
+
+    // subtitle + 无字幕：空结果 + 原因
+    const noSubs = await backend.overview({ path: bare, transcript: 'subtitle', envelope: false });
+    assert.equal(calls.length, 0, 'subtitle mode must never call ASR');
+    assert.deepEqual(noSubs.segments, []);
+    assert.equal(noSubs.transcript.source, 'none');
+    assert.match(noSubs.transcript.reason, /no subtitle source/i);
+    assert.ok(noSubs.warnings.includes('no-subtitle-source'));
+
+    // off + 有字幕：字幕也不读
+    const off = await backend.overview({ path: audio, transcript: 'off', envelope: false });
+    assert.equal(calls.length, 0);
+    assert.deepEqual(off.segments, []);
+    assert.equal(off.transcript.source, 'none');
+    assert.match(off.transcript.reason, /disabled/i);
+    assert.ok(off.warnings.includes('transcript-disabled'));
+
+    // probe capabilities 随参数变化
+    const autoProbe = await backend.probe({ path: bare, transcript: 'auto' });
+    assert.equal(autoProbe.capabilities.asr.available, true);
+    const subProbe = await backend.probe({ path: bare, transcript: 'subtitle' });
+    assert.equal(subProbe.capabilities.asr.available, false);
+    assert.match(subProbe.capabilities.asr.reason, /subtitle/i);
+    const offProbe = await backend.probe({ path: audio, transcript: 'off' });
+    assert.equal(offProbe.capabilities.asr.available, false);
+    assert.match(offProbe.capabilities.asr.reason, /disabled/i);
+    assert.equal(offProbe.capabilities.transcriptSource, 'none');
+    assert.equal(offProbe.capabilities.transcriptOrigin, 'none');
+    assert.equal(calls.length, 0, 'probe never runs ASR');
+  } finally {
+    if (prevCache === undefined) delete process.env.MMGREP_CACHE_DIR;
+    else process.env.MMGREP_CACHE_DIR = prevCache;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('后端 probe/overview：图形字幕轨写出 bitmap-skipped 原因', { skip }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-audio-bitmap-'));
+  const prevCache = process.env.MMGREP_CACHE_DIR;
+  process.env.MMGREP_CACHE_DIR = path.join(dir, 'cache');
+  try {
+    const audio = await makeBitmapSubtitleAudio(dir);
+    const backend = createAudioBackend({ config: {} });
+
+    const probe = await backend.probe({ path: audio });
+    assert.equal(probe.capabilities.transcriptSource, 'none');
+    assert.match(
+      probe.capabilities.transcriptReason,
+      /^embedded-subtitle-bitmap-skipped \(hdmv_pgs_subtitle, track \d+\)$/,
+    );
+    assert.ok(probe.subtitleTracks.some((track) => track.codec === 'hdmv_pgs_subtitle'));
+
+    const overview = await backend.overview({ path: audio, envelope: false });
+    assert.ok(
+      overview.warnings.some((w) => /^embedded-subtitle-bitmap-skipped \(hdmv_pgs_subtitle, track \d+\)$/.test(w)),
+      JSON.stringify(overview.warnings),
+    );
+    assert.equal(overview.transcript.source, 'none');
   } finally {
     if (prevCache === undefined) delete process.env.MMGREP_CACHE_DIR;
     else process.env.MMGREP_CACHE_DIR = prevCache;

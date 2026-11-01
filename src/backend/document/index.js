@@ -573,7 +573,8 @@ function sanitizeOverviewBudget(input) {
   const imagesValue = Number(input?.images);
   const edgeValue = Number(input?.maxEdge);
   const cells = Math.min(MAX_CELLS, Math.max(1, Number.isInteger(cellsValue) ? cellsValue : DEFAULT_CELLS));
-  const images = Math.min(MAX_IMAGES, Math.max(1, Number.isInteger(imagesValue) ? imagesValue : DEFAULT_IMAGES));
+  // images: 0 = 零像素纯文本模式：只回页文字，不渲染任何页图。
+  const images = Math.min(MAX_IMAGES, Math.max(0, Number.isInteger(imagesValue) ? imagesValue : DEFAULT_IMAGES));
   const maxEdge = Math.min(MAX_EDGE, Math.max(MIN_EDGE, Number.isInteger(edgeValue) ? edgeValue : DEFAULT_OVERVIEW_MAX_EDGE));
   return { cells, images, maxEdge };
 }
@@ -898,16 +899,19 @@ export function createDocumentBackend(ctx = {}) {
     }
 
     c.onProgress?.({ stage: 'images', detail: `rendering ${Math.min(pages.length, cells * images)} page(s)` });
-    const rendered = await renderOverviewImages({
-      info,
-      pages,
-      cells,
-      images,
-      maxEdge,
-      ctx: c,
-      pdfSupport,
-      warnings,
-    });
+    // images: 0：零像素模式，不渲染页图（页文字照样覆盖全部请求页）。
+    const rendered = images > 0
+      ? await renderOverviewImages({
+        info,
+        pages,
+        cells,
+        images,
+        maxEdge,
+        ctx: c,
+        pdfSupport,
+        warnings,
+      })
+      : [];
 
     return {
       mediaType: 'document',

@@ -6,7 +6,7 @@
 
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import { createVideoBackend } from '../../src/backend/video/index.js';
-import { assertFfmpegAvailable } from '../../src/media/ffmpeg.js';
+import { assertFfmpegAvailable, ffprobeJson, run } from '../../src/media/ffmpeg.js';
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -51,6 +51,91 @@ const ffmpegReady = await hasFfmpeg();
 const fixturesReady = ffmpegReady ? await ensureFixtures() : false;
 const skip = !(ffmpegReady && fixturesReady);
 
+/**
+ * 最小 PGS 段（PCS + END）。足以让 ffmpeg 的 sup demuxer 建出
+ * hdmv_pgs_subtitle 轨；本测试只关心「图形字幕轨被识别并跳过」。
+ */
+function minimalPgs() {
+  const segment = (type, payload = Buffer.alloc(0)) => {
+    const buffer = Buffer.alloc(13 + payload.length);
+    buffer.write('PG', 0, 'latin1');
+    buffer.writeUInt32BE(0, 2);
+    buffer.writeUInt32BE(0, 6);
+    buffer[10] = type;
+    buffer.writeUInt16BE(payload.length, 11);
+    payload.copy(buffer, 13);
+    return buffer;
+  };
+  return Buffer.concat([segment(0x14), segment(0x80)]);
+}
+
+/** 现造一个带图形字幕轨（hdmv_pgs_subtitle）的视频；建不出来返回 null。 */
+async function makeBitmapSubtitleVideo(dir) {
+  const sup = path.join(dir, 'bitmap.sup');
+  const out = path.join(dir, 'bitmap-subs.mkv');
+  await writeFile(sup, minimalPgs());
+  try {
+    await run('ffmpeg', [
+      '-y', '-v', 'error',
+      '-f', 'lavfi', '-i', 'color=c=black:s=160x90:d=4:r=10',
+      '-f', 'sup', '-i', sup,
+      '-map', '0:v', '-map', '1:s',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+      '-c:s', 'copy',
+      '-metadata:s:s:0', 'language=zho',
+      out,
+    ]);
+    const info = await ffprobeJson(out);
+    const hasBitmap = (info?.streams ?? []).some(
+      (stream) => stream.codec_type === 'subtitle' && stream.codec_name === 'hdmv_pgs_subtitle',
+    );
+    return hasBitmap ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 现造一个带空 mov_text 轨的视频（只有 WEBVTT 头，没有任何 cue）。 */
+async function makeEmptyTextSubtitleVideo(dir) {
+  const vtt = path.join(dir, 'empty-source.vtt');
+  const out = path.join(dir, 'empty-track.mp4');
+  await writeFile(vtt, 'WEBVTT\n\n');
+  await run('ffmpeg', [
+    '-y', '-v', 'error',
+    '-f', 'lavfi', '-i', 'color=c=black:s=160x90:d=4:r=10',
+    '-i', vtt,
+    '-map', '0:v', '-map', '1:s',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+    '-c:s', 'mov_text',
+    out,
+  ]);
+  return out;
+}
+
+/** 现造一个带三条文本字幕轨的视频：zho / chi / eng（语言码与多命中共用） */
+async function makeMultiTextSubtitleVideo(dir) {
+  const chi1 = path.join(dir, 'chi1.srt');
+  const chi2 = path.join(dir, 'chi2.srt');
+  const eng = path.join(dir, 'eng.srt');
+  await writeFile(chi1, '1\n00:00:00,000 --> 00:00:04,000\nCHI TRACK ONE\n');
+  await writeFile(chi2, '1\n00:00:00,000 --> 00:00:04,000\nCHI TRACK TWO\n');
+  await writeFile(eng, '1\n00:00:00,000 --> 00:00:04,000\nENG TRACK\n');
+  const out = path.join(dir, 'multi-subs.mp4');
+  await run('ffmpeg', [
+    '-y', '-v', 'error',
+    '-f', 'lavfi', '-i', 'color=c=black:s=160x90:d=4:r=10',
+    '-i', chi1, '-i', chi2, '-i', eng,
+    '-map', '0:v', '-map', '1:s', '-map', '2:s', '-map', '3:s',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+    '-c:s', 'mov_text',
+    '-metadata:s:s:0', 'language=zho',
+    '-metadata:s:s:1', 'language=chi',
+    '-metadata:s:s:2', 'language=eng',
+    out,
+  ]);
+  return out;
+}
+
 async function withCache(fn) {
   const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-video-'));
   const previous = process.env.MMGREP_CACHE_DIR;
@@ -83,9 +168,49 @@ function stubProvider({ text = 'STUB SPOKEN LINE', onCall = null } = {}) {
   return { provider, calls };
 }
 
+/** 会抛错的 ASR stub：用来证明某些模式下一次都不会被调用 */
+function throwingProvider() {
+  const calls = [];
+  const provider = {
+    id: 'stub',
+    describe: () => ({ id: 'stub', model: 'stub-model', baseUrl: null }),
+    transcribe: async ({ audioPath }) => {
+      calls.push(audioPath);
+      throw new Error('ASR MUST NOT BE CALLED');
+    },
+  };
+  return { provider, calls };
+}
+
 function assertPng(buffer) {
   assert.ok(Buffer.isBuffer(buffer), 'image must be a Buffer');
   assert.equal(buffer.subarray(1, 4).toString('latin1'), 'PNG', 'image must be a real PNG');
+}
+
+/**
+ * 统计 ffmpeg 子进程调用次数：把 MMGREP_FFMPEG_PATH 指向一个记账脚本，
+ * 每次调用都往日志里追加一行。仓库里没有别的统计手段，用这个来证明
+ * 「零像素模式没有走抽帧 / 镜头扫描路径」。
+ */
+async function installFfmpegCounter(dir) {
+  const logPath = path.join(dir, 'ffmpeg-calls.log');
+  const scriptPath = path.join(dir, 'ffmpeg-counter.sh');
+  await writeFile(scriptPath, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${logPath}'\nexec ffmpeg "$@"\n`, { mode: 0o755 });
+  const previous = process.env.MMGREP_FFMPEG_PATH;
+  process.env.MMGREP_FFMPEG_PATH = scriptPath;
+  return {
+    async calls() {
+      try {
+        return (await readFile(logPath, 'utf8')).split('\n').filter((line) => line.length > 0);
+      } catch {
+        return [];
+      }
+    },
+    restore() {
+      if (previous === undefined) delete process.env.MMGREP_FFMPEG_PATH;
+      else process.env.MMGREP_FFMPEG_PATH = previous;
+    },
+  };
 }
 
 function longestEdge(image) {
@@ -110,7 +235,7 @@ function assertOverviewShape(result, { cells, images, maxEdge }) {
 test('probe：契约 §4.3 字段、音频体检、字幕与 ASR 能力', { skip, timeout: 120000 }, async () => {
   await withCache(async () => {
     const backend = createVideoBackend({ config: {} });
-    const probe = await backend.probe({ path: SCENE, transcript: 'auto', transcriptFile: null });
+    const probe = await backend.probe({ path: SCENE, transcript: 'auto', subtitle: null });
 
     assert.equal(probe.mediaType, 'video');
     assert.equal(probe.path, SCENE);
@@ -141,19 +266,75 @@ test('probe：契约 §4.3 字段、音频体检、字幕与 ASR 能力', { skip
     assert.equal(probe.capabilities.transcriptPath, null);
     assert.ok(probe.recommended && probe.recommended.mode);
 
-    const sibling = await backend.probe({ path: SUBTITLES, transcript: 'auto', transcriptFile: null });
+    const sibling = await backend.probe({ path: SUBTITLES, transcript: 'auto', subtitle: null });
     assert.equal(sibling.capabilities.transcriptSource, 'subtitle');
     assert.equal(sibling.capabilities.transcriptOrigin, 'file');
     assert.equal(sibling.capabilities.transcriptPath, SRT);
 
     const stub = stubProvider();
     const withAsr = createVideoBackend({ config: {}, asrProvider: stub.provider });
-    const asrProbe = await withAsr.probe({ path: SCENE, transcript: 'auto', transcriptFile: null });
+    const asrProbe = await withAsr.probe({ path: SCENE, transcript: 'auto', subtitle: null });
     assert.equal(asrProbe.capabilities.asr.available, true);
     assert.equal(asrProbe.capabilities.asr.provider, 'stub');
     assert.equal(asrProbe.capabilities.transcriptSource, 'asr');
     assert.equal(asrProbe.capabilities.transcriptOrigin, 'asr');
     assert.equal(stub.calls.length, 0, 'probe must not run ASR');
+  });
+});
+
+test('probe/overview：图形字幕轨与空文本轨报出具名 warning', { skip, timeout: 120000 }, async () => {
+  await withCache(async (dir) => {
+    const backend = createVideoBackend({ config: {} });
+
+    // 图形字幕（PGS）：无法解析成文字，probe 与 overview 都要说明原因
+    const bitmap = await makeBitmapSubtitleVideo(dir);
+    if (bitmap) {
+      const probe = await backend.probe({ path: bitmap, transcript: 'auto', subtitle: null });
+      assert.equal(probe.capabilities.transcriptSource, 'none');
+      assert.match(
+        probe.capabilities.transcriptReason,
+        /^embedded-subtitle-bitmap-skipped \(hdmv_pgs_subtitle, track \d+\)$/,
+      );
+      assert.ok(probe.subtitleTracks.some((track) => track.codec === 'hdmv_pgs_subtitle'));
+
+      const overview = await backend.overview({
+        path: bitmap,
+        startMs: 0,
+        endMs: 4000,
+        cells: 2,
+        images: 1,
+        maxEdge: 320,
+        transcript: 'auto',
+        subtitle: null,
+      });
+      assert.ok(
+        overview.warnings.some((w) => /^embedded-subtitle-bitmap-skipped \(hdmv_pgs_subtitle, track \d+\)$/.test(w)),
+        JSON.stringify(overview.warnings),
+      );
+      assert.equal(overview.transcript.source, 'none');
+    }
+
+    // 空 mov_text 轨：存在文本轨，但抽出来没有任何段落
+    const empty = await makeEmptyTextSubtitleVideo(dir);
+    const probe = await backend.probe({ path: empty, transcript: 'auto', subtitle: null });
+    assert.equal(probe.capabilities.transcriptSource, 'subtitle', 'probe 只报轨道存在，不抽取内容');
+    assert.equal(probe.capabilities.transcriptOrigin, 'embedded');
+
+    const overview = await backend.overview({
+      path: empty,
+      startMs: 0,
+      endMs: 4000,
+      cells: 2,
+      images: 1,
+      maxEdge: 320,
+      transcript: 'auto',
+      subtitle: null,
+    });
+    assert.ok(
+      overview.warnings.some((w) => /^embedded-subtitle-empty \(track \d+\)$/.test(w)),
+      JSON.stringify(overview.warnings),
+    );
+    assert.equal(overview.transcript.source, 'none');
   });
 });
 
@@ -168,7 +349,7 @@ test('overview：cells/images/maxEdge 上限、PNG buffer、无转写时只出�
       images: 2,
       maxEdge: 640,
       transcript: 'off',
-      transcriptFile: null,
+      subtitle: null,
     });
     assertOverviewShape(result, { cells: 4, images: 2, maxEdge: 640 });
     assert.equal(result.images.length, 2, '12s window has enough room for 4 cells x 2 images');
@@ -195,7 +376,7 @@ test('overview：startMs/endMs 精确覆盖窗口', { skip, timeout: 120000 }, a
       images: 1,
       maxEdge: 640,
       transcript: 'off',
-      transcriptFile: null,
+      subtitle: null,
     });
     assertOverviewShape(result, { cells: 4, images: 1, maxEdge: 640 });
     assert.equal(result.segments[0].startMs, 2000);
@@ -204,7 +385,7 @@ test('overview：startMs/endMs 精确覆盖窗口', { skip, timeout: 120000 }, a
   });
 });
 
-test('overview：字幕优先——sibling 自动发现、显式 transcriptFile 胜出，且不调用 ASR', { skip, timeout: 120000 }, async () => {
+test('overview：字幕优先——sibling 自动发现、显式 subtitle 胜出，且不调用 ASR', { skip, timeout: 120000 }, async () => {
   await withCache(async (dir) => {
     const stub = stubProvider({ text: 'ASR SHOULD NOT RUN' });
     const backend = createVideoBackend({ config: {}, asrProvider: stub.provider });
@@ -217,7 +398,7 @@ test('overview：字幕优先——sibling 自动发现、显式 transcriptFile 
       images: 2,
       maxEdge: 640,
       transcript: 'auto',
-      transcriptFile: null,
+      subtitle: null,
     });
     assertOverviewShape(sibling, { cells: 4, images: 2, maxEdge: 640 });
     assert.equal(stub.calls.length, 0, 'ASR must not run when a sibling subtitle exists');
@@ -238,13 +419,107 @@ test('overview：字幕优先——sibling 自动发现、显式 transcriptFile 
       images: 1,
       maxEdge: 640,
       transcript: 'auto',
-      transcriptFile: explicit,
+      subtitle: explicit,
     });
     assert.equal(stub.calls.length, 0);
     assert.equal(explicitResult.transcript.source, 'subtitle');
     assert.equal(explicitResult.transcript.file, explicit);
     assert.ok(explicitResult.segments.some((segment) => /EXPLICIT TRANSCRIPT LINE/.test(segment.text)));
     assert.ok(explicitResult.segments.every((segment) => !/FIRST SUBTITLE LINE/.test(segment.text)));
+  });
+});
+
+test('probe/overview：显式 subtitle 的文件、轨 index、语言码与失败不回退', { skip, timeout: 120000 }, async () => {
+  await withCache(async (dir) => {
+    const backend = createVideoBackend({ config: {} });
+    const multi = await makeMultiTextSubtitleVideo(dir);
+    const info = await ffprobeJson(multi);
+    const subs = info.streams.filter((stream) => stream.codec_type === 'subtitle');
+    const chi = subs.find((stream) => stream.tags?.language === 'zho');
+    const chi2 = subs.find((stream) => stream.tags?.language === 'chi');
+
+    // 文件路径：显式文件优先于内嵌轨
+    const explicitFile = path.join(dir, 'explicit.srt');
+    await writeFile(explicitFile, '1\n00:00:00,000 --> 00:00:04,000\nPICKED FILE\n');
+    const byFile = await backend.overview({
+      path: multi, images: 0, transcript: 'subtitle', subtitle: explicitFile,
+    });
+    assert.equal(byFile.transcript.origin, 'file');
+    assert.equal(byFile.transcript.file, explicitFile);
+    assert.match(byFile.segments[0].text, /PICKED FILE/);
+
+    // 轨 index：数字与纯数字字符串等价
+    const byIndex = await backend.overview({
+      path: multi, images: 0, transcript: 'subtitle', subtitle: chi2.index,
+    });
+    assert.equal(byIndex.transcript.origin, 'embedded');
+    assert.match(byIndex.segments[0].text, /CHI TRACK TWO/);
+    const byIndexString = await backend.overview({
+      path: multi, images: 0, transcript: 'subtitle', subtitle: String(chi2.index),
+    });
+    assert.match(byIndexString.segments[0].text, /CHI TRACK TWO/);
+
+    // 语言码：zh ≈ chi/zho；多条命中取靠前的一条，其余写 warning；en ≈ eng
+    const byLanguage = await backend.overview({
+      path: multi, images: 0, transcript: 'subtitle', subtitle: 'zh',
+    });
+    assert.match(byLanguage.segments[0].text, /CHI TRACK ONE/);
+    assert.ok(
+      byLanguage.warnings.includes(
+        `subtitle-language-multiple-matches (language "zh": tracks ${chi.index}, ${chi2.index}; using track ${chi.index})`,
+      ),
+      JSON.stringify(byLanguage.warnings),
+    );
+    const byEnglish = await backend.overview({
+      path: multi, images: 0, transcript: 'subtitle', subtitle: 'en',
+    });
+    assert.match(byEnglish.segments[0].text, /ENG TRACK/);
+
+    // 显式选择不可用 → INVALID_ARGUMENT，不回退到自动顺序
+    await assert.rejects(
+      () => backend.overview({ path: multi, images: 0, transcript: 'subtitle', subtitle: 99 }),
+      (error) => error.code === 'INVALID_ARGUMENT' && /does not exist in this file/.test(error.message),
+    );
+    await assert.rejects(
+      () => backend.overview({ path: multi, images: 0, transcript: 'subtitle', subtitle: 'ja' }),
+      (error) => error.code === 'INVALID_ARGUMENT' && /no subtitle track matches language "ja"/.test(error.message),
+    );
+    const missing = path.join(dir, 'missing.srt');
+    await assert.rejects(
+      () => backend.overview({ path: multi, images: 0, transcript: 'subtitle', subtitle: missing }),
+      (error) => error.code === 'INVALID_ARGUMENT' && error.message === `subtitle file does not exist: "${missing}".`,
+    );
+
+    // 图形字幕轨：index 与语言码都拒绝，文案带 bitmap warning 形态
+    const bitmap = await makeBitmapSubtitleVideo(dir);
+    if (bitmap) {
+      const bitmapInfo = await ffprobeJson(bitmap);
+      const bitmapTrack = bitmapInfo.streams.find((stream) => stream.codec_type === 'subtitle');
+      await assert.rejects(
+        () => backend.overview({ path: bitmap, images: 0, transcript: 'subtitle', subtitle: bitmapTrack.index }),
+        (error) => error.code === 'INVALID_ARGUMENT'
+          && error.message.includes(`embedded-subtitle-bitmap-skipped (hdmv_pgs_subtitle, track ${bitmapTrack.index})`),
+      );
+      await assert.rejects(
+        () => backend.overview({ path: bitmap, images: 0, transcript: 'subtitle', subtitle: 'zh' }),
+        (error) => error.code === 'INVALID_ARGUMENT' && /bitmap subtitle tracks cannot be read as text/i.test(error.message),
+      );
+
+      // probe：同样的失败只报告、不抛错（契约 §4.5）
+      const probe = await backend.probe({ path: bitmap, subtitle: 'zh', transcript: 'auto' });
+      assert.equal(probe.capabilities.transcriptSource, 'none');
+      assert.match(probe.capabilities.transcriptReason, /no subtitle track matches language "zh"/);
+    }
+
+    // probe：显式文件不存在时只报告；即便同目录有 sibling，也不拿它冒充显式选择
+    const siblingProbe = await backend.probe({ path: SUBTITLES, subtitle: missing, transcript: 'auto' });
+    assert.equal(siblingProbe.capabilities.transcriptSource, 'none');
+    assert.equal(siblingProbe.capabilities.transcriptReason, `subtitle file does not exist: "${missing}".`);
+
+    // 不传 subtitle：保持自动顺序（内嵌文本轨优先，sibling 也能命中）
+    const auto = await backend.overview({ path: SUBTITLES, images: 0, transcript: 'subtitle' });
+    assert.equal(auto.transcript.origin, 'file');
+    assert.equal(auto.transcript.file, SRT);
   });
 });
 
@@ -260,7 +535,7 @@ test('overview：无字幕时 ASR 兜底，段落标 source/origin=asr，中间�
       images: 1,
       maxEdge: 640,
       transcript: 'auto',
-      transcriptFile: null,
+      subtitle: null,
     });
     assertOverviewShape(result, { cells: 4, images: 1, maxEdge: 640 });
     assert.equal(stub.calls.length, 1, '12s audio fits in one ASR chunk');
@@ -273,6 +548,192 @@ test('overview：无字幕时 ASR 兜底，段落标 source/origin=asr，中间�
     assert.equal(result.transcript.model, 'stub-model');
     assert.ok(result.segments.every((segment) => segment.source === 'asr' && segment.origin === 'asr'));
     assert.ok(result.segments.some((segment) => /STUB SPOKEN LINE/.test(segment.text)));
+  });
+});
+
+test('overview：transcript="subtitle" 只读字幕，无字幕时返回空结果且绝不调用 ASR', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const stub = throwingProvider();
+    const backend = createVideoBackend({ config: {}, asrProvider: stub.provider });
+
+    const withSubs = await backend.overview({
+      path: SUBTITLES,
+      startMs: 0,
+      endMs: 12000,
+      cells: 4,
+      images: 1,
+      maxEdge: 640,
+      transcript: 'subtitle',
+      subtitle: null,
+    });
+    assert.equal(stub.calls.length, 0);
+    assert.equal(withSubs.transcript.source, 'subtitle');
+    assert.equal(withSubs.transcript.origin, 'file');
+    assert.ok(withSubs.segments.some((segment) => /FIRST SUBTITLE LINE/.test(segment.text)));
+
+    const noSubs = await backend.overview({
+      path: SCENE,
+      startMs: 0,
+      endMs: 12000,
+      cells: 4,
+      images: 1,
+      maxEdge: 640,
+      transcript: 'subtitle',
+      subtitle: null,
+    });
+    assert.equal(stub.calls.length, 0, 'subtitle mode must never call ASR');
+    // 视频 overview 的 segments 是宫格单元；没有字幕时每格 text 为空、来源 none。
+    assert.ok(noSubs.segments.every((segment) => segment.text === '' && segment.source === 'none'));
+    assert.equal(noSubs.transcript.source, 'none');
+    assert.match(noSubs.transcript.reason, /no subtitle source/i);
+    assert.ok(noSubs.warnings.includes('no-subtitle-source'));
+  });
+});
+
+test('overview：transcript="off" 不读字幕也不跑 ASR', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const stub = throwingProvider();
+    const backend = createVideoBackend({ config: {}, asrProvider: stub.provider });
+    // SUBTITLES 自带字幕来源；off 必须连字幕都不读。
+    const result = await backend.overview({
+      path: SUBTITLES,
+      startMs: 0,
+      endMs: 12000,
+      cells: 4,
+      images: 1,
+      maxEdge: 640,
+      transcript: 'off',
+      subtitle: null,
+    });
+    assert.equal(stub.calls.length, 0);
+    assert.ok(result.segments.every((segment) => segment.text === '' && segment.source === 'none'));
+    assert.equal(result.transcript.source, 'none');
+    assert.equal(result.transcript.origin, 'none');
+    assert.match(result.transcript.reason, /disabled/i);
+    assert.ok(result.warnings.includes('transcript-disabled'));
+  });
+});
+
+test('overview：images: 0 是零像素纯文本模式——不出图、不扫镜头、不抽帧', { skip, timeout: 120000 }, async () => {
+  await withCache(async (dir) => {
+    const counter = await installFfmpegCounter(dir);
+    try {
+      const backend = createVideoBackend({ config: {} });
+      const result = await backend.overview({
+        path: SUBTITLES,
+        startMs: 0,
+        endMs: 12000,
+        cells: 4,
+        images: 0,
+        maxEdge: 640,
+        transcript: 'subtitle',
+      });
+
+      assert.equal(result.images.length, 0, '零像素模式不得出图');
+      assert.ok(result.segments.length > 0, '仍要回字幕段落');
+      assert.ok(result.segments.some((segment) => /FIRST SUBTITLE LINE/.test(segment.text)));
+      assert.ok(result.segments.some((segment) => /FOURTH SUBTITLE LINE/.test(segment.text)));
+      assert.ok(result.segments.every((segment) => segment.source === 'subtitle' && segment.origin === 'file'));
+      assert.ok(result.segments.every((segment) => segment.startMs !== null && segment.endMs !== null));
+      assert.ok(result.segments.every((segment) => segment.startMs >= 0 && segment.endMs <= 12000));
+      assert.equal(result.transcript.source, 'subtitle');
+      assert.equal(result.transcript.origin, 'file');
+
+      // 关键断言：镜头扫描与抽帧都要跑 ffmpeg，这里一次都不许跑。
+      const calls = await counter.calls();
+      assert.deepEqual(calls, [], `零像素模式不得调用 ffmpeg（镜头扫描 / 抽帧），实际调用：\n${calls.join('\n')}`);
+
+      // 对照组：images: 1 时确实会跑 ffmpeg —— 说明上面的计数是真的在数。
+      const withImage = await backend.overview({
+        path: SUBTITLES,
+        startMs: 0,
+        endMs: 12000,
+        cells: 4,
+        images: 1,
+        maxEdge: 640,
+        transcript: 'subtitle',
+      });
+      assert.equal(withImage.images.length, 1);
+      assert.ok((await counter.calls()).length > 0, '对照组必须记录到 ffmpeg 调用，否则计数没生效');
+    } finally {
+      counter.restore();
+    }
+  });
+});
+
+test('overview：images: 0 与 transcript="subtitle" 组合——零像素、零 ASR', { skip, timeout: 120000 }, async () => {
+  await withCache(async (dir) => {
+    const counter = await installFfmpegCounter(dir);
+    try {
+      const stub = throwingProvider();
+      const backend = createVideoBackend({ config: {}, asrProvider: stub.provider });
+      const result = await backend.overview({
+        path: SUBTITLES,
+        startMs: 0,
+        endMs: 12000,
+        cells: 4,
+        images: 0,
+        maxEdge: 640,
+        transcript: 'subtitle',
+      });
+
+      assert.equal(stub.calls.length, 0, '零像素模式不得触发 ASR');
+      assert.equal(result.images.length, 0);
+      assert.ok(result.segments.some((segment) => /FIRST SUBTITLE LINE/.test(segment.text)));
+      assert.deepEqual(await counter.calls(), [], '零像素 + 字幕模式不得调用 ffmpeg');
+    } finally {
+      counter.restore();
+    }
+  });
+});
+
+test('overview：images: 0 时窗口仍然生效，超窗段落被过滤掉', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const backend = createVideoBackend({ config: {} });
+    const result = await backend.overview({
+      path: SUBTITLES,
+      startMs: 3000,
+      endMs: 6000,
+      cells: 4,
+      images: 0,
+      maxEdge: 640,
+      transcript: 'subtitle',
+    });
+
+    assert.equal(result.images.length, 0);
+    assert.ok(result.segments.length > 0);
+    assert.ok(result.segments.every((segment) => segment.startMs >= 3000 && segment.endMs <= 6000));
+    assert.ok(result.segments.some((segment) => /SECOND SUBTITLE LINE/.test(segment.text)));
+    assert.ok(result.segments.every((segment) => !/FIRST SUBTITLE LINE/.test(segment.text)));
+  });
+});
+
+test('probe：transcript 三值让 capabilities.asr 与 transcriptSource 如实变化', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const stub = throwingProvider();
+    const backend = createVideoBackend({ config: {}, asrProvider: stub.provider });
+
+    const auto = await backend.probe({ path: SCENE, transcript: 'auto', subtitle: null });
+    assert.equal(auto.capabilities.asr.available, true);
+    assert.equal(auto.capabilities.transcriptSource, 'asr');
+
+    const subtitleMode = await backend.probe({ path: SCENE, transcript: 'subtitle', subtitle: null });
+    assert.equal(subtitleMode.capabilities.asr.available, false);
+    assert.match(subtitleMode.capabilities.asr.reason, /subtitle/i);
+    assert.equal(subtitleMode.capabilities.transcriptSource, 'none');
+
+    const subtitlePresent = await backend.probe({ path: SUBTITLES, transcript: 'subtitle', subtitle: null });
+    assert.equal(subtitlePresent.capabilities.asr.available, false);
+    assert.equal(subtitlePresent.capabilities.transcriptSource, 'subtitle');
+    assert.equal(subtitlePresent.capabilities.transcriptOrigin, 'file');
+
+    const off = await backend.probe({ path: SUBTITLES, transcript: 'off', subtitle: null });
+    assert.equal(off.capabilities.asr.available, false);
+    assert.match(off.capabilities.asr.reason, /disabled/i);
+    assert.equal(off.capabilities.transcriptSource, 'none');
+    assert.equal(off.capabilities.transcriptOrigin, 'none');
+    assert.equal(off.capabilities.transcriptPath, null);
+    assert.equal(stub.calls.length, 0, 'probe never runs ASR');
   });
 });
 
@@ -352,7 +813,7 @@ test('locate：字幕匹配、来源标注、includeFrame 单帧', { skip, timeo
       startMs: 0,
       endMs: 12000,
       transcript: 'auto',
-      transcriptFile: null,
+      subtitle: null,
       includeFrame: true,
     });
     assert.ok(result.matches.length >= 1);
@@ -374,7 +835,7 @@ test('locate：字幕匹配、来源标注、includeFrame 单帧', { skip, timeo
       startMs: 6000,
       endMs: 9000,
       transcript: 'auto',
-      transcriptFile: null,
+      subtitle: null,
       includeFrame: false,
     });
     assert.equal(windowed.totalSegments, 1);
@@ -395,28 +856,29 @@ test('locate：没有任何转写来源 → NO_TRANSCRIPT（契约 §7.5 文案�
         startMs: 0,
         endMs: 12000,
         transcript: 'auto',
-        transcriptFile: null,
+        subtitle: null,
         includeFrame: false,
       }),
       (error) => error.code === 'NO_TRANSCRIPT'
         && /^no transcript available for this file and no ASR provider is configured \(MMGREP_ASR_PROVIDER="none"\)\./.test(error.message)
-        && /Pass transcriptFile with a local \.srt\/\.vtt file, or configure an ASR provider\./.test(error.message),
+        && /Pass subtitle with a local \.srt\/\.vtt file, a track index, or a language code, or configure an ASR provider\./.test(error.message),
     );
   });
 });
 
-test('subtitles：sibling 文件、窗口过滤、显式文件；无字幕来源 → NO_TRANSCRIPT（契约 §8.6）', { skip, timeout: 120000 }, async () => {
+test('overview：sibling 文件、窗口过滤、显式文件；无字幕来源时 transcript 如实为空', { skip, timeout: 120000 }, async () => {
   await withCache(async (dir) => {
     const backend = createVideoBackend({ config: {} });
-    const clipped = await backend.subtitles({
+    const clipped = await backend.overview({
       path: SUBTITLES,
       startMs: 3000,
       endMs: 6000,
-      transcriptFile: null,
+      images: 0,
+      transcript: 'subtitle',
+      subtitle: null,
     });
-    assert.equal(clipped.origin, 'file');
-    assert.equal(clipped.sourcePath, SRT);
-    assert.equal(clipped.format, 'srt');
+    assert.equal(clipped.transcript.origin, 'file');
+    assert.equal(clipped.transcript.file, SRT);
     assert.equal(clipped.segments.length, 1);
     assert.equal(clipped.segments[0].index, 1);
     assert.equal(clipped.segments[0].source, 'subtitle');
@@ -425,23 +887,23 @@ test('subtitles：sibling 文件、窗口过滤、显式文件；无字幕来源
 
     const explicit = path.join(dir, 'picked.vtt');
     await writeFile(explicit, 'WEBVTT\n\n00:00:00.000 --> 00:00:12.000\nEXPLICIT VTT LINE\n');
-    const picked = await backend.subtitles({
+    const picked = await backend.overview({
       path: SUBTITLES,
       startMs: 0,
       endMs: 12000,
-      transcriptFile: explicit,
+      images: 0,
+      transcript: 'subtitle',
+      subtitle: explicit,
     });
-    assert.equal(picked.origin, 'file');
-    assert.equal(picked.sourcePath, explicit);
-    assert.equal(picked.format, 'vtt');
+    assert.equal(picked.transcript.origin, 'file');
+    assert.equal(picked.transcript.file, explicit);
     assert.ok(picked.segments.some((segment) => /EXPLICIT VTT LINE/.test(segment.text)));
 
-    await assert.rejects(
-      () => backend.subtitles({ path: SCENE, transcriptFile: null }),
-      (error) => error.code === 'NO_TRANSCRIPT'
-        && error.message === `no subtitle source for "${SCENE}": no embedded subtitle track, `
-          + 'no sibling .srt/.vtt/.ass/.ssa file, and no ASR provider configured. '
-          + 'Pass transcriptFile with a local subtitle file.',
-    );
+    // 没有字幕来源：overview 不报错，transcript 如实为空并写明原因
+    const empty = await backend.overview({ path: SCENE, images: 0, transcript: 'subtitle', subtitle: null });
+    assert.deepEqual(empty.segments, []);
+    assert.equal(empty.transcript.source, 'none');
+    assert.match(empty.transcript.reason, /no subtitle source was found/);
+    assert.ok(empty.warnings.includes('no-subtitle-source'));
   });
 });
