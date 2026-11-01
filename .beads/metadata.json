@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "MultiMediaGrep",
+  "project_id": "26c0380c-705b-44b9-b518-4909741f29a0"
+}
