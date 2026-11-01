@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "multimediagrep": {
+      "command": "npx",
+      "args": ["-y", "multimediagrep-mcp"],
+      "env": {
+        "MMGREP_CACHE_DIR": "~/.cache/multimediagrep",
+        "MMGREP_CACHE_MAX_BYTES": "10737418240",
+        "MMGREP_ASR_PROVIDER": "elevenlabs",
+        "MMGREP_ASR_API_KEY": "REPLACE_WITH_YOUR_ELEVENLABS_API_KEY",
+        "MMGREP_ASR_BASE_URL": "https://api.elevenlabs.io/v1",
+        "MMGREP_ASR_MODEL": "scribe_v1",
+        "MMGREP_ASR_LANGUAGE": "auto",
+        "MMGREP_DOC_PROVIDER": "mineru",
+        "MMGREP_DOC_API_KEY": "REPLACE_WITH_YOUR_MINERU_TOKEN",
+        "MMGREP_DOC_BASE_URL": "https://mineru.net/api/v4",
+        "MMGREP_MAX_IMAGE_TOKENS": "4000",
+        "MMGREP_LOG_LEVEL": "info"
+      }
+    }
+  }
+}
