@@ -1,0 +1,219 @@
+{
+  "id": "sample-mixed-pdf",
+  "kind": "pdf",
+  "file": "sample-mixed.pdf",
+  "generator": "fixtures/generate.mjs",
+  "pageCount": 4,
+  "pageWidthPt": 595,
+  "pageHeightPt": 842,
+  "marginPt": 72,
+  "hasTextLayer": true,
+  "coverPage": 1,
+  "textLayerPages": [
+    2,
+    3,
+    4
+  ],
+  "noTextLayerPages": [
+    1
+  ],
+  "imageWidthPx": 1240,
+  "imageHeightPx": 1754,
+  "imageFormat": "jpeg",
+  "jpegQuality": 2,
+  "pages": [
+    {
+      "page": 1,
+      "lines": [
+        {
+          "text": "MIXED FIXTURE COVER",
+          "box": {
+            "x": 120,
+            "y": 200,
+            "width": 678,
+            "height": 42
+          }
+        },
+        {
+          "text": "THIS COVER PAGE IS AN IMAGE ONLY.",
+          "box": {
+            "x": 120,
+            "y": 320,
+            "width": 585,
+            "height": 21
+          }
+        }
+      ],
+      "table": null,
+      "hasTextLayer": false
+    },
+    {
+      "page": 2,
+      "lines": [
+        {
+          "text": "BODY PAGE ONE",
+          "xPt": 72,
+          "yPt": 770,
+          "font": "F2",
+          "size": 16
+        },
+        {
+          "text": "PAGE 2 HAS A REAL TEXT LAYER.",
+          "xPt": 72,
+          "yPt": 740,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "THE COVER PAGE BEFORE IT IS AN IMAGE ONLY.",
+          "xPt": 72,
+          "yPt": 720,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "A DOC MUST NOT BE CALLED TEXTLESS BECAUSE OF PAGE ONE.",
+          "xPt": 72,
+          "yPt": 700,
+          "font": "F1",
+          "size": 11
+        }
+      ],
+      "textOps": [
+        {
+          "text": "BODY PAGE ONE",
+          "xPt": 72,
+          "yPt": 770
+        },
+        {
+          "text": "PAGE 2 HAS A REAL TEXT LAYER.",
+          "xPt": 72,
+          "yPt": 740
+        },
+        {
+          "text": "THE COVER PAGE BEFORE IT IS AN IMAGE ONLY.",
+          "xPt": 72,
+          "yPt": 720
+        },
+        {
+          "text": "A DOC MUST NOT BE CALLED TEXTLESS BECAUSE OF PAGE ONE.",
+          "xPt": 72,
+          "yPt": 700
+        }
+      ],
+      "hasTextLayer": true
+    },
+    {
+      "page": 3,
+      "lines": [
+        {
+          "text": "BODY PAGE TWO",
+          "xPt": 72,
+          "yPt": 770,
+          "font": "F2",
+          "size": 16
+        },
+        {
+          "text": "THIRD PAGE OF THE MIXED FIXTURE.",
+          "xPt": 72,
+          "yPt": 740,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "ALPHA BRAVO CHARLIE DELTA.",
+          "xPt": 72,
+          "yPt": 720,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "ONE TWO THREE FOUR FIVE.",
+          "xPt": 72,
+          "yPt": 700,
+          "font": "F1",
+          "size": 11
+        }
+      ],
+      "textOps": [
+        {
+          "text": "BODY PAGE TWO",
+          "xPt": 72,
+          "yPt": 770
+        },
+        {
+          "text": "THIRD PAGE OF THE MIXED FIXTURE.",
+          "xPt": 72,
+          "yPt": 740
+        },
+        {
+          "text": "ALPHA BRAVO CHARLIE DELTA.",
+          "xPt": 72,
+          "yPt": 720
+        },
+        {
+          "text": "ONE TWO THREE FOUR FIVE.",
+          "xPt": 72,
+          "yPt": 700
+        }
+      ],
+      "hasTextLayer": true
+    },
+    {
+      "page": 4,
+      "lines": [
+        {
+          "text": "BODY PAGE THREE",
+          "xPt": 72,
+          "yPt": 770,
+          "font": "F2",
+          "size": 16
+        },
+        {
+          "text": "LAST PAGE OF THE MIXED FIXTURE.",
+          "xPt": 72,
+          "yPt": 740,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "THIS PAGE ALSO CARRIES A TEXT LAYER.",
+          "xPt": 72,
+          "yPt": 720,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "END OF DOCUMENT.",
+          "xPt": 72,
+          "yPt": 700,
+          "font": "F1",
+          "size": 11
+        }
+      ],
+      "textOps": [
+        {
+          "text": "BODY PAGE THREE",
+          "xPt": 72,
+          "yPt": 770
+        },
+        {
+          "text": "LAST PAGE OF THE MIXED FIXTURE.",
+          "xPt": 72,
+          "yPt": 740
+        },
+        {
+          "text": "THIS PAGE ALSO CARRIES A TEXT LAYER.",
+          "xPt": 72,
+          "yPt": 720
+        },
+        {
+          "text": "END OF DOCUMENT.",
+          "xPt": 72,
+          "yPt": 700
+        }
+      ],
+      "hasTextLayer": true
+    }
+  ]
+}
