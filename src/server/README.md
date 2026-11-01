@@ -61,7 +61,7 @@ node --test "test/server/**/*.test.js"
 | 工具 | 参数（类型 / 适用媒体） |
 |---|---|
 | `media_probe` | `path`；`transcriptFile`（video/audio）；`transcript`（video/audio，`auto`/`subtitle`/`off`） |
-| `media_overview` | `path`；`start` / `end`（秒，video/audio）；`segment`（30–3600，video/audio）；`pages`（`"3-10,15"`，document）；`cells`（1–16，video/document）；`images`（1–4，video/document）；`maxEdge`（256–1600，video/document）；`envelope`（audio）；`transcriptFile` / `transcript`（video/audio） |
+| `media_overview` | `path`；`start` / `end`（秒，video/audio）；`segment`（30–3600，video/audio）；`pages`（`"3-10,15"`，document）；`cells`（1–16，video/document）；`images`（0–4，video/document；audio 仅 `0` = 零像素纯文本模式）；`maxEdge`（256–1600，video/document）；`envelope`（audio）；`transcriptFile` / `transcript`（video/audio） |
 | `media_zoom` | `path`；`at`（video）；`start` + `end`（video）；`page`（document）；`crop`（video/document）；`maxEdge` |
 | `media_locate` | `path` + `query`；`max`（1–20）；`start` / `end` / `segment` / `pages`；`transcriptFile` / `transcript`；`includeFrame`（video/document） |
 | `video_subtitles` | `path`（video/audio）；`start` / `end`；`pages` 仅用于报「不适用」；`transcriptFile` |

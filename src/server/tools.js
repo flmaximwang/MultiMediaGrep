@@ -77,6 +77,10 @@ What you get depends on the media:
 - document : a grid of page thumbnails plus the text of each page, when a document parser is
              configured
 
+Pass images: 0 for a text-only, zero-pixel overview: no grid is rendered and no frame is
+decoded (a video costs no ffmpeg work at all), so you get only the transcript — or the page
+text for a document — and the reported budget is all zeros. Use it when you only need the words.
+
 TEXT SOURCE ORDER — subtitles first, ASR only as a fallback:
 1. a transcriptFile you pass in (external subtitle file),
 2. the subtitle track embedded in the container,
@@ -196,7 +200,9 @@ const CELLS_PARAM = z.number().optional().describe(
 );
 
 const IMAGES_PARAM = z.number().optional().describe(
-  'How many puzzle images to return: 1-4, default 2. Applicable to video and document only. (返回几张拼图)',
+  'How many puzzle images to return: 0-4, default 2. Use 0 for the text-only mode: zero pixels — for video nothing is scanned '
+  + 'and no frame is decoded, for audio no waveform is drawn, for document no page is rendered; only the transcript '
+  + '(or page text) comes back and the budget is all zeros. Applicable to video and document; audio accepts 0 only. (返回几张拼图；0 = 纯文本模式)',
 );
 
 const MAX_EDGE_PARAM = z.number().optional().describe(
@@ -360,6 +366,8 @@ export const PARAM_APPLICABILITY = Object.freeze({
   },
   images: {
     media: ['video', 'document'],
+    // 录音只认 images: 0（零像素纯文本模式）；其它取值对录音依然不适用。
+    allow: (value, mediaType) => mediaType === 'audio' && value === 0,
     message: (t) => `images is not applicable to ${t} media.`,
   },
   maxEdge: {
@@ -375,11 +383,13 @@ export const PARAM_APPLICABILITY = Object.freeze({
 /**
  * 契约 §2.2 的硬规则：**不适用的参数必须报错，不能静默忽略。**
  * 只检查调用方真的传了的参数（默认值不触发）。
+ * 规则的 `allow(value, mediaType)` 是值级豁免：参数对某媒体「部分适用」时用它放行。
  */
 export function checkApplicability(args, mediaType) {
   for (const [param, rule] of Object.entries(PARAM_APPLICABILITY)) {
     if (args?.[param] === undefined) continue;
     if (rule.media.includes(mediaType)) continue;
+    if (rule.allow?.(args[param], mediaType)) continue;
     throw new ToolError('INVALID_ARGUMENT', rule.message(mediaType));
   }
 }
@@ -534,6 +544,10 @@ function planOverviewImages(args, mediaType, config) {
   const limitEdge = config?.images?.maxEdge ?? IMAGE_LIMITS.maxMaxEdge;
 
   if (mediaType === 'audio') {
+    // images: 0 是零像素模式，压过 envelope：true —— 录音不出波形图。
+    if (args.images !== undefined && Number(args.images) === 0) {
+      return planImageBudget({ cells: 1, images: 0, maxEdge: 1280, explicit: true, limitTokens, limitEdge });
+    }
     if (!args.envelope) return null;
     return planImageBudget({ cells: 1, images: 1, maxEdge: 1280, explicit: false, limitTokens, limitEdge });
   }
@@ -644,11 +658,12 @@ function truncateLines(headerLines, bodyLines, maxChars) {
   };
 }
 
-function formatOverviewSegmentLine(segment, mediaType) {
+function formatOverviewSegmentLine(segment, mediaType, textOnly = false) {
   if (mediaType === 'document') {
     return `${padLabel(`[page ${segment.page ?? segment.index}`)}] (${segment.source})  ${quoteBySource(segment.text, segment.source)}`.trimEnd();
   }
-  const label = mediaType === 'video' ? `[cell ${segment.index}` : `[seg ${segment.index}`;
+  // 纯文本模式（images: 0）没有宫格格位，段落是转写行而不是 cell。
+  const label = mediaType === 'video' && !textOnly ? `[cell ${segment.index}` : `[seg ${segment.index}`;
   const time = `${rangeLabel(segment.startMs, segment.endMs)}  `;
   return `${padLabel(label)}] ${time}(${segment.source})  ${quoteBySource(segment.text, segment.source)}`.trimEnd();
 }
@@ -722,7 +737,7 @@ function formatProbeText(result) {
 }
 
 function formatOverviewText({
-  mediaType, base, window, pages, durationSec, segments, transcript, imageDescriptors, budget, hasAudio,
+  mediaType, base, window, pages, durationSec, segments, transcript, imageDescriptors, textOnly, budget, hasAudio,
 }) {
   const lines = [];
   const attrs = [`path="${base.path}"`, `type="${mediaType}"`];
@@ -763,14 +778,19 @@ function formatOverviewText({
     lines.push(`transcript: NONE (${transcript.reason ?? 'no transcript source is available for this file'})`);
   }
 
-  const bodyLines = segments.map((segment) => formatOverviewSegmentLine(segment, mediaType));
+  const bodyLines = segments.map((segment) => formatOverviewSegmentLine(segment, mediaType, textOnly));
   const truncated = truncateLines(lines, bodyLines, budget.maxInlineChars);
   const notes = [];
   if (imageDescriptors.length > 0) {
     notes.push(`cost: ${imageDescriptors.length} image(s) x ~${budget.perImageTokens ?? '-'} = ~${budget.estimatedTokens} vision tokens · transcript from ${transcript.source}${transcript.file ? ` (${transcript.file})` : ''}`);
   }
   if (mediaType === 'video') {
-    notes.push('note: the grids are for locating. To read text on screen, media_zoom({ path, at }) and read the cropped single frame.');
+    if (textOnly) {
+      notes.push('note: text-only mode (images: 0) — no storyboard grid was rendered and no frame was decoded; the list below is the transcript of this window.');
+      notes.push('note: to see the picture, call media_zoom({ path, at }) for a single frame.');
+    } else {
+      notes.push('note: the grids are for locating. To read text on screen, media_zoom({ path, at }) and read the cropped single frame.');
+    }
     if (transcript.source === 'asr') {
       notes.push('note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not quote these lines as the speaker\'s exact words.');
     }
@@ -781,6 +801,9 @@ function formatOverviewText({
       notes.push('note: source is subtitle — the author\'s own words, safe to quote.');
     }
   } else if (mediaType === 'document') {
+    if (textOnly) {
+      notes.push('note: text-only mode (images: 0) — no page thumbnail was rendered; the list below is the text of every requested page.');
+    }
     notes.push('note: page text comes from OCR of the rendered pages — verify names and numbers against the page image via media_zoom({ path, page }).');
   }
   if (budget.warning) notes.push(`budget: ${budget.warning}`);
@@ -1109,6 +1132,8 @@ async function handleOverview(args, call) {
   const transcriptFile = mediaType === 'document' ? null : await resolveTranscriptFile(args.transcriptFile, { logger: call.logger });
 
   const plan = planOverviewImages(args, mediaType, call.config);
+  // images: 0 → 零像素纯文本模式：后端不出图，段落直接来自转写/页文字。
+  const textOnly = Boolean(plan && plan.requested.images === 0);
   const input = {
     ...baseInput({ ...base, mediaType }),
     transcriptFile,
@@ -1168,6 +1193,7 @@ async function handleOverview(args, call) {
     segments,
     transcript,
     imageDescriptors: descriptors,
+    textOnly,
     budget: {
       ...budget,
       maxInlineChars: call.config?.text?.maxInlineChars ?? DEFAULT_MAX_TEXT_INLINE_CHARS,

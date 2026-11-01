@@ -28,6 +28,8 @@
   ASR 段落 `source: 'asr'`（`origin: 'asr'`）。没有转写时 `source: 'none'`。
 - **overview** 的格范围严格覆盖 `startMs..endMs`：第一格从起点开始、最后一格在终点结束；
   镜头切点只用于对齐边界。输出格数不超过 `cells × images`，且窗口过短时宁可少给。
+- **overview 的 `images: 0`**：零像素纯文本模式——不扫镜头、不抽帧（这条路径上一次 ffmpeg
+  都不跑），段落直接就是转写行，图片数组为空。
 - **zoom** 的 `crop` 是输出图的分数坐标，在缩放到 `maxEdge` 后再裁。
 - **二进制 PNG** 走临时文件再读回：共享 `run()` 的 stdout 是字符串，不能承载二进制。
 - **Apache-2.0 派生**：`shots.js` / `frames.js` / `sheet.js` / `geometry.js` 派生自

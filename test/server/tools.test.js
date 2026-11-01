@@ -545,6 +545,160 @@ test('media_overview（video）：先 text 后 image，全文落盘，budget 默
   }
 });
 
+test('media_overview：images: 0 是零像素纯文本模式——预算全零、零图片、全文照常落盘', async () => {
+  const workspace = await makeWorkspace();
+  try {
+    const overviewCalls = [];
+    const backends = stubBackends({
+      video: {
+        async overview(input) {
+          overviewCalls.push(input);
+          return {
+            segments: [
+              { startMs: 0, endMs: 30000, text: '第一句', source: 'subtitle', origin: 'file' },
+              { startMs: 30000, endMs: 60000, text: '第二句', source: 'subtitle', origin: 'file' },
+            ],
+            images: [],
+            transcript: { source: 'subtitle', origin: 'file', language: 'zh', provider: null, model: null },
+            warnings: [],
+          };
+        },
+      },
+    });
+    await withClient(workspace, async (client) => {
+      const result = await client.callTool({
+        name: 'media_overview',
+        arguments: { path: workspace.files.video, start: 0, end: 300, images: 0 },
+      });
+      assert.notEqual(result.isError, true);
+      assert.equal(result.content.length, 1, '纯文本模式不得带 image 块');
+      assert.equal(result.content[0].type, 'text');
+
+      const data = result.structuredContent;
+      assert.deepEqual(data.images, []);
+      assert.equal(data.budget.requestedImages, 0);
+      assert.equal(data.budget.producedImages, 0);
+      assert.equal(data.budget.requestedCells, 0);
+      assert.equal(data.budget.producedCells, 0);
+      assert.equal(data.budget.estimatedTokens, 0);
+      assert.equal(data.budget.limit, 4000);
+      assert.equal(data.budget.warning, null);
+      assert.equal(data.segments.length, 2);
+      assert.equal(data.segments[0].text, '第一句');
+      assert.equal(data.truncated, false);
+
+      // 传给后端的形状就是 images: 0（后端据此跳过镜头扫描与抽帧）
+      assert.equal(overviewCalls[0].images, 0);
+
+      // 全文照常落盘（契约 §9）
+      assert.ok(data.fullText.contentMd.endsWith('content.md'));
+      const contentMd = await readFile(data.fullText.contentMd, 'utf8');
+      assert.match(contentMd, /第一句/);
+      const segmentsJsonl = await readFile(data.fullText.segmentsJsonl, 'utf8');
+      assert.match(segmentsJsonl, /"text":"第一句"/);
+
+      // 续读提示在纯文本模式下依然可用
+      assert.equal(data.continuation.nextStartMs, 300000);
+      assert.match(data.continuation.note, /More media follows at 05:00\.000/);
+
+      // 文本清单：没有宫格就没有 cell，段落标成 seg
+      assert.match(result.content[0].text, /^<overview path=".*a\.mp4" type="video" window="0\.00-300\.00"/);
+      assert.match(result.content[0].text, /\[seg 1\s*\] 00:00\.000-00:30\.000\s+\(subtitle\)\s+「第一句」/);
+      assert.match(result.content[0].text, /text-only mode \(images: 0\)/);
+    }, { backends });
+  } finally {
+    await workspace.cleanup();
+  }
+});
+
+test('media_overview（audio）：images: 0 压过 envelope——不出波形图，预算全零', async () => {
+  const workspace = await makeWorkspace();
+  try {
+    const overviewCalls = [];
+    const backends = stubBackends({
+      audio: {
+        async overview(input) {
+          overviewCalls.push(input);
+          return {
+            segments: [{ startMs: 0, endMs: 4120, text: '第一段', source: 'asr', origin: 'asr' }],
+            images: [],
+            transcript: { source: 'asr', origin: 'asr', language: 'zh', provider: 'stub', model: 'stub-v1' },
+            warnings: [],
+          };
+        },
+      },
+    });
+    await withClient(workspace, async (client) => {
+      const result = await client.callTool({
+        name: 'media_overview',
+        arguments: { path: workspace.files.audio, images: 0, envelope: true },
+      });
+      assert.notEqual(result.isError, true);
+      assert.equal(result.content.length, 1, '纯文本模式不得带 image 块');
+
+      const data = result.structuredContent;
+      assert.deepEqual(data.images, []);
+      assert.equal(data.budget.requestedImages, 0);
+      assert.equal(data.budget.producedImages, 0);
+      assert.equal(data.budget.estimatedTokens, 0);
+      assert.equal(data.budget.warning, null);
+      assert.equal(data.segments.length, 1);
+
+      // images: 0 一路传到后端（后端据此压过 envelope: true）
+      assert.equal(overviewCalls[0].images, 0);
+      assert.equal(overviewCalls[0].envelope, true);
+    }, { backends });
+  } finally {
+    await workspace.cleanup();
+  }
+});
+
+test('media_overview（document）：images: 0 只回页文字，不出页缩略图', async () => {
+  const workspace = await makeWorkspace();
+  try {
+    const overviewCalls = [];
+    const backends = stubBackends({
+      document: {
+        async overview(input) {
+          overviewCalls.push(input);
+          return {
+            segments: [
+              { startMs: null, endMs: null, page: 3, text: 'page three text', source: 'ocr', origin: 'ocr' },
+              { startMs: null, endMs: null, page: 4, text: 'page four text', source: 'ocr', origin: 'ocr' },
+            ],
+            images: [],
+            transcript: { source: 'ocr', origin: 'ocr', language: 'en', provider: 'mineru', model: 'stub' },
+            warnings: [],
+          };
+        },
+      },
+    });
+    await withClient(workspace, async (client) => {
+      const result = await client.callTool({
+        name: 'media_overview',
+        arguments: { path: workspace.files.document, pages: '3-4', images: 0 },
+      });
+      assert.notEqual(result.isError, true);
+      assert.equal(result.content.length, 1, '纯文本模式不得带 image 块');
+
+      const data = result.structuredContent;
+      assert.deepEqual(data.images, []);
+      assert.equal(data.budget.requestedImages, 0);
+      assert.equal(data.budget.producedImages, 0);
+      assert.equal(data.budget.estimatedTokens, 0);
+      assert.equal(data.budget.warning, null);
+      assert.equal(data.pages.length, 2);
+      assert.equal(data.pages[0].page, 3);
+      assert.match(data.pages[0].text, /page three text/);
+      assert.equal(overviewCalls[0].images, 0);
+
+      assert.match(result.content[0].text, /text-only mode \(images: 0\)/);
+    }, { backends });
+  } finally {
+    await workspace.cleanup();
+  }
+});
+
 test('media_overview：end 超出时长裁剪到末尾并标记 clipped', async () => {
   const workspace = await makeWorkspace();
   try {
@@ -593,6 +747,20 @@ test('media_overview：范围/形状越界的契约错误', async () => {
       });
       assert.equal(errorCode(tooManyImages), 'BUDGET_EXCEEDED');
       assert.match(tooManyImages.content[0].text, /requested 5 images but the per-call limit is 4/);
+
+      // images 的下限是 0（零像素纯文本模式），负数仍然拒绝
+      const negativeImages = await client.callTool({
+        name: 'media_overview', arguments: { path: workspace.files.video, images: -1 },
+      });
+      assert.equal(errorCode(negativeImages), 'INVALID_ARGUMENT');
+      assert.equal(negativeImages.structuredContent.error.message, 'images must be an integer >= 0 (got -1).');
+
+      // 录音只认 images: 0：其它取值仍然不适用
+      const audioImages = await client.callTool({
+        name: 'media_overview', arguments: { path: workspace.files.audio, images: 2 },
+      });
+      assert.equal(errorCode(audioImages), 'INVALID_ARGUMENT');
+      assert.equal(audioImages.structuredContent.error.message, 'images is not applicable to audio media.');
     });
   } finally {
     await workspace.cleanup();

@@ -109,11 +109,13 @@ flowchart TD
 | `crop` | ✅ | ❌ | ✅ | `crop is not applicable to audio media.` |
 | `page` | ❌ | ❌ | ✅ | `page is not applicable to video media. media_zoom uses "at" (or "start"/"end") for video.` |
 | `cells` | ✅ | ❌ | ✅ | `cells is not applicable to audio media. A recording has no frames; media_overview returns a timestamped transcript instead.` |
-| `images` | ✅ | ❌ | ✅ | `images is not applicable to audio media.` |
+| `images` | ✅ | ✅ 仅 `0` | ✅ | `images is not applicable to audio media.` |
 | `maxEdge` | ✅ | ❌ | ✅ | `maxEdge is not applicable to audio media.` |
 | `envelope` | ❌ | ✅ | ❌ | `envelope is not applicable to video media. It only applies to audio recordings.` |
 
 文档的 `cells` 语义是「每张拼图放几页缩略图」；视频的 `cells` 语义是「每张宫格放几个镜头格」。同一个名字，两种媒体各自解释——这是「按动作命名、跨媒体统一」的核心收益。
+
+**`images: 0` = 零像素纯文本模式。** 三种媒体都认这个值：视频**不扫镜头、不抽帧**（这条路径上一次 ffmpeg 都不跑），录音**不出波形图**（`images: 0` 压过 `envelope: true`），文档**不渲染页图**（只回页文字）。返回的 `budget` 全是零（`requestedImages` / `producedImages` / `estimatedTokens`），全文照常落盘，窗口与续读提示不变。这是「只要文字、不想付画面钱」的入口。
 
 ### 2.3 时间与页码表示
 
@@ -503,7 +505,7 @@ through the rest.
 | `segment` | integer | ❌ | `300` | video, audio | 只给 `start` 不给 `end` 时的窗口长度（秒，30–3600） |
 | `pages` | string | ❌ | 全文 | document | 页码范围，如 `"3-10,15"` |
 | `cells` | integer | ❌ | video `9` / document `6` | video, document | 每张拼图的格数（video=镜头格，document=页缩略图），1–16 |
-| `images` | integer | ❌ | `2` | video, document | 返回几张拼图，1–4 |
+| `images` | integer | ❌ | `2` | video, document, audio（仅 `0`） | 返回几张拼图，`0`–`4`；`0` = 零像素纯文本模式（不出图，只回文字，`budget` 全零） |
 | `maxEdge` | integer | ❌ | `1280` | video, document | 单张图最长边（px），上限 1600 |
 | `envelope` | boolean | ❌ | `false` | audio | 是否附带音频包络图（P2，可选） |
 
@@ -553,9 +555,9 @@ through the rest.
 | `continuation.nextStartMs` / `nextStartSec` | integer / number | 下一段起点（video/audio） | ms / s |
 | `continuation.nextPage` | integer | 下一批起始页（document） | 页 |
 | `continuation.note` | string | 人话续读提示 | — |
-| `budget.requestedImages` / `producedImages` | integer | 请求 vs 实际出的图数 | 张 |
-| `budget.requestedCells` / `producedCells` | integer | 请求 vs 实际出的格数 | 格 |
-| `budget.estimatedTokens` | integer | 本次总图片 token 估算 | token |
+| `budget.requestedImages` / `producedImages` | integer | 请求 vs 实际出的图数（`images: 0` 时两者都是 0） | 张 |
+| `budget.requestedCells` / `producedCells` | integer | 请求 vs 实际出的格数（`images: 0` 时两者都是 0） | 格 |
+| `budget.estimatedTokens` | integer | 本次总图片 token 估算（`images: 0` 时是 0） | token |
 | `budget.limit` | integer | 本次调用的图片 token 上限 | token |
 | `budget.warning` | string \| null | 超软预算时的降级建议 | — |
 
@@ -573,6 +575,19 @@ through the rest.
 cost: 2 image(s) x ~1229 = ~2458 vision tokens · transcript from subtitle file (0 s)
 note: the grids are for locating. To read text on screen, media_zoom({ path, at }) and read
       the cropped single frame.
+```
+
+**零像素纯文本模式（`images: 0`）**——没有宫格就没有格位，段落按转写行列出：
+
+```
+<overview path="/abs/a.mp4" type="video" window="0.00-600.00" duration="600.00"
+  audio="present" transcript="subtitle" origin="file" file="/abs/a.zh.srt" />
+[seg 1   ] 00:00.000-00:03.120  (subtitle)  「……」
+[seg 2   ] 00:03.120-00:07.480  (subtitle)  「……」
+...
+note: text-only mode (images: 0) — no storyboard grid was rendered and no frame was decoded;
+      the list below is the transcript of this window.
+note: to see the picture, call media_zoom({ path, at }) for a single frame.
 ```
 
 **录音（audio）**——按段落：
@@ -1147,6 +1162,8 @@ estimatedTokens    = max(gridTokens, pixelTokens)
 | 单图最长边 | **1600 px** | `maxEdge must be an integer between 256 and 1600 (got 3000).` |
 | 单图像素数 | **2,000,000** | `the requested shape would need 3,240,000 pixels per image but the limit is 2,000,000. Lower cells or maxEdge.` |
 
+**`images` 的下限是 0**（不是 1）：`images: 0` 是合法的零像素纯文本模式，`images: -1` 才报错 —— `images must be an integer >= 0 (got -1).`
+
 ### 10.3 软预算与默认形状
 
 软预算：**单次调用 ≤ 4,000 图片 token**（`MMGREP_MAX_IMAGE_TOKENS`，默认 4000）。
@@ -1158,6 +1175,7 @@ estimatedTokens    = max(gridTokens, pixelTokens)
 | `media_zoom` | — | 1 | 1600 | 1 帧 @ 1600×900 | **1,920** |
 | `media_locate`（`includeFrame`） | — | 1 | 1280 | 1 帧 @ 1280×720 | **1,229** |
 | `media_overview`（audio + `envelope`） | — | 1 | 1280 | 1 波形 @ 1280×720 | **1,229** |
+| `media_overview`（`images: 0`） | — | 0 | — | 无图 | **0** |
 | `video_subtitles` | — | 0 | — | 无图 | **0** |
 
 **自动模式下**（agent 没显式给 `cells` / `images` / `maxEdge`），server **保证**默认形状落在软预算内；素材更长时按 §10.5 分页。
@@ -1213,6 +1231,7 @@ estimatedTokens    = max(gridTokens, pixelTokens)
 | 短文档 | ≤ 30 页 | `probe` → `overview(cells 6, images 2)` | 1–2 | 591 / 1,229 | **2,458** | 一次读完 |
 | 扫描件（无文本层） | 任意页数 | `probe` → `overview(pages …)` → `media_zoom(page)` | 每批 1–2 + 每次 zoom 1 | 1,229 + **1,920**/zoom | 视页数 | 只能看图；要读字必须逐页 zoom（最贵路径） |
 | 录音 | 任意 | `probe` → `overview`（纯文本）→ `locate` | 0 | 0 | **0** | 零图片成本；录音是这条链路上最省的媒体 |
+| 只要文字 | 任意 | `probe` → `overview(images: 0)` | 0 | 0 | **0** | 零像素模式：视频不扫镜头、不抽帧，只要字幕/转写；配 `transcript: "subtitle"` 时零 ASR |
 
 ### 10.7 与 beads 票的关系
 
