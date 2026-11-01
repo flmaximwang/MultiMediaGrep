@@ -28,7 +28,7 @@ export function createDocProvider(env = process.env, opts = {}) -> provider | nu
 
 - `MMGREP_DOC_PROVIDER` 未设置 / 为空 / `none` → 返回 `null`，server 降级为「只出页面图」。
 - `MMGREP_DOC_PROVIDER=mineru` → 返回 MinerU provider。**没有 key 时构造不抛错**，
-  等 `parse()` 时才抛清晰错误（说明缺 `MMGREP_DOC_API_KEY`）。
+  等 `parse()` 时才抛清晰错误（说明缺 `MMGREP_MINERU_API_KEY`）。
 - 其它取值 → 构造时直接抛错，并列出支持的 provider。
 
 `opts` 传给具体 provider 的构造参数（优先级高于环境变量），常用的是
@@ -81,10 +81,13 @@ provider id（覆盖 `MMGREP_DOC_PROVIDER`，测试 / server 显式选择时用�
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `MMGREP_DOC_PROVIDER` | `none` | `mineru` \| `none` |
-| `MMGREP_DOC_API_KEY` | — | token（MinerU: https://mineru.net/apiManage/token ） |
-| `MMGREP_DOC_BASE_URL` | `https://mineru.net/api/v4` | 接口地址 |
-| `MMGREP_DOC_MODEL` | 空 | 留空 = 用服务端默认模型；MinerU 可选 `pipeline` / `vlm` / `MinerU-HTML` |
+| `MMGREP_MINERU_API_KEY` | — | token（MinerU: https://mineru.net/apiManage/token ） |
+| `MMGREP_MINERU_BASE_URL` | `https://mineru.net/api/v4` | 接口地址 |
+| `MMGREP_MINERU_MODEL` | 空 | 留空 = 用服务端默认模型；MinerU 可选 `pipeline` / `vlm` / `MinerU-HTML` |
 | `MMGREP_DOC_TIMEOUT_MS` | `300000` | 整体超时（包括上传、排队、解析、下载） |
+
+旧的 `MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL` 仅在专属变量
+未设置时兜底（0.2.0 删除）。
 
 ---
 
@@ -121,7 +124,7 @@ export function createMineruDocProvider({
    ```
 
    - `files[].is_ocr` 是**文件级**参数（不是顶层）；`page_ranges` 也是文件级。
-   - `model_version` 只在显式配置 `MMGREP_DOC_MODEL` 时发送。
+   - `model_version` 只在显式配置 `MMGREP_MINERU_MODEL` 时发送。
    - 链接有效期 24 小时；单次最多 50 个文件（我们一次只传一个）。
 
 2. **PUT 上传**
@@ -218,7 +221,7 @@ await provider.parse({ filePath, pages }, { onProgress: (e) => … }); // 单次
 - **token 永不出现在** `describe()`、返回值 `raw`、进度回调、错误信息或日志里；
   错误信息统一走 `redact()`，把 token 替换成 `***`。
 - HTTP 错误信息包含状态码、`statusText`，以及响应体里的 `code` / `msg` / `msgCode`；
-  401/403 会额外提示检查 `MMGREP_DOC_API_KEY`，404 提示检查 `MMGREP_DOC_BASE_URL`，
+  401/403 会额外提示检查 `MMGREP_MINERU_API_KEY`，404 提示检查 `MMGREP_MINERU_BASE_URL`，
   429 提示限流/额度。
 - 常见业务错误码（`A0202` token 错、`A0211` token 过期、`-60005` 文件过大、
   `-60006` 页数超限、`-60018` 每日额度耗尽等）会附带一行可读提示。
@@ -260,8 +263,8 @@ Node 22 没有内置的 zip 读取 API（`node:zlib` 只有 `inflateRaw`）。`m
    }
    ```
 2. 在 `index.js` 的 `DOC_PROVIDERS` 里加上 id，并在 `createDocProvider` 里映射环境变量
-   （`MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL` /
-   `MMGREP_DOC_TIMEOUT_MS` 是通用约定，尽量复用）。
+   （按 `MMGREP_<PROVIDER>_API_KEY` / `MMGREP_<PROVIDER>_BASE_URL` / `MMGREP_<PROVIDER>_MODEL` /
+   `MMGREP_DOC_TIMEOUT_MS` 的约定；MinerU 即 `MMGREP_MINERU_*`）。
 3. 遵守同一条红线：**构造不抛错（缺 key 时），parse 时才抛清晰错误**；缺 key 的错误信息要
    点名缺哪个环境变量；`describe()` / 错误 / 进度里都不能出现 token。
 4. 在 `test/doc/` 下加测试：用 `node:http` 起本地 stub，不联网、不用真 key。

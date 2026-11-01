@@ -31,6 +31,7 @@ import { guardToolHandler } from './errors.js';
 import {
   DEFAULT_MAX_IMAGE_TOKENS,
   DEFAULT_MAX_TEXT_INLINE_CHARS,
+  providerApiKeyEnv,
 } from './config.js';
 import {
   IMAGE_LIMITS,
@@ -1050,7 +1051,7 @@ function asrUnavailableReason({ mediaType, hasAudio, audioHealth, call }) {
   if (!call.runtime?.asrProvider) return 'MMGREP_ASR_PROVIDER is "none". Transcription will be empty.';
   const config = call.runtime?.config?.asr;
   if (config && !config.apiKey && !isLoopback(config.baseUrl)) {
-    return `MMGREP_ASR_API_KEY is not set for provider "${config.provider}".`;
+    return `${providerApiKeyEnv('asr', config.provider)} is not set for provider "${config.provider}".`;
   }
   return null;
 }
@@ -1061,7 +1062,7 @@ function ocrUnavailableReason(mediaType, call) {
   if (!call.runtime?.docProvider) return 'MMGREP_DOC_PROVIDER is "none".';
   const config = call.runtime?.config?.doc;
   if (config && !config.apiKey && !isLoopback(config.baseUrl)) {
-    return `MMGREP_DOC_API_KEY is not set for provider "${config.provider}".`;
+    return `${providerApiKeyEnv('doc', config.provider)} is not set for provider "${config.provider}".`;
   }
   return null;
 }

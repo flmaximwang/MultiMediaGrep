@@ -60,7 +60,7 @@ server **只支持 stdio 传输**：它没有 HTTP 端点、没有端口、不�
 # 用户级：所有项目都能用
 claude mcp add --scope user multimediagrep \
   -e MMGREP_ASR_PROVIDER=elevenlabs \
-  -e MMGREP_ASR_API_KEY=sk-你的key \
+  -e MMGREP_ELEVENLABS_API_KEY=sk-你的key \
   -- npx -y multimediagrep-mcp
 
 # 项目级：写进项目里的 .mcp.json，随仓库提交给团队
@@ -80,7 +80,7 @@ claude mcp add --scope project multimediagrep -- npx -y multimediagrep-mcp
       "args": ["-y", "multimediagrep-mcp"],
       "env": {
         "MMGREP_ASR_PROVIDER": "elevenlabs",
-        "MMGREP_ASR_API_KEY": "sk-替换成你的key"
+        "MMGREP_ELEVENLABS_API_KEY": "sk-替换成你的key"
       }
     }
   }
@@ -97,7 +97,7 @@ Hermes 的 MCP 管理是 `hermes mcp` 这一组子命令，stdio server 走 `--c
 ```bash
 hermes mcp add multimediagrep \
   --command npx \
-  --env MMGREP_ASR_PROVIDER=elevenlabs MMGREP_ASR_API_KEY=sk-你的key \
+  --env MMGREP_ASR_PROVIDER=elevenlabs MMGREP_ELEVENLABS_API_KEY=sk-你的key \
   --args -y multimediagrep-mcp
 ```
 
@@ -117,7 +117,7 @@ mcp_servers:
       - multimediagrep-mcp
     env:
       MMGREP_ASR_PROVIDER: elevenlabs
-      MMGREP_ASR_API_KEY: sk-替换成你的key
+      MMGREP_ELEVENLABS_API_KEY: sk-替换成你的key
     enabled: true
 ```
 
@@ -207,10 +207,10 @@ npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.1.0/
 
 ```bash
 MMGREP_ASR_PROVIDER=elevenlabs
-MMGREP_ASR_API_KEY=sk-你的key
-# 下面三个都有默认值，一般不用动
-MMGREP_ASR_BASE_URL=https://api.elevenlabs.io/v1
-MMGREP_ASR_MODEL=scribe_v1
+MMGREP_ELEVENLABS_API_KEY=sk-你的key
+# 下面几个都有默认值，一般不用动
+MMGREP_ELEVENLABS_BASE_URL=https://api.elevenlabs.io/v1
+MMGREP_ELEVENLABS_MODEL=scribe_v1
 MMGREP_ASR_LANGUAGE=auto
 ```
 
@@ -222,19 +222,19 @@ server 打的是 `POST {baseUrl}/speech-to-text`，认证头是 `xi-api-key`（�
 
 ```bash
 MMGREP_ASR_PROVIDER=openai-compatible
-MMGREP_ASR_API_KEY=你的key
-MMGREP_ASR_BASE_URL=https://your-service/v1
-MMGREP_ASR_MODEL=whisper-1
+MMGREP_OPENAI_COMPATIBLE_API_KEY=你的key
+MMGREP_OPENAI_COMPATIBLE_BASE_URL=https://your-service/v1
+MMGREP_OPENAI_COMPATIBLE_MODEL=whisper-1
 ```
 
-> ⚠️ **`MMGREP_ASR_BASE_URL` 和 `MMGREP_ASR_MODEL` 必须显式写。**
-> server 层的这两个默认值是**写死的 ElevenLabs 值**（`https://api.elevenlabs.io/v1` + `scribe_v1`），
-> **不会**跟着 `MMGREP_ASR_PROVIDER` 变。不改的话，请求会带着 `scribe_v1` 打到你填的地址上，
-> 然后被对方拒掉。
+> ⚠️ **`MMGREP_OPENAI_COMPATIBLE_BASE_URL` 默认是 `https://api.openai.com/v1`。**
+> 用自建 / 第三方兼容服务时改成自己的地址；`MMGREP_OPENAI_COMPATIBLE_MODEL` 默认 `whisper-1`，
+> 按服务实际支持的模型名改。默认值按 provider 分组，**不会**再把 ElevenLabs 的 `scribe_v1`
+> 发给 OpenAI 兼容服务。
 
-> ⚠️ **自建本地服务也必须给一个非空 `MMGREP_ASR_API_KEY`**：provider 层是「key 为空就当没配置」，
-> 即使 `MMGREP_ASR_BASE_URL` 指向 `127.0.0.1`。本地服务不校验 key 时，随便填一个占位串即可
-> （例如 `MMGREP_ASR_API_KEY=local`）。
+> ⚠️ **自建本地服务也必须给一个非空 `MMGREP_OPENAI_COMPATIBLE_API_KEY`**：provider 层是「key 为空就当没配置」，
+> 即使 `MMGREP_OPENAI_COMPATIBLE_BASE_URL` 指向 `127.0.0.1`。本地服务不校验 key 时，随便填一个占位串即可
+> （例如 `MMGREP_OPENAI_COMPATIBLE_API_KEY=local`）。
 > 另外：只有本地地址时 `MMGREP_ASR_PROVIDER` 要写 `openai-compatible`，别写 `elevenlabs`。
 
 ### 3.3 文档解析：MinerU
@@ -244,10 +244,10 @@ MMGREP_ASR_MODEL=whisper-1
 
 ```bash
 MMGREP_DOC_PROVIDER=mineru
-MMGREP_DOC_API_KEY=你的token
+MMGREP_MINERU_API_KEY=你的token
 # 默认值，一般不用动
-MMGREP_DOC_BASE_URL=https://mineru.net/api/v4
-MMGREP_DOC_MODEL=          # 留空 = 用服务端默认模型；也可填 pipeline / vlm / MinerU-HTML
+MMGREP_MINERU_BASE_URL=https://mineru.net/api/v4
+MMGREP_MINERU_MODEL=          # 留空 = 用服务端默认模型；也可填 pipeline / vlm / MinerU-HTML
 MMGREP_DOC_TIMEOUT_MS=180000
 ```
 
@@ -346,12 +346,12 @@ rm -rf ~/.cache/multimediagrep/ab/abcdef.../
 | `TOOL_NOT_FOUND: ffmpeg is not installed or not on PATH.` | 同上 | 同上 |
 | `TOOL_NOT_FOUND: no PDF page rasterizer is available on this machine (pdftoppm, mutool, and gs were all missing).` | 没装 PDF 栅格化工具 | 装 `poppler-utils` / `mupdf-tools` / `ghostscript` 任意一个 |
 | `TOOL_NOT_FOUND: cannot read PDF metadata: no PDF tool is installed (pdfinfo, mutool, or qpdf).` | 同上（缺的是元信息工具） | 同上 |
-| probe 说 `asr: unavailable — No ASR provider is configured (set MMGREP_ASR_PROVIDER and MMGREP_ASR_API_KEY).` | 没配 ASR | 配 `MMGREP_ASR_PROVIDER` + `MMGREP_ASR_API_KEY`（§3.1 / §3.2），或传一个本地字幕文件 |
-| probe 说 `ocr: unavailable — No document parser is configured (MMGREP_DOC_PROVIDER is "none"). Scanned pages and images are returned as page images only.` | 没配文档解析 | 配 `MMGREP_DOC_PROVIDER=mineru` + `MMGREP_DOC_API_KEY`（§3.3）；扫描件没 OCR 就只能看页图 |
-| `PROVIDER_NOT_CONFIGURED`（文档） | 选了 provider 但缺 key | `MMGREP_DOC_API_KEY` 填上，或把 `MMGREP_DOC_PROVIDER` 去掉退回「只有页图」 |
+| probe 说 `asr: unavailable — No ASR provider is configured (set MMGREP_ASR_PROVIDER and the matching provider key: MMGREP_ELEVENLABS_API_KEY or MMGREP_OPENAI_COMPATIBLE_API_KEY).` | 没配 ASR | 配 `MMGREP_ASR_PROVIDER` + 对应 provider 的 key（§3.1 / §3.2），或传一个本地字幕文件 |
+| probe 说 `ocr: unavailable — No document parser is configured (MMGREP_DOC_PROVIDER is "none"). Scanned pages and images are returned as page images only.` | 没配文档解析 | 配 `MMGREP_DOC_PROVIDER=mineru` + `MMGREP_MINERU_API_KEY`（§3.3）；扫描件没 OCR 就只能看页图 |
+| `PROVIDER_NOT_CONFIGURED`（文档） | 选了 provider 但缺 key | `MMGREP_MINERU_API_KEY` 填上，或把 `MMGREP_DOC_PROVIDER` 去掉退回「只有页图」 |
 | `PROVIDER_FAILED: … HTTP 401/403 …` | key 不对 / token 过期 | 换 key；MinerU 常见业务码 `A0202`（token 错）、`A0211`（token 过期） |
-| `PROVIDER_FAILED`，但我明明用的是自己的服务 | `MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 没改 | 这两个的默认值是**写死的 ElevenLabs 值**，不跟 provider 变；显式写上（见 §3.2） |
-| `PROVIDER_FAILED: … HTTP 404 …` | 基址写错 | 检查 `MMGREP_ASR_BASE_URL` / `MMGREP_DOC_BASE_URL` |
+| `PROVIDER_FAILED`，但我明明用的是自己的服务 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_MODEL` 没改 | 这两个的默认值是 OpenAI 官方的 `https://api.openai.com/v1` + `whisper-1`；用自己的服务时显式写上（见 §3.2） |
+| `PROVIDER_FAILED: … HTTP 404 …` | 基址写错 | 检查 `MMGREP_ELEVENLABS_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_MINERU_BASE_URL` |
 | `PROVIDER_FAILED: ASR request timed out after 120000 ms.` | ASR 超时 | 调大 `MMGREP_ASR_TIMEOUT_MS`；或换更快的模型 |
 | `PROVIDER_FAILED` + 排队很久 | MinerU 排队 | 调大 `MMGREP_DOC_TIMEOUT_MS`（默认 180000） |
 | `NO_TRANSCRIPT: no transcript available for this file and no ASR provider is configured (MMGREP_ASR_PROVIDER="none"). …` | `media_locate` / `video_subtitles` 要文字但没有 | 配 ASR，或给 `transcriptFile` 传一个本地 `.srt`/`.vtt` |

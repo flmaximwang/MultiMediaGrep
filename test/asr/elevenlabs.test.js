@@ -270,8 +270,8 @@ describe('ElevenLabs ASR provider', () => {
     try {
       const provider = createAsrProvider({
         MMGREP_ASR_PROVIDER: 'elevenlabs',
-        MMGREP_ASR_API_KEY: FAKE_KEY,
-        MMGREP_ASR_BASE_URL: stub.baseUrl,
+        MMGREP_ELEVENLABS_API_KEY: FAKE_KEY,
+        MMGREP_ELEVENLABS_BASE_URL: stub.baseUrl,
         MMGREP_ASR_LANGUAGE: 'zh',
         MMGREP_ASR_TIMEOUT_MS: '30000',
       });
@@ -339,7 +339,7 @@ describe('createAsrProvider（ElevenLabs 相关）', () => {
   test('provider = elevenlabs 且有 key → 造出 provider，默认 baseUrl / model 正确', () => {
     const provider = createAsrProvider({
       MMGREP_ASR_PROVIDER: 'elevenlabs',
-      MMGREP_ASR_API_KEY: FAKE_KEY,
+      MMGREP_ELEVENLABS_API_KEY: FAKE_KEY,
     });
     assert.equal(provider.id, 'elevenlabs');
     assert.deepEqual(provider.describe(), {
@@ -359,7 +359,7 @@ describe('createAsrProvider（ElevenLabs 相关）', () => {
       (err) => err,
     );
     assert.ok(error instanceof Error);
-    assert.match(error.message, /MMGREP_ASR_API_KEY/);
+    assert.match(error.message, /MMGREP_ELEVENLABS_API_KEY/);
     assert.ok(!/sk-/.test(error.message), '错误信息里不能出现任何看起来像 key 的东西');
   });
 
@@ -373,8 +373,8 @@ describe('createAsrProvider（ElevenLabs 相关）', () => {
   test('baseUrl 外面包了引号也能用（Windows setx 的老坑）', () => {
     const provider = createAsrProvider({
       MMGREP_ASR_PROVIDER: 'elevenlabs',
-      MMGREP_ASR_API_KEY: FAKE_KEY,
-      MMGREP_ASR_BASE_URL: '"https://example.test/v1"',
+      MMGREP_ELEVENLABS_API_KEY: FAKE_KEY,
+      MMGREP_ELEVENLABS_BASE_URL: '"https://example.test/v1"',
     });
     assert.equal(provider.describe().baseUrl, 'https://example.test/v1');
   });
