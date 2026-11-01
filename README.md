@@ -109,7 +109,7 @@ npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.1.0/
 # 用户级（所有项目可用）
 claude mcp add --scope user multimediagrep \
   -e MMGREP_ASR_PROVIDER=elevenlabs \
-  -e MMGREP_ASR_API_KEY=sk-你的key \
+  -e MMGREP_ELEVENLABS_API_KEY=sk-你的key \
   -- npx -y multimediagrep-mcp
 
 # 项目级（写进项目里的 .mcp.json，随仓库走）
@@ -126,9 +126,9 @@ claude mcp add --scope project multimediagrep -- npx -y multimediagrep-mcp
       "args": ["-y", "multimediagrep-mcp"],
       "env": {
         "MMGREP_ASR_PROVIDER": "elevenlabs",
-        "MMGREP_ASR_API_KEY": "sk-替换成你的key",
+        "MMGREP_ELEVENLABS_API_KEY": "sk-替换成你的key",
         "MMGREP_DOC_PROVIDER": "mineru",
-        "MMGREP_DOC_API_KEY": "替换成你的token"
+        "MMGREP_MINERU_API_KEY": "替换成你的token"
       }
     }
   }
@@ -142,7 +142,7 @@ Hermes 用同名的 `hermes mcp add` 流程（stdio server）：
 ```bash
 hermes mcp add multimediagrep \
   --command npx \
-  --env MMGREP_ASR_PROVIDER=elevenlabs MMGREP_ASR_API_KEY=sk-你的key \
+  --env MMGREP_ASR_PROVIDER=elevenlabs MMGREP_ELEVENLABS_API_KEY=sk-你的key \
   --args -y multimediagrep-mcp
 ```
 
@@ -190,21 +190,29 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 |---|---|---|
 | `MMGREP_CACHE_DIR` | `~/.cache/multimediagrep` | 缓存根目录（抽帧、页图、转写、全文落盘都在这）。`~` 会展开；相对路径按 cwd 解析 |
 | `MMGREP_CACHE_MAX_BYTES` | `10737418240`（10 GiB） | 缓存上限，支持 `512MB` / `10GB` / 纯字节数；超出按 LRU 淘汰 |
-| `MMGREP_ASR_PROVIDER` | `none` | ASR 后端：`none`（不转写）/ `elevenlabs` / `openai-compatible` |
-| `MMGREP_ASR_API_KEY` | 空 | ASR 的 API key。选了 provider 就**必填**——自建本地服务也要给一个非空值（可以随便写，如 `local`） |
-| `MMGREP_ASR_BASE_URL` | `https://api.elevenlabs.io/v1` | ASR 的 API 基址。**默认值与 provider 无关**——用 `openai-compatible` 时必须显式改成你的服务地址 |
-| `MMGREP_ASR_MODEL` | `scribe_v1` | ASR 模型名。**默认值与 provider 无关**——用 `openai-compatible` 时必须显式改成 `whisper-1` 之类，否则会把 `scribe_v1` 发给 OpenAI 兼容服务 |
+| `MMGREP_ASR_PROVIDER` | `none` | ASR 后端：`none`（不转写）/ `elevenlabs` / `openai-compatible`。选定后只读该 provider 自己那组变量 |
+| `MMGREP_ELEVENLABS_API_KEY` | 空 | ElevenLabs 的 API key（`MMGREP_ASR_PROVIDER=elevenlabs` 时**必填**） |
+| `MMGREP_ELEVENLABS_BASE_URL` | `https://api.elevenlabs.io/v1` | ElevenLabs 的 API 基址 |
+| `MMGREP_ELEVENLABS_MODEL` | `scribe_v1` | ElevenLabs 转写模型名 |
+| `MMGREP_OPENAI_COMPATIBLE_API_KEY` | 空 | OpenAI 兼容服务的 API key（`MMGREP_ASR_PROVIDER=openai-compatible` 时**必填**；自建本地服务也要填非空占位值，如 `local`） |
+| `MMGREP_OPENAI_COMPATIBLE_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容服务的 API 基址；自建服务填自己的地址 |
+| `MMGREP_OPENAI_COMPATIBLE_MODEL` | `whisper-1` | OpenAI 兼容服务的转写模型名 |
 | `MMGREP_ASR_LANGUAGE` | `auto` | 强制语言（BCP-47，如 `zh` / `en`）；`auto` = 让服务自己判断 |
 | `MMGREP_ASR_TIMEOUT_MS` | `120000` | ASR 单次请求超时 |
 | `MMGREP_DOC_PROVIDER` | `none` | 文档解析后端：`none`（只出页图）/ `mineru` |
-| `MMGREP_DOC_API_KEY` | 空 | 文档解析服务的 token（MinerU：<https://mineru.net/apiManage/token>） |
-| `MMGREP_DOC_BASE_URL` | `https://mineru.net/api/v4` | 文档解析的 API 基址 |
-| `MMGREP_DOC_MODEL` | 空 | 解析模型名；留空 = 用服务端默认（MinerU 可选 `pipeline` / `vlm` / `MinerU-HTML`） |
+| `MMGREP_MINERU_API_KEY` | 空 | MinerU 的 token（<https://mineru.net/apiManage/token>） |
+| `MMGREP_MINERU_BASE_URL` | `https://mineru.net/api/v4` | MinerU 的 API 基址 |
+| `MMGREP_MINERU_MODEL` | 空 | 解析模型名；留空 = 用服务端默认（MinerU 可选 `pipeline` / `vlm` / `MinerU-HTML`） |
 | `MMGREP_DOC_TIMEOUT_MS` | `180000` | 文档解析单次请求超时（3 分钟）。MinerU 是「上传 → 排队 → 解析 → 下载」整段墙钟时间，排队久就调大 |
 | `MMGREP_OCR_PROVIDER` | `none` | 预留给独立的本地 OCR 通道（契约 §12.4）。**当前版本未实现**：OCR 由文档解析 provider（MinerU）承担，这个变量只出现在启动横幅，不影响任何工具行为 |
 | `MMGREP_MAX_IMAGE_TOKENS` | `4000` | 单次调用的图片 token **软预算**。超了自动模式会降形，显式模式只警告 |
 | `MMGREP_MAX_IMAGE_EDGE` | `1600` | 单张图最长边的全局上限（px）。请求超过 → `BUDGET_EXCEEDED` |
 | `MMGREP_LOG_LEVEL` | `info` | 日志级别：`error` / `warn` / `info` / `debug`。日志**一律走 stderr**（stdout 是协议通道） |
+
+> 旧的 `MMGREP_ASR_API_KEY` / `MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 与
+> `MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL` 仍会在对应的
+> provider 专属变量未设置时兜底，但启动时会记一条弃用 warning；计划在 0.2.0 删除。
+> 同一进程里可以同时存在多家 provider 的 key，server 只读当前选中 provider 的那一组。
 
 另有 `MMGREP_FFMPEG_PATH` / `MMGREP_FFPROBE_PATH`（默认按 `PATH` 查找）、
 `MMGREP_MAX_TEXT_INLINE_CHARS`（默认 24000）、`MMGREP_MAX_CONCURRENCY`（默认 2）等，

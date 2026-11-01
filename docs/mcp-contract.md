@@ -1329,20 +1329,27 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 
 | 变量 | 类型 | 默认值 | 作用 | 没配 / 配错时的行为 |
 |---|---|---|---|---|
-| `MMGREP_ASR_PROVIDER` | string | `none` | 生效的 ASR 后端。`none` = 完全不做转写；`elevenlabs` = ElevenLabs；其余值按 OpenAI `/audio/transcriptions` 方言的兼容服务处理 | `none` → `capabilities.asr.available = false`，`reason` 写「MMGREP_ASR_PROVIDER is \"none\"」。此时**只出画面**。另外：音频体检判定 `too-quiet` / `silent` 时**即使配了 provider 也不跑 ASR**（见 §4.3.1） |
-| `MMGREP_ASR_API_KEY` | string | 空 | provider 的 API key | 云端 provider 缺 key → `PROVIDER_NOT_CONFIGURED`（不猜、不匿名试）。若 `MMGREP_ASR_BASE_URL` 指向回环地址（`127.0.0.1` / `localhost` / `[::1]`），则**不需要** key |
-| `MMGREP_ASR_BASE_URL` | string | `https://api.elevenlabs.io/v1` | provider 的 API 基址 | 用默认值。填回环地址即视为本地服务，免 key |
-| `MMGREP_ASR_MODEL` | string | `scribe_v1` | 转写模型名 | 用默认值。模型不被 provider 接受 → `PROVIDER_FAILED`，并把 provider 的原话带上 |
+| `MMGREP_ASR_PROVIDER` | string | `none` | 生效的 ASR 后端。`none` = 完全不做转写；`elevenlabs` = ElevenLabs；`openai-compatible` = 按 OpenAI `/audio/transcriptions` 方言的兼容服务。选定后只读取该 provider 自己那组 key / baseUrl / model 变量 | `none` → `capabilities.asr.available = false`，`reason` 写「MMGREP_ASR_PROVIDER is \"none\"」。此时**只出画面**。另外：音频体检判定 `too-quiet` / `silent` 时**即使配了 provider 也不跑 ASR**（见 §4.3.1）。未知 provider id → 记 warning 并回落到 `none` |
+| `MMGREP_ELEVENLABS_API_KEY` | string | 空 | `elevenlabs` 的 API key | 云端 provider 缺 key → `PROVIDER_NOT_CONFIGURED`（不猜、不匿名试）。若 `MMGREP_ELEVENLABS_BASE_URL` 指向回环地址（`127.0.0.1` / `localhost` / `[::1]`），则**不需要** key |
+| `MMGREP_ELEVENLABS_BASE_URL` | string | `https://api.elevenlabs.io/v1` | ElevenLabs 的 API 基址 | 用默认值。填回环地址即视为本地服务，免 key |
+| `MMGREP_ELEVENLABS_MODEL` | string | `scribe_v1` | ElevenLabs 转写模型名 | 用默认值。模型不被 provider 接受 → `PROVIDER_FAILED`，并把 provider 的原话带上 |
+| `MMGREP_OPENAI_COMPATIBLE_API_KEY` | string | 空 | `openai-compatible` 的 API key | 缺 key → `PROVIDER_NOT_CONFIGURED`；回环地址免 key |
+| `MMGREP_OPENAI_COMPATIBLE_BASE_URL` | string | `https://api.openai.com/v1` | OpenAI 兼容服务的 API 基址 | 用默认值；自建服务显式填自己的地址 |
+| `MMGREP_OPENAI_COMPATIBLE_MODEL` | string | `whisper-1` | OpenAI 兼容服务的转写模型名 | 用默认值。**不会**继承 ElevenLabs 的 `scribe_v1`；模型不被接受 → `PROVIDER_FAILED` |
 | `MMGREP_ASR_LANGUAGE` | string | `auto` | 强制语言（BCP-47，如 `zh` / `en`）。`auto` = 由 provider 自动判定 | 用默认值。填了不被支持的语言 → `PROVIDER_FAILED`（provider 原话） |
+
+> 兼容兜底：`MMGREP_ASR_API_KEY` / `MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 在对应的 provider 专属变量未设置时仍然生效，但会在 `config.warnings` 里记一条弃用提示；计划在 0.2.0 删除。旧 `MMGREP_ASR_MODEL` 与 `openai-compatible` 同用时还会额外警告该值可能不适配。
 
 ### 12.3 文档解析 provider
 
 | 变量 | 类型 | 默认值 | 作用 | 没配 / 配错时的行为 |
 |---|---|---|---|---|
-| `MMGREP_DOC_PROVIDER` | string | `none` | 文档解析后端。`none` = 不抽文字层；`mineru` = MinerU | `none` → 文档**只出页缩略图**，`pages[].text` 为空，`reason` 写明「MMGREP_DOC_PROVIDER is \"none\"」 |
-| `MMGREP_DOC_API_KEY` | string | 空 | provider 的 API key | 云端 provider 缺 key → `PROVIDER_NOT_CONFIGURED`；回环地址免 key |
-| `MMGREP_DOC_BASE_URL` | string | 见 §13 待确认项 | provider 的 API 基址 | 用内置默认值 |
-| `MMGREP_DOC_MODEL` | string | 见 §13 待确认项 | 解析模型名 | 用内置默认值 |
+| `MMGREP_DOC_PROVIDER` | string | `none` | 文档解析后端。`none` = 不抽文字层；`mineru` = MinerU | `none` → 文档**只出页缩略图**，`pages[].text` 为空，`reason` 写明「MMGREP_DOC_PROVIDER is \"none\"」。未知 provider id → 记 warning 并回落到 `none` |
+| `MMGREP_MINERU_API_KEY` | string | 空 | MinerU 的 API token | 云端 provider 缺 key → `PROVIDER_NOT_CONFIGURED`；回环地址免 key |
+| `MMGREP_MINERU_BASE_URL` | string | `https://mineru.net/api/v4` | MinerU 的 API 基址 | 用内置默认值 |
+| `MMGREP_MINERU_MODEL` | string | 空 | MinerU 的解析模型名；留空 = 服务端默认 | 用内置默认值 |
+
+> 兼容兜底：`MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL` 在 `MMGREP_MINERU_*` 未设置时仍然生效，并记一条弃用提示；计划在 0.2.0 删除。
 
 ### 12.4 OCR provider
 
@@ -1455,8 +1462,8 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | # | 问题 | 我的建议 | 影响面 |
 |---|---|---|---|
 | 1 | **图片预算的四个数**（4 张 / 16 格 / 1600 px / 4000 token）是推导值，不是实测值 | 等 beads `9z5.3`（Claude Code / Hermes 实测）出来后按实测收紧 | §10 全部；实现必须先复核 |
-| 2 | **`MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 的默认值** | 建议保留 `https://api.elevenlabs.io/v1` + `scribe_v1`，但**本仓库未联网验证** ElevenLabs 当前的转写 endpoint 与模型名，落地前需人工核对 | §12.2；配错会直接 `PROVIDER_FAILED` |
-| 3 | **`MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL` 的默认值** | 同上，MinerU 的接入方式与模型名**未在本仓库确认**（上游无文档后端，无从参照） | §12.3 |
+| 2 | **`MMGREP_ELEVENLABS_BASE_URL` / `MMGREP_ELEVENLABS_MODEL` / `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_MODEL` 的默认值** | ElevenLabs 保留 `https://api.elevenlabs.io/v1` + `scribe_v1`，OpenAI 兼容保留 `https://api.openai.com/v1` + `whisper-1`；但**本仓库未联网验证**各家当前的转写 endpoint 与模型名，落地前需人工核对 | §12.2；配错会直接 `PROVIDER_FAILED` |
+| 3 | **`MMGREP_MINERU_BASE_URL` / `MMGREP_MINERU_MODEL` 的默认值** | 基址默认 `https://mineru.net/api/v4`、模型默认留空；MinerU 的接入方式与模型名**未在本仓库确认**（上游无文档后端，无从参照） | §12.3 |
 | 4 | **同目录字幕自动发现是否默认开启** | 我选了**默认开启**（§8.5），因为它命中率高，且命中的文件路径一定会在返回值里报出来，不是静默行为 | §8.5；若嫌意外，可改为默认关闭、需显式 `transcriptFile` |
 | 5 | **`media_locate` 默认是否出图** | 我选了**默认不出图**（`includeFrame` 默认 `false`），沿用上游「定位不花像素」的定位 | §7.2 |
 | 6 | **文档 `cells` 的默认 6** | 视频默认 9、文档默认 6。文档格是页缩略图，6 页一张比 9 页一张更容易看清页内排版 | §10.3；可调 |

@@ -30,11 +30,152 @@ export const DEFAULT_AUDIO_MIN_SPEECH_RATIO = 0.05;
 /** 契约 §12.5：provider 超时 */
 export const DEFAULT_ASR_TIMEOUT_MS = 120000;
 export const DEFAULT_DOC_TIMEOUT_MS = 180000;
-/** 契约 §12.2 / §12.3：默认基址与模型 */
+/** 契约 §12.2 / §12.3：默认基址与模型（按 provider 分组） */
 export const DEFAULT_ASR_BASE_URL = 'https://api.elevenlabs.io/v1';
 export const DEFAULT_ASR_MODEL = 'scribe_v1';
+export const DEFAULT_OPENAI_COMPATIBLE_BASE_URL = 'https://api.openai.com/v1';
+export const DEFAULT_OPENAI_COMPATIBLE_MODEL = 'whisper-1';
 export const DEFAULT_DOC_BASE_URL = 'https://mineru.net/api/v4';
 export const DEFAULT_DOC_MODEL = '';
+
+/**
+ * provider → 环境变量组。选哪个 provider 就只读哪一组，互不串用。
+ *
+ * 键名固定为 apiKey / baseUrl / model，值是**该 provider 专属**的环境变量名；
+ * defaultBaseUrl / defaultModel 是该 provider 自己的默认值。
+ */
+export const PROVIDER_ENV = Object.freeze({
+  asr: Object.freeze({
+    elevenlabs: Object.freeze({
+      apiKey: 'MMGREP_ELEVENLABS_API_KEY',
+      baseUrl: 'MMGREP_ELEVENLABS_BASE_URL',
+      model: 'MMGREP_ELEVENLABS_MODEL',
+      defaultBaseUrl: DEFAULT_ASR_BASE_URL,
+      defaultModel: DEFAULT_ASR_MODEL,
+    }),
+    'openai-compatible': Object.freeze({
+      apiKey: 'MMGREP_OPENAI_COMPATIBLE_API_KEY',
+      baseUrl: 'MMGREP_OPENAI_COMPATIBLE_BASE_URL',
+      model: 'MMGREP_OPENAI_COMPATIBLE_MODEL',
+      defaultBaseUrl: DEFAULT_OPENAI_COMPATIBLE_BASE_URL,
+      defaultModel: DEFAULT_OPENAI_COMPATIBLE_MODEL,
+    }),
+  }),
+  doc: Object.freeze({
+    mineru: Object.freeze({
+      apiKey: 'MMGREP_MINERU_API_KEY',
+      baseUrl: 'MMGREP_MINERU_BASE_URL',
+      model: 'MMGREP_MINERU_MODEL',
+      defaultBaseUrl: DEFAULT_DOC_BASE_URL,
+      defaultModel: DEFAULT_DOC_MODEL,
+    }),
+  }),
+});
+
+/** 旧的「所有 provider 共用一个」变量：专属变量未设置时兜底，并记弃用 warning。 */
+const LEGACY_ENV = Object.freeze({
+  asr: Object.freeze({
+    apiKey: 'MMGREP_ASR_API_KEY',
+    baseUrl: 'MMGREP_ASR_BASE_URL',
+    model: 'MMGREP_ASR_MODEL',
+  }),
+  doc: Object.freeze({
+    apiKey: 'MMGREP_DOC_API_KEY',
+    baseUrl: 'MMGREP_DOC_BASE_URL',
+    model: 'MMGREP_DOC_MODEL',
+  }),
+});
+
+const PROVIDER_ENV_VAR = Object.freeze({
+  asr: 'MMGREP_ASR_PROVIDER',
+  doc: 'MMGREP_DOC_PROVIDER',
+});
+
+/** provider=none 时仍保持旧内部形状的默认值（不读任何 provider 变量）。 */
+const NONE_DEFAULTS = Object.freeze({
+  asr: Object.freeze({ baseUrl: DEFAULT_ASR_BASE_URL, model: DEFAULT_ASR_MODEL }),
+  doc: Object.freeze({ baseUrl: DEFAULT_DOC_BASE_URL, model: DEFAULT_DOC_MODEL }),
+});
+
+/**
+ * 取某个 provider 的某个配置项：专属变量优先，旧的通用变量兜底。
+ * warning 里只出现变量名 / provider id，**永远不含变量值**。
+ */
+function readProviderSetting(env, kind, provider, field, warnings) {
+  const spec = PROVIDER_ENV[kind][provider];
+  const primary = spec[field];
+  const legacy = LEGACY_ENV[kind][field];
+
+  const primaryValue = readString(env, primary);
+  if (primaryValue !== undefined) return { value: primaryValue, source: primary };
+
+  const legacyValue = readString(env, legacy);
+  if (legacyValue === undefined) return { value: undefined, source: null };
+
+  warnings.push(`${legacy} is deprecated for provider "${provider}"; use ${primary} instead.`);
+  if (kind === 'asr' && provider === 'openai-compatible' && field === 'model') {
+    warnings.push(
+      `${legacy} was shared across ASR providers and may not be valid for "openai-compatible"; ` +
+        `use ${primary} instead (default: ${spec.defaultModel}).`,
+    );
+  }
+  return { value: legacyValue, source: legacy };
+}
+
+/**
+ * 解析一个 provider 分组（asr / doc），产出旧内部形状：
+ * { provider, apiKey, apiKeySource, baseUrl, model }。
+ */
+function resolveProviderSection(kind, requestedProvider, env, warnings) {
+  const noneDefaults = NONE_DEFAULTS[kind];
+  if (requestedProvider === 'none') {
+    return {
+      provider: 'none',
+      apiKey: '',
+      apiKeySource: null,
+      baseUrl: noneDefaults.baseUrl,
+      model: noneDefaults.model,
+    };
+  }
+
+  const spec = PROVIDER_ENV[kind][requestedProvider];
+  if (!spec) {
+    const envName = PROVIDER_ENV_VAR[kind];
+    warnings.push(
+      `${envName} is "${requestedProvider}", which is not a supported provider ` +
+        `(${Object.keys(PROVIDER_ENV[kind]).join(', ')}, none); falling back to "none".`,
+    );
+    return {
+      provider: 'none',
+      apiKey: '',
+      apiKeySource: null,
+      baseUrl: noneDefaults.baseUrl,
+      model: noneDefaults.model,
+    };
+  }
+
+  const apiKey = readProviderSetting(env, kind, requestedProvider, 'apiKey', warnings);
+  const baseUrl = readProviderSetting(env, kind, requestedProvider, 'baseUrl', warnings);
+  const model = readProviderSetting(env, kind, requestedProvider, 'model', warnings);
+
+  return {
+    provider: requestedProvider,
+    apiKey: apiKey.value ?? '',
+    apiKeySource: apiKey.source,
+    baseUrl: baseUrl.value ?? spec.defaultBaseUrl,
+    model: model.value ?? spec.defaultModel,
+  };
+}
+
+/** 取某 provider 的变量组（未知 provider 返回 null）。 */
+export function providerEnv(kind, providerId) {
+  return PROVIDER_ENV[kind]?.[String(providerId ?? '').toLowerCase()] ?? null;
+}
+
+/** 缺 key 报错时应点名的环境变量；未知 provider 回落到旧的通用名。 */
+export function providerApiKeyEnv(kind, providerId) {
+  return providerEnv(kind, providerId)?.apiKey ?? LEGACY_ENV[kind]?.apiKey ?? 'MMGREP_API_KEY';
+}
 
 /** server 身份（与 package.json 保持一致的硬编码，避免运行时读包信息） */
 export const SERVER_NAME = 'multimediagrep';
@@ -131,6 +272,9 @@ export function loadConfig(env = process.env) {
     warnings.push(`MMGREP_LOG_LEVEL is invalid ("${logLevelRaw}"); using "info".`);
   }
 
+  const asrSection = resolveProviderSection('asr', asrProvider, env, warnings);
+  const docSection = resolveProviderSection('doc', docProvider, env, warnings);
+
   const config = {
     server: Object.freeze({ name: SERVER_NAME, version: SERVER_VERSION }),
     cache: Object.freeze({
@@ -138,18 +282,12 @@ export function loadConfig(env = process.env) {
       maxBytes: readCacheMaxBytes(env, warnings),
     }),
     asr: Object.freeze({
-      provider: asrProvider,
-      apiKey: readString(env, 'MMGREP_ASR_API_KEY') ?? '',
-      baseUrl: readString(env, 'MMGREP_ASR_BASE_URL') ?? DEFAULT_ASR_BASE_URL,
-      model: readString(env, 'MMGREP_ASR_MODEL') ?? DEFAULT_ASR_MODEL,
+      ...asrSection,
       language: readString(env, 'MMGREP_ASR_LANGUAGE') ?? 'auto',
       timeoutMs: readInt(env, 'MMGREP_ASR_TIMEOUT_MS', DEFAULT_ASR_TIMEOUT_MS, { min: 1, warnings }),
     }),
     doc: Object.freeze({
-      provider: docProvider,
-      apiKey: readString(env, 'MMGREP_DOC_API_KEY') ?? '',
-      baseUrl: readString(env, 'MMGREP_DOC_BASE_URL') ?? DEFAULT_DOC_BASE_URL,
-      model: readString(env, 'MMGREP_DOC_MODEL') ?? DEFAULT_DOC_MODEL,
+      ...docSection,
       timeoutMs: readInt(env, 'MMGREP_DOC_TIMEOUT_MS', DEFAULT_DOC_TIMEOUT_MS, { min: 1, warnings }),
     }),
     ocr: Object.freeze({ provider: ocrProvider }),

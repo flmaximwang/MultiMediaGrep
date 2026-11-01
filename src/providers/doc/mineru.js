@@ -53,7 +53,7 @@ const POLL_JITTER = 0.25;
 
 /** 常见官方错误码 → 可读提示（见 https://mineru.net/apiManage/docs 的错误码表）。 */
 const API_CODE_HINTS = {
-  A0202: 'token is invalid — check MMGREP_DOC_API_KEY',
+  A0202: 'token is invalid — check MMGREP_MINERU_API_KEY',
   A0211: 'token has expired — create a new token at https://mineru.net/apiManage/token',
   '-500': 'request parameter error',
   '-10001': 'MinerU service error, please retry later',
@@ -164,8 +164,8 @@ export function createMineruDocProvider(options = {}) {
 
       if (!apiKey) {
         throw new Error(
-          'MinerU document provider is enabled (MMGREP_DOC_PROVIDER=mineru) but MMGREP_DOC_API_KEY is missing. ' +
-            'Set MMGREP_DOC_API_KEY to a MinerU token (create one at https://mineru.net/apiManage/token), ' +
+          'MinerU document provider is enabled (MMGREP_DOC_PROVIDER=mineru) but MMGREP_MINERU_API_KEY is missing. ' +
+            'Set MMGREP_MINERU_API_KEY to a MinerU token (create one at https://mineru.net/apiManage/token), ' +
             'or unset MMGREP_DOC_PROVIDER to fall back to page-image-only mode.',
         );
       }
@@ -573,9 +573,9 @@ function httpErrorMessage(res, json, rawText) {
   }
   let hint = '';
   if (res.status === 401 || res.status === 403) {
-    hint = ' — authentication failed, check MMGREP_DOC_API_KEY (token) and its validity';
+    hint = ' — authentication failed, check MMGREP_MINERU_API_KEY (token) and its validity';
   } else if (res.status === 404) {
-    hint = ' — endpoint not found, check MMGREP_DOC_BASE_URL';
+    hint = ' — endpoint not found, check MMGREP_MINERU_BASE_URL';
   } else if (res.status === 429) {
     hint = ' — rate limited or daily quota exhausted';
   } else if (res.status >= 500) {

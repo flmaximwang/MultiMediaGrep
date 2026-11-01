@@ -34,9 +34,9 @@ test('defaults to process.env when no env object is given', () => {
 test('builds a mineru provider from environment variables', () => {
   const provider = createDocProvider({
     MMGREP_DOC_PROVIDER: 'mineru',
-    MMGREP_DOC_API_KEY: 'super-secret-token',
-    MMGREP_DOC_MODEL: 'vlm',
-    MMGREP_DOC_BASE_URL: 'https://example.test/api/v4/',
+    MMGREP_MINERU_API_KEY: 'super-secret-token',
+    MMGREP_MINERU_MODEL: 'vlm',
+    MMGREP_MINERU_BASE_URL: 'https://example.test/api/v4/',
     MMGREP_DOC_TIMEOUT_MS: '12345',
   });
 
@@ -55,7 +55,7 @@ test('builds a mineru provider from environment variables', () => {
 });
 
 test('uses the default base URL and model when not configured', () => {
-  const provider = createDocProvider({ MMGREP_DOC_PROVIDER: 'mineru', MMGREP_DOC_API_KEY: 'k' });
+  const provider = createDocProvider({ MMGREP_DOC_PROVIDER: 'mineru', MMGREP_MINERU_API_KEY: 'k' });
   assert.deepEqual(provider.describe(), {
     id: 'mineru',
     model: null,
@@ -65,7 +65,7 @@ test('uses the default base URL and model when not configured', () => {
 
 test('opts override environment variables', () => {
   const provider = createDocProvider(
-    { MMGREP_DOC_PROVIDER: 'mineru', MMGREP_DOC_API_KEY: 'k', MMGREP_DOC_MODEL: 'vlm' },
+    { MMGREP_DOC_PROVIDER: 'mineru', MMGREP_MINERU_API_KEY: 'k', MMGREP_MINERU_MODEL: 'vlm' },
     { model: 'pipeline', baseUrl: 'http://127.0.0.1:9999/api/v4' },
   );
   assert.deepEqual(provider.describe(), {
@@ -77,20 +77,20 @@ test('opts override environment variables', () => {
 
 test('opts.provider overrides the environment variable', () => {
   const provider = createDocProvider(
-    { MMGREP_DOC_PROVIDER: 'none', MMGREP_DOC_API_KEY: 'k' },
+    { MMGREP_DOC_PROVIDER: 'none', MMGREP_MINERU_API_KEY: 'k' },
     { provider: 'mineru', baseUrl: 'http://127.0.0.1:1234/api/v4' },
   );
   assert.ok(provider);
   assert.equal(provider.describe().baseUrl, 'http://127.0.0.1:1234/api/v4');
 
-  assert.equal(createDocProvider({ MMGREP_DOC_PROVIDER: 'mineru', MMGREP_DOC_API_KEY: 'k' }, { provider: 'none' }), null);
+  assert.equal(createDocProvider({ MMGREP_DOC_PROVIDER: 'mineru', MMGREP_MINERU_API_KEY: 'k' }, { provider: 'none' }), null);
 });
 
 test('constructing mineru without an API key does not throw; parse() does', async () => {
   const provider = createDocProvider({ MMGREP_DOC_PROVIDER: 'mineru' });
   assert.ok(provider);
   assert.equal(provider.describe().id, 'mineru');
-  await assert.rejects(() => provider.parse({ filePath: '/tmp/whatever.pdf' }), /MMGREP_DOC_API_KEY/);
+  await assert.rejects(() => provider.parse({ filePath: '/tmp/whatever.pdf' }), /MMGREP_MINERU_API_KEY/);
 });
 
 test('an unknown provider is rejected with a clear message', () => {
@@ -108,7 +108,7 @@ test('an unknown provider is rejected with a clear message', () => {
 test('a malformed timeout falls back to the default instead of breaking', () => {
   const provider = createDocProvider({
     MMGREP_DOC_PROVIDER: 'mineru',
-    MMGREP_DOC_API_KEY: 'k',
+    MMGREP_MINERU_API_KEY: 'k',
     MMGREP_DOC_TIMEOUT_MS: 'not-a-number',
   });
   assert.equal(provider.describe().id, 'mineru');
