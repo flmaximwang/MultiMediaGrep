@@ -156,6 +156,38 @@ node src/index.js
 
 配置里把 `command` 换成 `node`、`args` 换成 `["/绝对路径/MultiMediaGrep/src/index.js"]` 即可。
 
+### 2.5 从 GitHub 装（npm 还没发布时）
+
+仓库地址：<https://github.com/flmaximwang/MultiMediaGrep>（公开，Apache-2.0）。
+
+```bash
+# A) 临时拉取并启动（宿主拉起 server 时用这条）
+npx -y github:flmaximwang/MultiMediaGrep
+
+# B) 装成本地命令 multimediagrep-mcp
+npm i -g github:flmaximwang/MultiMediaGrep
+
+# C) 只装 release 里的运行时包（不含 test/ 与 fixtures/，体积最小）
+npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.1.0/multimediagrep-mcp-0.1.0.tgz
+```
+
+三种装法在宿主配置里的写法一样，只是 `command` / `args` 不同：
+
+```json
+{
+  "mcpServers": {
+    "multimediagrep": {
+      "command": "npx",
+      "args": ["-y", "github:flmaximwang/MultiMediaGrep"]
+    }
+  }
+}
+```
+
+> A / B 会把整个仓库拉下来（含 vendor 源码与文档），首次安装比 npm 慢一些；
+> C 只含运行时。`npx` 会在本地缓存，第二次启动就快了。
+> 注意：GitHub 源的安装不走 npm registry 的版本号管理，升级要自己 `git pull` 或换回 npm 包。
+
 ---
 
 ## 3. 外部服务（可选）

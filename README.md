@@ -86,6 +86,16 @@ npm install
 node src/index.js
 ```
 
+```bash
+# 3) 从 GitHub 装（npm 还没发布时）
+npx -y github:flmaximwang/MultiMediaGrep            # 临时拉取并启动
+npm i -g github:flmaximwang/MultiMediaGrep           # 装成本地命令 multimediagrep-mcp
+npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.1.0/multimediagrep-mcp-0.1.0.tgz   # 只装 release 里的运行时包
+```
+
+> 从 GitHub 源码装会把整个仓库拉下来（含 vendor 源码与文档），首次安装比 npm 慢；
+> release 里的 `.tgz` 只含运行时（src + vendor 运行时 + 署名材料）。
+
 **只有 stdio 传输。** 没有 HTTP / SSE 端点，也没有 `--port` 之类的开关——它被谁拉起、怎么拉起，
 由 MCP client 决定。
 
@@ -148,6 +158,28 @@ hermes mcp add multimediagrep \
 各宿主的完整写法见 [`docs/install.md`](docs/install.md) §2。
 
 ---
+
+## 给第一次来的 agent：5 分钟上手
+
+给一个**没有上下文**、只想「看看这个工具能干什么」的 agent：
+
+1. **装起来**（宿主负责拉起它，不用自己开端口）：
+   - Claude Code：`claude mcp add --scope user multimediagrep -- npx -y github:flmaximwang/MultiMediaGrep`
+   - 其它 client：把 [`examples/mcp-config.json`](examples/mcp-config.json) 里的 `command` / `args` 换成上面那条命令即可。
+2. **确认环境**：宿主里需要 `ffmpeg` + `ffprobe` 在 PATH 上；读 PDF 还要 `poppler` / `mutool` / `gs` 任意一个。
+   缺了会返回 `TOOL_NOT_FOUND`，不会静默出错。
+3. **先探后看**（省图片 token）：
+   - `media_probe({ path })` → 类型、时长、有没有字幕轨、能不能 ASR/OCR。**不花任何图片 token**，先做这一步。
+   - `media_overview({ path })` → 视频出分镜宫格图 + 时间对齐文本；录音出带时间轴转写；文档出页图 + 每页文字。
+   - `media_zoom({ path, at })` → 只在「画面上有字要读」时用，最贵（约 1900 token/张）。
+   - `media_locate({ path, query })` → 「那句话在哪说的」，纯文本、零图片。
+4. **记住三件事**：
+   - 只吃**本地绝对路径**，它不下载任何东西；
+   - server 自己不调 LLM，理解由你的模型完成；
+   - **字幕优先于 ASR**：字幕是作者原话（可引用），ASR 是机器转写（人名、数字容易错，别当原话引用）。
+5. **长素材先收窄**：视频/录音用 `start`/`end`，文档用 `pages`（如 `"3-10,15"`），再跟着结果里的 `continuation` 往下走。
+
+没有 ASR key 也能用：只是拿不到文字层（文件自带字幕就照样出文本）。
 
 ## 环境变量
 
