@@ -261,6 +261,7 @@ HTTP 端点常被多个调用方共用，provider 的 key 不必都写死在 ser
 3. **先探后看**（省图片 token）：
    - `media_probe({ path })` → 类型、时长、有没有字幕轨、能不能 ASR/OCR。**不花任何图片 token**，先做这一步。
    - `media_overview({ path })` → 视频出分镜宫格图 + 时间对齐文本；录音出带时间轴转写；文档出页图 + 每页文字。
+   - 文档的文字层可能是坏的（早先劣质 OCR 写进去的）：probe 会给出 `text layer: looks unreliable (...)`，这时用 `media_overview({ path, pages, ocr: "force" })` / `media_locate({ path, query, ocr: "force" })` 要求重新识别（需要已配置 OCR provider）。
    - `media_zoom({ path, at })` → 只在「画面上有字要读」时用，最贵（约 1900 token/张）。
    - `media_locate({ path, query })` → 「那句话在哪说的」，纯文本、零图片。
    - 想指定字幕来源时给 `media_probe` / `media_overview` / `media_locate` 传 `subtitle`：本地字幕文件绝对路径、字幕轨 index（非负整数），或语言码（如 `zh` / `en`）；显式指定不可用会直接报错，不会静默换成别的来源。
@@ -294,7 +295,7 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 | `MMGREP_OPENAI_COMPATIBLE_MODEL` | `whisper-1` | OpenAI 兼容服务的转写模型名 |
 | `MMGREP_ASR_LANGUAGE` | `auto` | 强制语言（BCP-47，如 `zh` / `en`）；`auto` = 让服务自己判断 |
 | `MMGREP_ASR_TIMEOUT_MS` | `120000` | ASR 单次请求超时 |
-| `MMGREP_OCR_PROVIDER` | `none` | OCR 角色：只处理没有文字层的页。`none` / `mineru` |
+| `MMGREP_OCR_PROVIDER` | `none` | OCR 角色：只处理没有文字层的页，以及工具参数 `ocr: "force"` 指定的页。`none` / `mineru` |
 | `MMGREP_TYPESET_PROVIDER` | `builtin` | typeset 角色：只处理有文字层的页，恢复结构、不重识别字符。`builtin` / `mineru` / `none` |
 | `MMGREP_MINERU_API_KEY` | 空 | MinerU 的 token（两个角色共用；<https://mineru.net/apiManage/token>） |
 | `MMGREP_MINERU_BASE_URL` | `https://mineru.net/api/v4` | MinerU 的 API 基址（两个角色共用） |

@@ -63,6 +63,11 @@ nothing. Then pick the right next tool:
 - a specific moment or page -> media_zoom for a close-up
 - "where was X said / on which page" -> media_locate for a timestamp or a page number
 
+For documents it also checks whether the text layer looks unreliable — U+FFFD replacement
+characters, private-use characters, isolated single letters, symbol noise — and, when it does,
+points at media_overview({ path, ocr: "force" }) to re-recognize the pages.
+(文档文字层看起来不可靠时会提示，可用 ocr: "force" 强制重新识别)
+
 For audio it also reports a quick health check — average level, speech ratio and silence ratio
 — so you know whether the recording actually contains audible speech before you spend an ASR
 call on it. A recording that is effectively silent is reported as such and is never sent to ASR
@@ -79,6 +84,12 @@ What you get depends on the media:
              time-aligned text index of the cells
 - audio    : a timestamped transcript, segment by segment
 - document : a grid of page thumbnails plus page text, when a document parser is configured
+
+For DOCUMENTS, ocr: "auto" (default) uses the PDF text layer where one exists and calls the OCR
+provider only for pages without one; ocr: "force" re-recognizes every requested page with the
+OCR provider, even pages that already have a text layer, and tags them (ocr). Use force when
+media_probe says "text layer: looks unreliable" or when the extracted text is visibly garbled.
+Forced results are cached separately from auto. (文档：ocr: "force" = 强制重新 OCR / 重新识别文字层)
 
 Pass images: 0 for a text-only, zero-pixel overview: no grid is rendered and no frame is
 decoded (a video costs no ffmpeg work at all), so you get only the transcript — or the page
@@ -155,6 +166,12 @@ query appears on that page (hits), and a short snippet around the first hit — 
 whole page. Pages that matched but did not fit are listed as "N more pages match: ...".
 Read a full page with media_overview({ path, pages }).
 
+For DOCUMENTS, ocr: "auto" (default) searches the PDF text layer where one exists and OCRs only
+pages without one; ocr: "force" re-recognizes every requested page with the OCR provider first,
+even pages that already have a text layer, and tags those matches (ocr). Use force when
+media_probe says "text layer: looks unreliable". Forced results are cached separately from auto.
+(文档：ocr: "force" = 强制重新 OCR / 重新识别文字层)
+
 Text only by default — no image, no pixels spent. Add includeFrame: true to also get the
 picture at the best match (one image, roughly 1,900 vision tokens).
 
@@ -208,6 +225,13 @@ const SEGMENT_PARAM = z.number().optional().describe(
 
 const PAGES_PARAM = z.string().optional().describe(
   'Page range for document media: comma-separated 1-based page numbers and closed ranges, e.g. "3-10,15". Not applicable to video or audio. (页码范围)',
+);
+
+const OCR_PARAM = z.enum(['auto', 'force']).optional().describe(
+  'Document media only: how to obtain page text. "auto" (default) uses the PDF text layer where one exists and OCR only for pages without one. '
+  + '"force" re-recognizes every requested page with the OCR provider even if it already has a text layer, and tags those pages (ocr); use it when '
+  + 'media_probe says "text layer: looks unreliable" or the extracted text is garbled. Forced results are cached separately from "auto". '
+  + 'Requires a configured OCR provider; not applicable to video or audio. (文档：ocr auto 默认；force = 强制重新 OCR / 重新识别文字层)',
 );
 
 const CELLS_PARAM = z.number().optional().describe(
@@ -272,6 +296,7 @@ export const TOOL_SHAPES = Object.freeze({
     end: END_PARAM,
     segment: SEGMENT_PARAM,
     pages: PAGES_PARAM,
+    ocr: OCR_PARAM,
     cells: CELLS_PARAM,
     images: IMAGES_PARAM,
     maxEdge: MAX_EDGE_PARAM,
@@ -296,6 +321,7 @@ export const TOOL_SHAPES = Object.freeze({
     end: END_PARAM,
     segment: SEGMENT_PARAM,
     pages: PAGES_PARAM,
+    ocr: OCR_PARAM,
     includeFrame: INCLUDE_FRAME_PARAM,
   },
 });
@@ -345,6 +371,11 @@ export const PARAM_APPLICABILITY = Object.freeze({
     message: (t) => (t === 'document'
       ? 'pages is not applicable to document media.'
       : `pages is not applicable to ${t} media. Use "start" and "end" (seconds) instead.`),
+  },
+  ocr: {
+    media: ['document'],
+    message: (t) => `ocr is not applicable to ${t} media. Only documents have a page text layer or page images to OCR; `
+      + 'video and audio use subtitles/transcript instead.',
   },
   includeFrame: {
     media: ['video', 'document'],
@@ -1044,6 +1075,11 @@ function formatTextLayerLine(result) {
   const layer = result.capabilities?.textLayer ?? {};
   const checked = Array.isArray(layer.checkedPages) ? layer.checkedPages : [];
   const sampled = checked.length > 0 ? checked.join(', ') : null;
+  // 9z5.31：有文字层不代表文字是对的。劣质 OCR 写进去的文字层会优先提示
+  // 「看起来不可靠 + 怎么强制重新识别」，而不是让 agent 直接引用。
+  if (layer.reliable === false && layer.warning) {
+    return `text layer: ${layer.warning}`;
+  }
   if (result.hasTextLayer === null || result.hasTextLayer === undefined) {
     return `text layer: unknown — ${layer.reason ?? 'the PDF text layer could not be checked.'}`;
   }
@@ -1683,6 +1719,8 @@ async function handleOverview(args, call) {
     pageCount,
     durationSec,
     envelope: Boolean(args.envelope),
+    // 9z5.31：文档 ocr:"force" → 后端 ocrMode；video/audio 已被 checkApplicability 拒绝。
+    ocrMode: mediaType === 'document' ? (args.ocr ?? 'auto') : undefined,
     ...(plan ? { cells: plan.produced.cells, images: plan.produced.images, maxEdge: plan.produced.maxEdge } : {}),
   };
 
@@ -2134,6 +2172,8 @@ async function handleLocate(args, call) {
     pageCount,
     durationSec,
     includeFrame: Boolean(args.includeFrame),
+    // 9z5.31：文档 ocr:"force" → 后端 ocrMode（locate 也要能搜重新识别出来的文字）。
+    ocrMode: mediaType === 'document' ? (args.ocr ?? 'auto') : undefined,
   };
 
   const result = (await call.dispatcher.call(mediaType, 'locate', input, call.backendCtx)) ?? {};

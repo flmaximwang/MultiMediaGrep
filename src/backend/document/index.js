@@ -37,6 +37,7 @@ import {
   textToBlocks,
 } from '../../providers/doc/builtin.js';
 import { createPdfSupport, normalizePageText } from './pdf.js';
+import { assessTextLayerQuality } from './text-quality.js';
 import {
   DEFAULT_LOCATE_FRAME_MAX_EDGE,
   DEFAULT_OVERVIEW_MAX_EDGE,
@@ -241,6 +242,9 @@ async function inspectDocument(filePath, ctx, pdfSupport, cache) {
     sampledPages: [],
     checkedPages: [],
     textPage: null,
+    reliable: null,
+    reasons: [],
+    warning: null,
   };
 
   if (classified.kind === 'pdf') {
@@ -260,12 +264,17 @@ async function inspectDocument(filePath, ctx, pdfSupport, cache) {
     const sampled = await pdfSupport.sampleHasText(filePath, { pageCount, signal: ctx.signal });
     const reason = sampled.reason ?? null;
     hasTextLayer = reason ? null : Boolean(sampled.hasText);
+    // 9z5.31：文字层「有」不代表「对」——劣质 OCR 写进去的文字层也要能让 agent 发现。
+    const quality = reason ? null : assessTextLayerQuality(sampled.sampleText);
     textLayer = {
       checked: reason === null,
       reason,
       sampledPages: sampled.sampledPages ?? [],
       checkedPages: sampled.checkedPages ?? [],
       textPage: sampled.textPage ?? null,
+      reliable: quality?.reliable ?? null,
+      reasons: quality?.reasons ?? [],
+      warning: quality?.warning ?? null,
     };
   } else if (classified.kind === 'image') {
     const size = await readImageSize(filePath, { signal: ctx.signal });
@@ -273,11 +282,29 @@ async function inspectDocument(filePath, ctx, pdfSupport, cache) {
     height = size.height;
     unit = 'px';
     hasTextLayer = false;
-    textLayer = { checked: true, reason: null, sampledPages: [], checkedPages: [], textPage: null };
+    textLayer = {
+      checked: true,
+      reason: null,
+      sampledPages: [],
+      checkedPages: [],
+      textPage: null,
+      reliable: null,
+      reasons: [],
+      warning: null,
+    };
   } else {
     // 纯文本：一页，没有像素尺寸，但「文字层」恒为真（任务口径）。
     hasTextLayer = true;
-    textLayer = { checked: true, reason: null, sampledPages: [], checkedPages: [], textPage: null };
+    textLayer = {
+      checked: true,
+      reason: null,
+      sampledPages: [],
+      checkedPages: [],
+      textPage: null,
+      reliable: null,
+      reasons: [],
+      warning: null,
+    };
   }
 
   const info = {
@@ -780,6 +807,24 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
   const skipSimple = ctx.config?.typeset?.skipSimple !== false;
   const providerErrors = {};
   const forceOcr = ocrMode === 'force';
+  if (forceOcr) {
+    // 9z5.31：force 是 agent 的明确指令，不能静默退化成 auto（那会继续用坏文字层）。
+    if (info.kind === 'text') {
+      throw new ToolError(
+        'INVALID_ARGUMENT',
+        'ocr: "force" is not applicable to plain-text documents (.txt / .md): there is no page image to re-recognize. '
+          + 'The file itself is the text layer; read it with media_overview({ path }).',
+      );
+    }
+    if (!ocrState.available) {
+      throw new ToolError(
+        'PROVIDER_NOT_CONFIGURED',
+        `ocr: "force" was requested, but no OCR provider is available: ${ocrState.reason ?? 'no OCR provider is configured.'}`,
+        'Set MMGREP_OCR_PROVIDER=mineru and MMGREP_MINERU_API_KEY (or send the x-mmgrep-ocr-provider request header in HTTP mode), '
+          + 'or use ocr: "auto" to read the existing text layer.',
+      );
+    }
+  }
   let textPageCount = 0;
   let ocrPageCount = 0;
 
@@ -1659,6 +1704,10 @@ export function createDocumentBackend(ctx = {}) {
           sampledPages: info.textLayer?.sampledPages ?? [],
           checkedPages: info.textLayer?.checkedPages ?? [],
           textPage: info.textLayer?.textPage ?? null,
+          // 9z5.31：采样页文本的启发式结论（reliable=null 表示没样本 / 非 PDF）。
+          reliable: info.textLayer?.reliable ?? null,
+          reasons: info.textLayer?.reasons ?? [],
+          warning: info.textLayer?.warning ?? null,
         },
       },
       recommended: recommendedFor(info),
