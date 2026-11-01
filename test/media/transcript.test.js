@@ -7,6 +7,8 @@ import { test } from 'node:test';
 
 import { assertFfmpegAvailable, ffprobeJson, run } from '../../src/media/ffmpeg.js';
 import {
+  analyzeSubtitleStreams,
+  bitmapSkippedWarnings,
   discoverSiblingSubtitles,
   pickSubtitleStream,
   resolveSubtitleSource,
@@ -48,6 +50,44 @@ test('subtitleExtension / pickSubtitleStream：只认文本型轨，按语言优
   assert.equal(pickSubtitleStream(streams).index, 4);
   assert.equal(pickSubtitleStream([]), null);
   assert.equal(pickSubtitleStream([{ index: 1, codec_type: 'video' }]), null);
+});
+
+test('analyzeSubtitleStreams：文本轨按语言优先级，位图轨记录跳过原因', () => {
+  const streams = [
+    { index: 2, codec_type: 'subtitle', codec_name: 'hdmv_pgs_subtitle', tags: { language: 'zh-Hans' } },
+    { index: 3, codec_type: 'subtitle', codec_name: 'dvd_subtitle' },
+    { index: 4, codec_type: 'subtitle', codec_name: 'subrip', tags: { language: 'en' } },
+    { index: 5, codec_type: 'subtitle', codec_name: 'ass', tags: { language: 'zh-CN' } },
+  ];
+  const analysis = analyzeSubtitleStreams(streams);
+  assert.equal(analysis.stream.index, 5);
+  assert.deepEqual(analysis.bitmapSkipped, [
+    { index: 2, codec: 'hdmv_pgs_subtitle' },
+    { index: 3, codec: 'dvd_subtitle' },
+  ]);
+  assert.deepEqual(bitmapSkippedWarnings(analysis.bitmapSkipped), [
+    'embedded-subtitle-bitmap-skipped (hdmv_pgs_subtitle, track 2)',
+    'embedded-subtitle-bitmap-skipped (dvd_subtitle, track 3)',
+  ]);
+});
+
+test('resolveSubtitleSource：只有位图字幕轨时返回 null 并写明 bitmap-skipped', async () => {
+  const dir = await tempDir('mmgrep-bitmap-');
+  try {
+    const media = path.join(dir, 'a.mp4');
+    await writeFile(media, 'video');
+    const warnings = [];
+    const resolved = await resolveSubtitleSource({
+      mediaPath: media,
+      streams: [{ index: 1, codec_type: 'subtitle', codec_name: 'dvd_subtitle' }],
+      siblings: false,
+      warnings,
+    });
+    assert.equal(resolved, null);
+    assert.deepEqual(warnings, ['embedded-subtitle-bitmap-skipped (dvd_subtitle, track 1)']);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('discoverSiblingSubtitles：精确同名优先，其次语言后缀', async () => {

@@ -380,6 +380,7 @@ path, and it only prepares images and text for your own model to look at.
 | `capabilities.transcriptSource` | `"subtitle"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 本次探针判定会走哪条转写来源（可信度口径，见 §2.5） | — |
 | `capabilities.transcriptOrigin` | `"file"` \| `"embedded"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道（外部文件 / 内嵌轨 / ASR / OCR） | — |
 | `capabilities.transcriptPath` | string \| null | 若来源是文件，具体是哪个文件 | — |
+| `capabilities.transcriptReason` | string \| null | 文件里有字幕轨、但本次没有用上时的可读原因（如只剩图形字幕轨）；与 `warnings` 中的条目同源 | — |
 | `recommended.mode` | `"single"` \| `"sequence"` | 短素材一次读完 / 长素材分段读 | — |
 | `recommended.segmentSec` | integer | 分段读时的建议窗口长度 | s |
 | `recommended.overviewImages` | integer | 建议的 overview 图片数 | 张 |
@@ -878,6 +879,18 @@ what is on screen.
 3. **同目录同名文件自动发现**（见下）。
 4. （仅 `media_overview` / `media_locate`）**ASR 兜底** → provider 已配置且音频体检通过时跑 ASR。
 5. 都没有 → 报错 `NO_TRANSCRIPT`（或 `media_overview` 的空转写 + 原因，见 §5.5）。
+
+**字幕轨存在但没有用上时的警告（`warnings`）：**
+
+只有文本型字幕轨能解析成文字；图形字幕轨（PGS / DVD / DVB / XSUB）会被跳过。为了不让 agent 把「有字幕但用不了」误当成「没有字幕」，以下情形必须写进 `media_overview` / `media_locate` 的 `warnings`，并由 `media_probe` 的 `capabilities.transcriptReason` 给出原因（多条以 `; ` 连接）：
+
+| warning | 触发条件 |
+|---|---|
+| `embedded-subtitle-bitmap-skipped (<codec>, track <index>)` | 内嵌字幕轨是图形字幕（如 `hdmv_pgs_subtitle` / `dvd_subtitle` / `dvb_subtitle` / `xsub`），无法解析成文字 |
+| `embedded-subtitle-empty (track <index>)` | 选中的文本型字幕轨抽出来后没有任何段落 |
+| `embedded-subtitle-unreadable (track <index>): <message>` | 抽取内嵌字幕轨失败（ffmpeg 报错原文附在冒号后） |
+
+轨道存在但上述原因让内嵌字幕没被采用时，仍会继续尝试同目录同名文件与 ASR；警告只解释「为什么没用内嵌轨」，不中断后续来源。
 
 **同目录同名自动发现的规则：**
 

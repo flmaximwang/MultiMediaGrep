@@ -8,7 +8,11 @@ import { stat } from 'node:fs/promises';
 import { audioConfig, computeAudioHealth } from '../../media/audio-health.js';
 import { ffprobeJson, run } from '../../media/ffmpeg.js';
 import { ToolError } from '../../media/interface.js';
-import { discoverSiblingSubtitles, pickSubtitleStream } from '../../media/transcript.js';
+import {
+  analyzeSubtitleStreams,
+  bitmapSkippedWarnings,
+  discoverSiblingSubtitles,
+} from '../../media/transcript.js';
 import {
   displayAspect,
   normalizeRotation,
@@ -216,11 +220,12 @@ async function explicitSubtitleFile(filePath) {
 export async function shapeProbe({ media, audioHealth, input, ctx }) {
   let subtitlePath = null;
   let subtitleOrigin = null;
+  const subtitleAnalysis = analyzeSubtitleStreams(media.streams);
   const explicit = await explicitSubtitleFile(input?.transcriptFile);
   if (explicit) {
     subtitlePath = explicit;
     subtitleOrigin = 'file';
-  } else if (pickSubtitleStream(media.streams) !== null) {
+  } else if (subtitleAnalysis.stream !== null) {
     subtitleOrigin = 'embedded';
   } else {
     const sibling = (await discoverSiblingSubtitles(input.path))[0] ?? null;
@@ -259,6 +264,10 @@ export async function shapeProbe({ media, audioHealth, input, ctx }) {
     transcriptSource = 'asr';
     transcriptOrigin = 'asr';
   }
+  // 有字幕轨却没用上（如只有图形字幕）时，probe 也要说明原因
+  const transcriptReason = transcriptSource === 'subtitle'
+    ? null
+    : (bitmapSkippedWarnings(subtitleAnalysis.bitmapSkipped).join('; ') || null);
 
   const long = media.durationSec !== null && media.durationSec > 1800;
   return {
@@ -298,6 +307,7 @@ export async function shapeProbe({ media, audioHealth, input, ctx }) {
       transcriptSource,
       transcriptOrigin,
       transcriptPath: transcriptPathFor(transcriptOrigin, subtitlePath),
+      transcriptReason,
     },
     recommended: {
       mode: long ? 'sequence' : 'single',

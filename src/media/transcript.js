@@ -34,12 +34,23 @@ export function subtitleExtension(filePath) {
   return SUBTITLE_FORMATS.includes(ext.slice(1)) ? ext : null;
 }
 
-/** 挑出真正能读成文字的字幕轨：先按语言优先级，再按轨序 */
-export function pickSubtitleStream(streams = []) {
-  const candidates = (streams ?? [])
-    .filter((stream) => stream?.codec_type === 'subtitle')
-    .filter((stream) => !BITMAP_SUBTITLE_CODECS.has(String(stream?.codec_name ?? '').toLowerCase()));
-  if (candidates.length === 0) return null;
+/**
+ * 拆开字幕轨：挑出真正能读成文字的那一条（先按语言优先级，再按轨序），
+ * 同时把因是位图而被跳过的轨记录下来——「有字幕但没用上」要能对 agent 交代。
+ *
+ * @returns {{stream: object|null, bitmapSkipped: Array<{index: number|null, codec: string}>}}
+ */
+export function analyzeSubtitleStreams(streams = []) {
+  const bitmapSkipped = [];
+  const candidates = [];
+  for (const stream of (streams ?? []).filter((item) => item?.codec_type === 'subtitle')) {
+    const codec = String(stream?.codec_name ?? '').toLowerCase();
+    if (BITMAP_SUBTITLE_CODECS.has(codec)) {
+      bitmapSkipped.push({ index: stream?.index ?? null, codec: codec || 'unknown' });
+    } else {
+      candidates.push(stream);
+    }
+  }
   const ranked = candidates
     .map((stream, order) => ({
       stream,
@@ -47,7 +58,19 @@ export function pickSubtitleStream(streams = []) {
       rank: languageRank(stream?.tags?.language),
     }))
     .sort((a, b) => (a.rank - b.rank) || (a.order - b.order));
-  return ranked[0].stream;
+  return { stream: ranked[0]?.stream ?? null, bitmapSkipped };
+}
+
+/** 挑出真正能读成文字的字幕轨：先按语言优先级，再按轨序 */
+export function pickSubtitleStream(streams = []) {
+  return analyzeSubtitleStreams(streams).stream;
+}
+
+/** 位图字幕被跳过时的 warning 文案（契约 §8.5；带 codec 与轨道号） */
+export function bitmapSkippedWarnings(bitmapSkipped = []) {
+  return bitmapSkipped.map(
+    ({ index, codec }) => `embedded-subtitle-bitmap-skipped (${codec}, track ${index ?? '?'})`,
+  );
 }
 
 /** 把内嵌字幕轨抽成 SRT 文本（ffmpeg 的 srt muxer 直接输出到 stdout） */
@@ -177,8 +200,10 @@ export async function resolveSubtitleSource({
   }
 
   if (embedded) {
-    const stream = pickSubtitleStream(streams);
+    const analysis = analyzeSubtitleStreams(streams);
+    const stream = analysis.stream;
     if (stream) {
+      const track = stream.index ?? '?';
       try {
         const text = await extractEmbeddedSubtitle(mediaPath, stream.index, { signal });
         const segments = parseSubtitles(text, { format: 'srt' });
@@ -192,11 +217,13 @@ export async function resolveSubtitleSource({
             warnings,
           };
         }
-        warnings.push('embedded-subtitle-empty');
+        warnings.push(`embedded-subtitle-empty (track ${track})`);
       } catch (error) {
-        warnings.push(`embedded-subtitle-unreadable: ${error?.message ?? error}`);
+        warnings.push(`embedded-subtitle-unreadable (track ${track}): ${error?.message ?? error}`);
       }
     }
+    // 没有任何文本轨被用上（或文本轨读不出来）时，把被跳过的位图轨也交代清楚
+    warnings.push(...bitmapSkippedWarnings(analysis.bitmapSkipped));
   }
 
   if (siblings) {
