@@ -1,30 +1,44 @@
 /**
- * 文档解析 provider 工厂。
+ * 文档 provider 工厂（契约 v2）。
  *
- * 文档后端（PDF + 图片）在遇到「扫描件 / 无文本层」的页面时，需要把页面交给外部
- * 文档解析服务做 OCR。服务商可插拔：用户在 agent 的 MCP 配置里用环境变量指定用哪家、
- * 给 token，server 照单接受；没配就不调外部服务，只返回页面图让多模态模型自己看。
+ * 文档 provider 拆成**两个角色**（0.2.0，破坏性变更）：
  *
- * 环境变量：
- *   MMGREP_DOC_PROVIDER          'mineru' | 'none'（默认 'none'）
- *   MMGREP_MINERU_API_KEY        token
- *   MMGREP_MINERU_BASE_URL       默认 https://mineru.net/api/v4
- *   MMGREP_MINERU_MODEL          默认留空（用服务端默认模型）
- *   MMGREP_DOC_TIMEOUT_MS        默认 300000
+ *   ocr     从像素识别字符，只处理**没有文字层**的页（以及 ocrMode=force 的页）。
+ *           env MMGREP_OCR_PROVIDER = mineru | none（默认 none）。
+ *   typeset 为**有文字层**的页恢复阅读顺序与结构，**不得重新识别字符**。
+ *           env MMGREP_TYPESET_PROVIDER = builtin | mineru | none（默认 builtin）。
  *
- * 旧的 MMGREP_DOC_API_KEY / MMGREP_DOC_BASE_URL / MMGREP_DOC_MODEL 仅在专属变量
- * 未设置时兜底（0.2.0 删除）。
+ * 每个 provider 在注册表里声明自己支持的角色：
+ *   mineru  → ocr + typeset
+ *   builtin → typeset（本地，不联网；文本由调用方通过 parse({ textLayers }) 传入）
+ *
+ * 两个角色共用 MinerU 的凭据变量（MMGREP_MINERU_*）与超时变量
+ * （MMGREP_DOC_TIMEOUT_MS），不再有 MMGREP_DOC_PROVIDER / MMGREP_DOC_API_KEY /
+ * MMGREP_DOC_BASE_URL / MMGREP_DOC_MODEL。
  *
  * 接口契约见同目录 README.md。
  */
 
+import { createBuiltinTypesetProvider } from './builtin.js';
 import { createMineruDocProvider } from './mineru.js';
 
-/** 支持的 provider id。 */
-export const DOC_PROVIDERS = ['mineru', 'none'];
+/** provider 角色。 */
+export const DOC_ROLES = Object.freeze(['ocr', 'typeset']);
 
-/** provider 专属环境变量；旧通用变量只作兜底。 */
-const PROVIDER_ENV = Object.freeze({
+/** 角色 → 环境变量名。 */
+export const DOC_ROLE_ENV = Object.freeze({
+  ocr: 'MMGREP_OCR_PROVIDER',
+  typeset: 'MMGREP_TYPESET_PROVIDER',
+});
+
+/** 角色 → 默认 provider。 */
+export const DOC_ROLE_DEFAULTS = Object.freeze({
+  ocr: 'none',
+  typeset: 'builtin',
+});
+
+/** provider 专属环境变量（两个角色共用同一组）。 */
+export const DOC_PROVIDER_ENV = Object.freeze({
   mineru: Object.freeze({
     apiKey: 'MMGREP_MINERU_API_KEY',
     baseUrl: 'MMGREP_MINERU_BASE_URL',
@@ -32,16 +46,41 @@ const PROVIDER_ENV = Object.freeze({
   }),
 });
 
-const LEGACY_ENV = Object.freeze({
-  apiKey: 'MMGREP_DOC_API_KEY',
-  baseUrl: 'MMGREP_DOC_BASE_URL',
-  model: 'MMGREP_DOC_MODEL',
+/**
+ * provider 注册表 v2：每个 provider 声明 `roles`，工厂按角色校验。
+ *
+ * `none` 不是 provider：它是「该角色关闭」的取值，工厂返回 null。
+ */
+export const DOC_PROVIDER_REGISTRY = Object.freeze({
+  mineru: Object.freeze({
+    id: 'mineru',
+    roles: Object.freeze(['ocr', 'typeset']),
+    create: (options) => createMineruDocProvider(options),
+  }),
+  builtin: Object.freeze({
+    id: 'builtin',
+    roles: Object.freeze(['typeset']),
+    create: () => createBuiltinTypesetProvider(),
+  }),
 });
 
-/** 专属变量优先，旧通用变量兜底；空串视作没配。 */
-function readProviderEnv(source, providerId, field) {
-  const names = PROVIDER_ENV[providerId];
-  return readEnvString(source, names?.[field]) ?? readEnvString(source, LEGACY_ENV[field]);
+/** 所有已注册 provider id（不含 none）。 */
+export const DOC_PROVIDERS = Object.freeze(Object.keys(DOC_PROVIDER_REGISTRY));
+
+/** 各角色允许的取值（含 none），用于配置层 / HTTP 头的错误提示。 */
+export const DOC_ROLE_PROVIDERS = Object.freeze({
+  ocr: Object.freeze(['mineru', 'none']),
+  typeset: Object.freeze(['builtin', 'mineru', 'none']),
+});
+
+/** 某个角色支持的 provider id（不含 none）。 */
+export function providersForRole(role) {
+  return DOC_PROVIDERS.filter((id) => DOC_PROVIDER_REGISTRY[id].roles.includes(role));
+}
+
+/** 某个 provider 是否支持某个角色。 */
+export function providerSupportsRole(providerId, role) {
+  return Boolean(DOC_PROVIDER_REGISTRY[String(providerId ?? '').toLowerCase()]?.roles.includes(role));
 }
 
 function readEnvString(source, key) {
@@ -52,51 +91,77 @@ function readEnvString(source, key) {
   return trimmed === '' ? undefined : trimmed;
 }
 
-/**
- * 根据环境变量创建文档解析 provider。
- *
- * @param {object} [env] 环境变量对象，默认 process.env 。
- * @param {object} [opts] 覆盖项（例如 { fetchImpl, onProgress, timeoutMs }），优先级高于 env 。
- * @returns {object|null} provider；'none'（或未配置）时返回 null，server 据此降级为「只出页面图」。
- */
-export function createDocProvider(env = process.env, opts = {}) {
-  const source = env && typeof env === 'object' ? env : {};
-  const overrides = opts && typeof opts === 'object' ? opts : {};
-  // opts.provider 优先于环境变量（测试 / server 强制指定时用）。
-  const raw = String(overrides.provider ?? source.MMGREP_DOC_PROVIDER ?? 'none')
-    .trim()
-    .toLowerCase();
-
-  // 'none' / 未配置 → 不调外部服务，server 走「只返回页面图」的降级路径。
-  if (raw === '' || raw === 'none') return null;
-
-  if (raw === 'mineru') {
-    const timeoutRaw = source.MMGREP_DOC_TIMEOUT_MS;
-    const fromEnv = {
-      apiKey: readProviderEnv(source, 'mineru', 'apiKey') ?? '',
-      baseUrl: readProviderEnv(source, 'mineru', 'baseUrl'),
-      model: readProviderEnv(source, 'mineru', 'model') ?? '',
-      timeoutMs: timeoutRaw === undefined || timeoutRaw === '' ? undefined : Number(timeoutRaw),
-    };
-    const { provider: _provider, ...providerOpts } = overrides;
-    return createMineruDocProvider({
-      ...definedOnly(fromEnv),
-      ...definedOnly(providerOpts),
-    });
-  }
-
-  throw new Error(
-    `Unsupported MMGREP_DOC_PROVIDER "${raw}". Supported providers: ${DOC_PROVIDERS.join(', ')}.`,
-  );
-}
-
 /** 丢掉值为 undefined 的键，避免覆盖掉下层的默认值。 */
 function definedOnly(obj) {
   const out = {};
-  for (const [k, v] of Object.entries(obj ?? {})) {
-    if (v !== undefined) out[k] = v;
+  for (const [key, value] of Object.entries(obj ?? {})) {
+    if (value !== undefined) out[key] = value;
   }
   return out;
 }
 
-export { createMineruDocProvider };
+/**
+ * 按角色创建文档 provider。
+ *
+ * @param {'ocr'|'typeset'} role
+ * @param {object} [env] 环境变量对象，默认 process.env 。
+ * @param {object} [opts] 覆盖项（优先级高于 env）：
+ *   { provider, apiKey, baseUrl, model, timeoutMs, fetchImpl, onProgress, pollIntervalMs }
+ * @returns {object|null} provider；角色取值为 'none'（或未配置）时返回 null。
+ */
+export function createDocProvider(role, env = process.env, opts = {}) {
+  const normalizedRole = String(role ?? '').trim().toLowerCase();
+  if (!DOC_ROLES.includes(normalizedRole)) {
+    throw new Error(
+      `Unknown document provider role "${role ?? ''}". Supported roles: ${DOC_ROLES.join(', ')}.`,
+    );
+  }
+
+  const source = env && typeof env === 'object' ? env : {};
+  const overrides = opts && typeof opts === 'object' ? opts : {};
+  const envName = DOC_ROLE_ENV[normalizedRole];
+
+  // opts.provider 优先于环境变量（测试 / server 显式选择时用）。
+  const raw = String(overrides.provider ?? source[envName] ?? DOC_ROLE_DEFAULTS[normalizedRole])
+    .trim()
+    .toLowerCase();
+
+  if (raw === '' || raw === 'none') return null;
+
+  const entry = DOC_PROVIDER_REGISTRY[raw];
+  if (!entry) {
+    throw new Error(
+      `Unsupported ${envName} "${raw}" for the ${normalizedRole} role. ` +
+        `Supported providers: ${DOC_ROLE_PROVIDERS[normalizedRole].join(', ')}.`,
+    );
+  }
+  if (!entry.roles.includes(normalizedRole)) {
+    throw new Error(
+      `Provider "${raw}" does not support the ${normalizedRole} role (it supports: ${entry.roles.join(', ')}). ` +
+        `Use ${DOC_ROLE_PROVIDERS[normalizedRole].join(' / ')} for ${envName}.`,
+    );
+  }
+
+  const { provider: _provider, role: _role, ...providerOpts } = overrides;
+
+  if (raw === 'builtin') {
+    return entry.create();
+  }
+
+  const envSpec = DOC_PROVIDER_ENV[raw] ?? {};
+  const timeoutRaw = source.MMGREP_DOC_TIMEOUT_MS;
+  const fromEnv = {
+    apiKey: readEnvString(source, envSpec.apiKey) ?? '',
+    baseUrl: readEnvString(source, envSpec.baseUrl),
+    model: readEnvString(source, envSpec.model) ?? '',
+    timeoutMs: timeoutRaw === undefined || timeoutRaw === '' ? undefined : Number(timeoutRaw),
+  };
+
+  return entry.create({
+    ...definedOnly(fromEnv),
+    ...definedOnly(providerOpts),
+    role: normalizedRole,
+  });
+}
+
+export { createBuiltinTypesetProvider, createMineruDocProvider };

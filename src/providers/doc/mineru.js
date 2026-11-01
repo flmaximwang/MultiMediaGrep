@@ -36,6 +36,8 @@
 import { stat, readFile } from 'node:fs/promises';
 import { inflateRawSync } from 'node:zlib';
 
+import { blocksToText, textToBlocks } from './builtin.js';
+
 /** MinerU 默认接口地址。 */
 export const MINERU_DEFAULT_BASE_URL = 'https://mineru.net/api/v4';
 /** 默认超时（MinerU 是异步任务，轮询可能比较久）。 */
@@ -77,8 +79,12 @@ const API_CODE_HINTS = {
  * @param {number} [options.timeoutMs] 整体超时，默认 300000。
  * @param {Function} [options.fetchImpl] 注入的 fetch 实现（测试用）。
  * @param {Function} [options.onProgress] 进度回调 ({stage, detail}) => void 。
- * @param {boolean} [options.isOcr] 是否开启 OCR，默认 true（本 provider 主要用于扫描件）。
+ * @param {'ocr'|'typeset'|'both'} [options.role] 工厂创建时绑定的角色（只用于错误提示；parse 可覆盖）。
  * @param {number} [options.pollIntervalMs] 首次轮询间隔，默认 1500ms（测试可调小）。
+ *
+ * 契约 v2 的 OCR 模式由 parse({ ocrMode }) 决定：
+ *   - 'auto'（默认）：不发送 is_ocr，让 MinerU 按文档自行选择；
+ *   - 'force'：发送 is_ocr: true，要求对页面重新识别（9z5.31）。
  */
 export function createMineruDocProvider(options = {}) {
   const opts = options ?? {};
@@ -88,7 +94,7 @@ export function createMineruDocProvider(options = {}) {
   const timeoutMs = normalizeTimeoutMs(opts.timeoutMs);
   const fetchImpl = typeof opts.fetchImpl === 'function' ? opts.fetchImpl : globalThis.fetch;
   const constructorOnProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
-  const isOcr = opts.isOcr === undefined ? true : Boolean(opts.isOcr);
+  const constructorRole = normalizeRole(opts.role ?? 'both');
   const pollIntervalMs = normalizePollInterval(opts.pollIntervalMs);
 
   /** 打码：任何进入错误信息 / 日志的文本都不能带 token。 */
@@ -149,24 +155,32 @@ export function createMineruDocProvider(options = {}) {
 
   return {
     id: 'mineru',
+    roles: Object.freeze(['ocr', 'typeset']),
 
     /**
-     * 解析本地文档。
+     * 解析本地文档（契约 v2）。
      *
-     * @param {{filePath: string, pages?: any, signal?: AbortSignal}} input
+     * @param {object} input
+     * @param {string} input.filePath
+     * @param {any} [input.pages]
+     * @param {'ocr'|'typeset'|'both'} [input.role] 默认 both。
+     * @param {'auto'|'force'} [input.ocrMode] 默认 auto；force 时发送 is_ocr: true。
+     * @param {AbortSignal} [input.signal]
      * @param {{onProgress?: Function}} [callOptions] 单次调用的进度回调，优先于构造时的 onProgress 。
-     * @returns {Promise<{provider: string, model: string|null, pages: Array<{page: number, text: string, tables?: Array<object>}>, raw?: object}>}
+     * @returns {Promise<{provider: string, model: string|null, pages: Array<{page: number, textOrigin: string, blocks: Array<object>, text: string, tables?: Array<object>}>, raw?: object}>}
      */
     async parse(input = {}, callOptions = {}) {
       const { filePath, pages, signal } = input ?? {};
+      const role = normalizeRole(input?.role ?? constructorRole);
+      const ocrMode = normalizeOcrMode(input?.ocrMode);
       const onProgress =
         typeof callOptions?.onProgress === 'function' ? callOptions.onProgress : constructorOnProgress;
 
       if (!apiKey) {
         throw new Error(
-          'MinerU document provider is enabled (MMGREP_DOC_PROVIDER=mineru) but MMGREP_MINERU_API_KEY is missing. ' +
+          `MinerU document provider is enabled (${roleEnvHint(role)}) but MMGREP_MINERU_API_KEY is missing. ` +
             'Set MMGREP_MINERU_API_KEY to a MinerU token (create one at https://mineru.net/apiManage/token), ' +
-            'or unset MMGREP_DOC_PROVIDER to fall back to page-image-only mode.',
+            'or set MMGREP_OCR_PROVIDER=none / MMGREP_TYPESET_PROVIDER=none to fall back to the PDF text layer / page images.',
         );
       }
       if (typeof fetchImpl !== 'function') {
@@ -210,7 +224,7 @@ export function createMineruDocProvider(options = {}) {
           throw new Error('The requested page range is empty.');
         }
 
-        const merged = new Map(); // page -> { page, text, tables }
+        const merged = new Map(); // page -> { page, textOrigin, blocks, text, tables }
         const batchIds = [];
         const usedRanges = [];
 
@@ -226,12 +240,15 @@ export function createMineruDocProvider(options = {}) {
             deadline,
             runSignal,
             report,
+            role,
+            ocrMode,
           });
           batchIds.push(result.batchId);
           for (const page of result.pages) {
             const existing = merged.get(page.page);
             if (existing) {
-              existing.text = [existing.text, page.text].filter(Boolean).join('\n');
+              existing.blocks = [...(existing.blocks ?? []), ...(page.blocks ?? [])];
+              existing.text = blocksToText(existing.blocks);
               if (page.tables?.length) existing.tables = [...(existing.tables ?? []), ...page.tables];
             } else {
               merged.set(page.page, page);
@@ -249,6 +266,8 @@ export function createMineruDocProvider(options = {}) {
           raw: {
             baseUrl,
             model: model || null,
+            role,
+            ocrMode,
             batchIds,
             pageRanges: usedRanges,
           },
@@ -260,19 +279,20 @@ export function createMineruDocProvider(options = {}) {
 
     /** 描述信息 —— 绝不包含 token。 */
     describe() {
-      return { id: 'mineru', model: model || null, baseUrl };
+      return { id: 'mineru', model: model || null, baseUrl, roles: ['ocr', 'typeset'] };
     },
   };
 
   /**
    * 跑完一个批次：申请上传地址 → PUT 上传 → 轮询 → 下载结果包 → 解包出页面。
    */
-  async function runOneBatch({ filePath, bytes, pageRanges, chunk, requested, deadline, runSignal, report }) {
+  async function runOneBatch({ filePath, bytes, pageRanges, chunk, requested, deadline, runSignal, report, role, ocrMode }) {
     // ---- 第 1 步：申请预签名上传地址 ----
     report('requesting', 'Requesting a MinerU upload URL...');
     const fileName = filePath.split(/[\\/]/).pop() || 'document.pdf';
     const fileEntry = { name: fileName };
-    if (isOcr) fileEntry.is_ocr = true;
+    // 契约 v2：auto 不再强制 OCR；只有 force 才显式要求重新识别。
+    if (ocrMode === 'force') fileEntry.is_ocr = true;
     if (pageRanges) fileEntry.page_ranges = pageRanges;
     const requestBody = { files: [fileEntry] };
     if (model) requestBody.model_version = model;
@@ -359,7 +379,10 @@ export function createMineruDocProvider(options = {}) {
     // ---- 第 5 步：解包 ----
     report('unpacking', 'Extracting text and tables from the result package...');
     // 按「本批次实际请求的页范围」解包并过滤（切批时是 chunk，否则是整体范围）。
-    const pages = extractPagesFromZip(zipBuffer, { range: chunk ?? requested });
+    const pages = extractPagesFromZip(zipBuffer, {
+      range: chunk ?? requested,
+      textOrigin: textOriginFor({ role, ocrMode, model }),
+    });
     return { batchId, pages };
   }
 
@@ -431,6 +454,51 @@ export function createMineruDocProvider(options = {}) {
 /* ------------------------------------------------------------------ *
  * 纯函数工具
  * ------------------------------------------------------------------ */
+
+const DOC_ROLES = Object.freeze(['ocr', 'typeset', 'both']);
+const OCR_MODES = Object.freeze(['auto', 'force']);
+
+function normalizeRole(value) {
+  const role = String(value ?? '').trim().toLowerCase();
+  if (!DOC_ROLES.includes(role)) {
+    throw new Error(`Invalid document provider role "${value ?? ''}". Supported roles: ${DOC_ROLES.join(', ')}.`);
+  }
+  return role;
+}
+
+function normalizeOcrMode(value) {
+  const mode = String(value ?? 'auto').trim().toLowerCase();
+  if (!OCR_MODES.includes(mode)) {
+    throw new Error(`Invalid ocrMode "${value ?? ''}". Supported values: ${OCR_MODES.join(', ')}.`);
+  }
+  return mode;
+}
+
+function roleEnvHint(role) {
+  if (role === 'ocr') return 'MMGREP_OCR_PROVIDER=mineru';
+  if (role === 'typeset') return 'MMGREP_TYPESET_PROVIDER=mineru';
+  return 'MMGREP_OCR_PROVIDER=mineru or MMGREP_TYPESET_PROVIDER=mineru';
+}
+
+/**
+ * MinerU 结果的 textOrigin。
+ *
+ * 保守策略（9z5.29 核实前）：
+ *   - force：调用方明确要求重新识别 → ocr；
+ *   - vlm 模型读页图，实质是 OCR → ocr；
+ *   - 只做 OCR 角色 → ocr；
+ *   - typeset / both 且未强制 OCR：pipeline 是否保留文字层尚未核实 → unknown
+ *     （契约要求「无法保证原字符时返回 ocr 或 unknown」）。
+ *
+ * TODO(9z5.29): 核实 pipeline + is_ocr=false 对有文字层 PDF 的行为、结果包里
+ * 是否有逐页解析模式字段，再决定能否把 unknown 收窄成 textlayer。
+ */
+function textOriginFor({ role, ocrMode, model }) {
+  if (ocrMode === 'force') return 'ocr';
+  if (String(model ?? '').trim().toLowerCase() === 'vlm') return 'ocr';
+  if (role === 'ocr') return 'ocr';
+  return 'unknown';
+}
 
 function normalizeTimeoutMs(value) {
   const n = Number(value);
@@ -727,17 +795,19 @@ function findEndOfCentralDirectory(buf) {
  * ------------------------------------------------------------------ */
 
 /**
- * 解包 MinerU 的结果 zip，产出页面数组。
+ * 解包 MinerU 的结果 zip，产出契约 v2 的页面数组。
  *
  * @param {Buffer} zipBuffer 结果 zip。
- * @param {{range?: number[]|null}} [opts] range 是本批次请求的页码列表（1 起），用于过滤与页码基准判定。
+ * @param {{range?: number[]|null, textOrigin?: 'textlayer'|'ocr'|'unknown'}} [opts]
+ *   range 是本批次请求的页码列表（1 起），用于过滤与页码基准判定；
+ *   textOrigin 是本批次结果的可信度（MinerU 的核实结论见 9z5.29）。
  *
  * 页码基准：content_list.json 里的 page_idx 是 0 基的原始页索引
  * （官方文档说明「抽页后保留原始页索引」），所以页码 = page_idx + 1。
  * 为了兼容「服务端按切片重新编号」的实现，若整批返回的 page_idx 都落在
  * [0, 范围长度-1] 内且落在 [起始页-1, 结束页-1] 之外，则按相对页码处理。
  */
-export function extractPagesFromZip(zipBuffer, { range = null } = {}) {
+export function extractPagesFromZip(zipBuffer, { range = null, textOrigin = 'unknown' } = {}) {
   const entries = readZipEntries(zipBuffer);
 
   const contentListName = pickContentListName(entries);
@@ -745,7 +815,7 @@ export function extractPagesFromZip(zipBuffer, { range = null } = {}) {
 
   if (contentListName) {
     const items = parseJsonEntry(entries.get(contentListName), contentListName);
-    pages = itemsToPages(items, { range });
+    pages = itemsToPages(items, { range, textOrigin });
   } else {
     // 兜底：没有 content_list.json 时用 full.md（无法确定分页，整篇算作一页）。
     const mdName = pickMarkdownName(entries);
@@ -756,7 +826,8 @@ export function extractPagesFromZip(zipBuffer, { range = null } = {}) {
     }
     const text = entries.get(mdName).toString('utf8');
     const page = range && range.length ? range[0] : 1;
-    pages = [{ page, text, tables: [] }];
+    const blocks = textToBlocks(text);
+    pages = [{ page, textOrigin, blocks, text: blocksToText(blocks), tables: [] }];
   }
 
   // 只保留请求范围内的页。
@@ -787,13 +858,19 @@ function parseJsonEntry(buffer, name) {
   }
 }
 
-/** 把 content_list 的条目按页聚合成页面。 */
-function itemsToPages(items, { range }) {
+/**
+ * 把 content_list 的条目按页聚合成契约 v2 的页面。
+ *
+ * 9z5.28 只做最简 blocks：每条有文字的条目 → 一个 paragraph block。
+ * 完整的类型映射（text_level → heading、图注 → caption、公式 → equation、
+ * 表格 → table 等）与 textOrigin 的核实属于 9z5.29。
+ */
+function itemsToPages(items, { range, textOrigin }) {
   if (!Array.isArray(items)) {
     throw new Error('MinerU content_list.json is not a JSON array.');
   }
 
-  const byPage = new Map(); // pageIdx -> { textParts: [], tables: [] }
+  const byPage = new Map(); // pageIdx -> { blocks: [], tables: [] }
   const pageIdxs = [];
 
   for (const item of items) {
@@ -802,7 +879,7 @@ function itemsToPages(items, { range }) {
     const idx = Number(rawIdx);
     if (!Number.isInteger(idx) || idx < 0) continue;
     if (!byPage.has(idx)) {
-      byPage.set(idx, { textParts: [], tables: [] });
+      byPage.set(idx, { blocks: [], tables: [] });
       pageIdxs.push(idx);
     }
     const bucket = byPage.get(idx);
@@ -812,11 +889,11 @@ function itemsToPages(items, { range }) {
       const table = buildTable(item);
       bucket.tables.push(table);
       const parts = [table.caption, tableRowsToText(table.rows), table.footnote].filter(Boolean);
-      if (parts.length) bucket.textParts.push(parts.join('\n'));
+      if (parts.length) bucket.blocks.push({ type: 'paragraph', text: parts.join('\n') });
       continue;
     }
     const text = itemToText(item);
-    if (text) bucket.textParts.push(text);
+    if (text) bucket.blocks.push({ type: 'paragraph', text });
   }
 
   const offset = computePageOffset(pageIdxs, range);
@@ -825,7 +902,9 @@ function itemsToPages(items, { range }) {
   for (const [idx, bucket] of byPage) {
     pages.push({
       page: idx + 1 + offset,
-      text: bucket.textParts.join('\n').trim(),
+      textOrigin,
+      blocks: bucket.blocks,
+      text: blocksToText(bucket.blocks),
       tables: bucket.tables,
     });
   }

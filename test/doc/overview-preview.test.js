@@ -53,7 +53,7 @@ async function withServer(limit, fn) {
     MMGREP_CACHE_DIR: path.join(dir, 'cache'),
     MMGREP_MAX_TEXT_INLINE_CHARS: String(limit),
     MMGREP_MAX_IMAGE_TOKENS: '4000',
-    MMGREP_DOC_PROVIDER: 'none',
+    MMGREP_OCR_PROVIDER: 'none',
   });
   const exportDir = path.join(dir, 'export');
   await mkdir(exportDir, { recursive: true });

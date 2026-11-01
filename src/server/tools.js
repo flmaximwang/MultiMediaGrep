@@ -35,6 +35,7 @@ import {
   DEFAULT_MAX_IMAGE_TOKENS,
   DEFAULT_MAX_TEXT_INLINE_CHARS,
   providerApiKeyEnv,
+  providerEnv,
 } from './config.js';
 import {
   IMAGE_LIMITS,
@@ -1065,12 +1066,21 @@ function formatProbeText(result) {
   }
 
   const ocr = caps.ocr ?? {};
+  const typeset = caps.typeset ?? {};
   if (mediaType !== 'document') {
     lines.push('ocr: not applicable to this media type.');
-  } else if (ocr.available) {
-    lines.push(`ocr: available — provider "${ocr.provider ?? 'unknown'}".`);
+    lines.push('typeset: not applicable to this media type.');
   } else {
-    lines.push(`ocr: unavailable — ${ocr.reason ?? 'no document parser is configured.'}`);
+    if (ocr.available) {
+      lines.push(`ocr: available — provider "${ocr.provider ?? 'unknown'}".`);
+    } else {
+      lines.push(`ocr: unavailable — ${ocr.reason ?? 'no OCR provider is configured.'}`);
+    }
+    if (typeset.available) {
+      lines.push(`typeset: available — provider "${typeset.provider ?? 'unknown'}".`);
+    } else {
+      lines.push(`typeset: unavailable — ${typeset.reason ?? 'no typeset provider is configured.'}`);
+    }
   }
 
   lines.push(`transcript source: ${caps.transcriptSource ?? 'none'}${caps.transcriptPath ? ` (${caps.transcriptPath})` : ''}`);
@@ -1435,12 +1445,14 @@ function asrProviderUsable(runtime) {
   return Boolean(config.apiKey) || isLoopback(config.baseUrl);
 }
 
-/** 文档解析 provider 是否真的可用 */
-function docProviderUsable(runtime) {
-  const provider = runtime?.docProvider;
+/** 文档 provider 的某个角色（ocr / typeset）是否真的可用 */
+function docRoleProviderUsable(runtime, role) {
+  const provider = runtime?.[`${role}Provider`];
   if (!provider) return false;
-  const config = runtime?.config?.doc;
+  const config = runtime?.config?.[role];
   if (!config) return true;
+  // builtin / none 没有凭据；只有外部 provider 才需要 key（回环地址免 key）。
+  if (!providerEnv('doc', config.provider)) return true;
   return Boolean(config.apiKey) || isLoopback(config.baseUrl);
 }
 
@@ -1451,12 +1463,14 @@ function normalizeProbeResult(result, base, call) {
   const audioHealth = result.audioHealth ?? null;
   const capabilities = result.capabilities ?? {};
   const asrConfigured = asrProviderUsable(call.runtime);
-  const docConfigured = docProviderUsable(call.runtime);
+  const ocrConfigured = docRoleProviderUsable(call.runtime, 'ocr');
+  const typesetConfigured = docRoleProviderUsable(call.runtime, 'typeset');
   const asrAvailable = asrConfigured
     && mediaType !== 'document'
     && hasAudio
     && (audioHealth === null || audioHealth.effective !== false);
-  const ocrAvailable = docConfigured && mediaType === 'document';
+  const ocrAvailable = ocrConfigured && mediaType === 'document';
+  const typesetAvailable = typesetConfigured && mediaType === 'document';
 
   const defaults = {
     mediaType,
@@ -1489,8 +1503,13 @@ function normalizeProbeResult(result, base, call) {
       },
       ocr: {
         available: ocrAvailable,
-        provider: ocrAvailable ? (call.runtime?.docProvider?.id ?? null) : null,
+        provider: ocrAvailable ? (call.runtime?.ocrProvider?.id ?? null) : null,
         reason: ocrAvailable ? null : ocrUnavailableReason(mediaType, call),
+      },
+      typeset: {
+        available: typesetAvailable,
+        provider: typesetAvailable ? (call.runtime?.typesetProvider?.id ?? null) : null,
+        reason: typesetAvailable ? null : typesetUnavailableReason(mediaType, call),
       },
       transcriptSource: result.capabilities?.transcriptSource ?? 'none',
       transcriptOrigin: result.capabilities?.transcriptOrigin ?? 'none',
@@ -1512,6 +1531,7 @@ function normalizeProbeResult(result, base, call) {
       ...capabilities,
       asr: { ...defaults.capabilities.asr, ...(capabilities.asr ?? {}) },
       ocr: { ...defaults.capabilities.ocr, ...(capabilities.ocr ?? {}) },
+      typeset: { ...defaults.capabilities.typeset, ...(capabilities.typeset ?? {}) },
     },
     recommended: { ...defaults.recommended, ...(result.recommended ?? {}) },
   };
@@ -1534,10 +1554,23 @@ function asrUnavailableReason({ mediaType, hasAudio, audioHealth, call }) {
 
 function ocrUnavailableReason(mediaType, call) {
   if (mediaType !== 'document') return 'ocr is not applicable to this media type.';
-  if (call.runtime?.providerErrors?.doc) return call.runtime.providerErrors.doc;
-  if (!call.runtime?.docProvider) return 'MMGREP_DOC_PROVIDER is "none".';
-  const config = call.runtime?.config?.doc;
-  if (config && !config.apiKey && !isLoopback(config.baseUrl)) {
+  if (call.runtime?.providerErrors?.ocr) return call.runtime.providerErrors.ocr;
+  if (!call.runtime?.ocrProvider) return 'MMGREP_OCR_PROVIDER is "none". Pages without a text layer are returned as page images only.';
+  const config = call.runtime?.config?.ocr;
+  if (config && providerEnv('doc', config.provider) && !config.apiKey && !isLoopback(config.baseUrl)) {
+    return `${providerApiKeyEnv('doc', config.provider)} is not set for provider "${config.provider}".`;
+  }
+  return null;
+}
+
+function typesetUnavailableReason(mediaType, call) {
+  if (mediaType !== 'document') return 'typeset is not applicable to this media type.';
+  if (call.runtime?.providerErrors?.typeset) return call.runtime.providerErrors.typeset;
+  if (!call.runtime?.typesetProvider) {
+    return 'MMGREP_TYPESET_PROVIDER is "none". Pages with a text layer use the raw extracted text.';
+  }
+  const config = call.runtime?.config?.typeset;
+  if (config && providerEnv('doc', config.provider) && !config.apiKey && !isLoopback(config.baseUrl)) {
     return `${providerApiKeyEnv('doc', config.provider)} is not set for provider "${config.provider}".`;
   }
   return null;
@@ -2246,7 +2279,8 @@ export function createCallContext(runtime, extra, toolName) {
     backendCtx: {
       cache: runtime.cache ?? null,
       asrProvider: runtime.asrProvider ?? null,
-      docProvider: runtime.docProvider ?? null,
+      ocrProvider: runtime.ocrProvider ?? null,
+      typesetProvider: runtime.typesetProvider ?? null,
       logger: runtime.logger,
       onProgress,
       signal: extra?.signal ?? null,
@@ -2259,7 +2293,7 @@ export function createCallContext(runtime, extra, toolName) {
  * 把 4 个工具注册到 McpServer。
  *
  * @param {import('@modelcontextprotocol/sdk/server/mcp.js').McpServer} server
- * @param {object} runtime { config, logger, cache, asrProvider, docProvider, backends, dispatcher }
+ * @param {object} runtime { config, logger, cache, asrProvider, ocrProvider, typesetProvider, backends, dispatcher }
  */
 export function registerTools(server, runtime) {
   for (const definition of TOOL_DEFINITIONS) {

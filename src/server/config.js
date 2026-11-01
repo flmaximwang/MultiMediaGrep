@@ -54,10 +54,34 @@ export const DEFAULT_HTTP_HOST = '127.0.0.1';
 export const DEFAULT_HTTP_PORT = 3927;
 
 /**
+ * 文档 provider 的两个角色（契约 v2）：
+ *   ocr     只处理没有文字层的页；默认 none。
+ *   typeset 只处理有文字层的页，不得重新识别字符；默认 builtin。
+ */
+export const DOC_ROLE_ENV = Object.freeze({
+  ocr: 'MMGREP_OCR_PROVIDER',
+  typeset: 'MMGREP_TYPESET_PROVIDER',
+});
+
+export const DOC_ROLE_DEFAULTS = Object.freeze({
+  ocr: 'none',
+  typeset: 'builtin',
+});
+
+/** 各角色允许的取值（含 none）。与 src/providers/doc 的注册表保持一致。 */
+export const DOC_ROLE_PROVIDERS = Object.freeze({
+  ocr: Object.freeze(['mineru', 'none']),
+  typeset: Object.freeze(['builtin', 'mineru', 'none']),
+});
+
+/**
  * provider → 环境变量组。选哪个 provider 就只读哪一组，互不串用。
  *
  * 键名固定为 apiKey / baseUrl / model，值是**该 provider 专属**的环境变量名；
  * defaultBaseUrl / defaultModel 是该 provider 自己的默认值。
+ *
+ * `doc` 现在是**外部文档 provider 的凭据组**（MinerU），由 ocr / typeset 两个角色
+ * 共用；它不再是一个「选哪个 provider」的配置段。
  */
 export const PROVIDER_ENV = Object.freeze({
   asr: Object.freeze({
@@ -87,29 +111,34 @@ export const PROVIDER_ENV = Object.freeze({
   }),
 });
 
-/** 旧的「所有 provider 共用一个」变量：专属变量未设置时兜底，并记弃用 warning。 */
+/** 旧的「所有 ASR provider 共用一个」变量：专属变量未设置时兜底，并记弃用 warning。 */
 const LEGACY_ENV = Object.freeze({
   asr: Object.freeze({
     apiKey: 'MMGREP_ASR_API_KEY',
     baseUrl: 'MMGREP_ASR_BASE_URL',
     model: 'MMGREP_ASR_MODEL',
   }),
-  doc: Object.freeze({
-    apiKey: 'MMGREP_DOC_API_KEY',
-    baseUrl: 'MMGREP_DOC_BASE_URL',
-    model: 'MMGREP_DOC_MODEL',
-  }),
 });
 
 const PROVIDER_ENV_VAR = Object.freeze({
   asr: 'MMGREP_ASR_PROVIDER',
-  doc: 'MMGREP_DOC_PROVIDER',
+});
+
+/**
+ * 0.2.0 删除的文档 provider 变量：不再读取，只负责在启动时给出可操作的 warning。
+ * 值是替代变量的说明（错误信息里只出现变量名，不出现变量值）。
+ */
+const LEGACY_DOC_ENV = Object.freeze({
+  MMGREP_DOC_PROVIDER:
+    'use MMGREP_OCR_PROVIDER for pages without a text layer and MMGREP_TYPESET_PROVIDER for pages with one (default: builtin)',
+  MMGREP_DOC_API_KEY: 'use MMGREP_MINERU_API_KEY',
+  MMGREP_DOC_BASE_URL: 'use MMGREP_MINERU_BASE_URL',
+  MMGREP_DOC_MODEL: 'use MMGREP_MINERU_MODEL',
 });
 
 /** provider=none 时仍保持旧内部形状的默认值（不读任何 provider 变量）。 */
 const NONE_DEFAULTS = Object.freeze({
   asr: Object.freeze({ baseUrl: DEFAULT_ASR_BASE_URL, model: DEFAULT_ASR_MODEL }),
-  doc: Object.freeze({ baseUrl: DEFAULT_DOC_BASE_URL, model: DEFAULT_DOC_MODEL }),
 });
 
 /**
@@ -119,11 +148,12 @@ const NONE_DEFAULTS = Object.freeze({
 function readProviderSetting(env, kind, provider, field, warnings) {
   const spec = PROVIDER_ENV[kind][provider];
   const primary = spec[field];
-  const legacy = LEGACY_ENV[kind][field];
+  const legacy = LEGACY_ENV[kind]?.[field];
 
   const primaryValue = readString(env, primary);
   if (primaryValue !== undefined) return { value: primaryValue, source: primary };
 
+  if (!legacy) return { value: undefined, source: null };
   const legacyValue = readString(env, legacy);
   if (legacyValue === undefined) return { value: undefined, source: null };
 
@@ -180,6 +210,67 @@ function resolveProviderSection(kind, requestedProvider, env, warnings) {
     baseUrl: baseUrl.value ?? spec.defaultBaseUrl,
     model: model.value ?? spec.defaultModel,
   };
+}
+
+/**
+ * 读外部文档 provider（MinerU）的专属变量：**没有旧 MMGREP_DOC_* 兜底**。
+ * 旧变量只在启动时 warn，不再影响行为。
+ */
+function readExternalProviderSetting(env, provider, field) {
+  const spec = PROVIDER_ENV.doc?.[provider];
+  if (!spec) return { value: undefined, source: null };
+  const primary = spec[field];
+  const value = readString(env, primary);
+  return { value, source: value === undefined ? null : primary };
+}
+
+/** 解析一个文档角色（ocr / typeset）的 provider 与凭据。 */
+function resolveDocRoleSection(role, requestedProvider, env, warnings) {
+  const envName = DOC_ROLE_ENV[role];
+  const allowed = DOC_ROLE_PROVIDERS[role];
+  const fallback = DOC_ROLE_DEFAULTS[role];
+  let provider = String(requestedProvider ?? fallback).trim().toLowerCase();
+  if (provider === '') provider = fallback;
+
+  if (!allowed.includes(provider)) {
+    warnings.push(
+      `${envName} is "${provider}", which is not a supported ${role} provider ` +
+        `(${allowed.join(', ')}); falling back to "${fallback}".`,
+    );
+    provider = fallback;
+  }
+
+  // none / builtin 不需要凭据；baseUrl / model 保留内置默认值，方便 describeConfig 输出。
+  if (provider === 'none' || provider === 'builtin') {
+    return {
+      provider,
+      apiKey: '',
+      apiKeySource: null,
+      baseUrl: DEFAULT_DOC_BASE_URL,
+      model: DEFAULT_DOC_MODEL,
+    };
+  }
+
+  const apiKey = readExternalProviderSetting(env, provider, 'apiKey');
+  const baseUrl = readExternalProviderSetting(env, provider, 'baseUrl');
+  const model = readExternalProviderSetting(env, provider, 'model');
+  const spec = PROVIDER_ENV.doc[provider];
+
+  return {
+    provider,
+    apiKey: apiKey.value ?? '',
+    apiKeySource: apiKey.source,
+    baseUrl: baseUrl.value ?? spec.defaultBaseUrl,
+    model: model.value ?? spec.defaultModel,
+  };
+}
+
+/** 0.2.0 删除的变量：设置过就明确 warn，绝不静默忽略。 */
+function warnLegacyDocEnv(env, warnings) {
+  for (const [name, replacement] of Object.entries(LEGACY_DOC_ENV)) {
+    if (readString(env, name) === undefined) continue;
+    warnings.push(`${name} was removed in 0.2.0 and is ignored; ${replacement}.`);
+  }
 }
 
 /** 取某 provider 的变量组（未知 provider 返回 null）。 */
@@ -311,8 +402,8 @@ export function loadConfig(env = process.env) {
   const warnings = [];
 
   const asrProvider = (readString(env, 'MMGREP_ASR_PROVIDER') ?? 'none').toLowerCase();
-  const docProvider = (readString(env, 'MMGREP_DOC_PROVIDER') ?? 'none').toLowerCase();
-  const ocrProvider = (readString(env, 'MMGREP_OCR_PROVIDER') ?? 'none').toLowerCase();
+  const ocrProvider = (readString(env, DOC_ROLE_ENV.ocr) ?? DOC_ROLE_DEFAULTS.ocr).toLowerCase();
+  const typesetProvider = (readString(env, DOC_ROLE_ENV.typeset) ?? DOC_ROLE_DEFAULTS.typeset).toLowerCase();
   const logLevelRaw = (readString(env, 'MMGREP_LOG_LEVEL') ?? 'info').toLowerCase();
   const logLevel = LOG_LEVELS[logLevelRaw] === undefined ? 'info' : logLevelRaw;
   if (LOG_LEVELS[logLevelRaw] === undefined) {
@@ -320,7 +411,10 @@ export function loadConfig(env = process.env) {
   }
 
   const asrSection = resolveProviderSection('asr', asrProvider, env, warnings);
-  const docSection = resolveProviderSection('doc', docProvider, env, warnings);
+  const ocrSection = resolveDocRoleSection('ocr', ocrProvider, env, warnings);
+  const typesetSection = resolveDocRoleSection('typeset', typesetProvider, env, warnings);
+  const docTimeoutMs = readInt(env, 'MMGREP_DOC_TIMEOUT_MS', DEFAULT_DOC_TIMEOUT_MS, { min: 1, warnings });
+  warnLegacyDocEnv(env, warnings);
 
   const transportMode = readTransportMode(env, warnings);
   const httpHost = readString(env, 'MMGREP_HTTP_HOST') ?? DEFAULT_HTTP_HOST;
@@ -354,11 +448,8 @@ export function loadConfig(env = process.env) {
       language: readString(env, 'MMGREP_ASR_LANGUAGE') ?? 'auto',
       timeoutMs: readInt(env, 'MMGREP_ASR_TIMEOUT_MS', DEFAULT_ASR_TIMEOUT_MS, { min: 1, warnings }),
     }),
-    doc: Object.freeze({
-      ...docSection,
-      timeoutMs: readInt(env, 'MMGREP_DOC_TIMEOUT_MS', DEFAULT_DOC_TIMEOUT_MS, { min: 1, warnings }),
-    }),
-    ocr: Object.freeze({ provider: ocrProvider }),
+    ocr: Object.freeze({ ...ocrSection, timeoutMs: docTimeoutMs }),
+    typeset: Object.freeze({ ...typesetSection, timeoutMs: docTimeoutMs }),
     images: Object.freeze({
       maxTokens: readInt(env, 'MMGREP_MAX_IMAGE_TOKENS', DEFAULT_MAX_IMAGE_TOKENS, { min: 1, warnings }),
       maxEdge: readInt(env, 'MMGREP_MAX_IMAGE_EDGE', DEFAULT_MAX_IMAGE_EDGE, { min: 1, warnings }),
@@ -431,14 +522,20 @@ export function describeConfig(config) {
       language: config.asr.language,
       timeoutMs: config.asr.timeoutMs,
     },
-    doc: {
-      provider: config.doc.provider,
-      apiKey: config.doc.apiKey ? 'set' : 'unset',
-      baseUrl: config.doc.baseUrl,
-      model: config.doc.model,
-      timeoutMs: config.doc.timeoutMs,
+    ocr: {
+      provider: config.ocr.provider,
+      apiKey: config.ocr.apiKey ? 'set' : 'unset',
+      baseUrl: config.ocr.baseUrl,
+      model: config.ocr.model,
+      timeoutMs: config.ocr.timeoutMs,
     },
-    ocr: { provider: config.ocr.provider },
+    typeset: {
+      provider: config.typeset.provider,
+      apiKey: config.typeset.apiKey ? 'set' : 'unset',
+      baseUrl: config.typeset.baseUrl,
+      model: config.typeset.model,
+      timeoutMs: config.typeset.timeoutMs,
+    },
     images: { maxTokens: config.images.maxTokens, maxEdge: config.images.maxEdge },
     text: { maxInlineChars: config.text.maxInlineChars },
     audio: { minDbfs: config.audio.minDbfs, minSpeechRatio: config.audio.minSpeechRatio },

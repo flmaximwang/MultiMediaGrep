@@ -180,7 +180,8 @@ claude mcp add --scope project multimediagrep -- npx -y multimediagrep-mcp
       "env": {
         "MMGREP_ASR_PROVIDER": "elevenlabs",
         "MMGREP_ELEVENLABS_API_KEY": "sk-替换成你的key",
-        "MMGREP_DOC_PROVIDER": "mineru",
+        "MMGREP_OCR_PROVIDER": "mineru",
+        "MMGREP_TYPESET_PROVIDER": "builtin",
         "MMGREP_MINERU_API_KEY": "替换成你的token"
       }
     }
@@ -213,7 +214,7 @@ hermes mcp add multimediagrep \
 ### 每请求凭据（仅 HTTP 模式）
 
 HTTP 端点常被多个调用方共用，provider 的 key 不必都写死在 server 的环境变量里：
-每个请求可以在头里临时覆盖 ASR / 文档解析的 provider、key、基址和模型。
+每个请求可以在头里临时覆盖 ASR / 文档 provider 的角色、key、基址和模型。
 
 | 请求头 | 作用 | 对应环境变量 |
 |---|---|---|
@@ -225,19 +226,21 @@ HTTP 端点常被多个调用方共用，provider 的 key 不必都写死在 ser
 | `x-mmgrep-openai-compatible-base-url` | OpenAI 兼容服务的基址 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` |
 | `x-mmgrep-openai-compatible-model` | OpenAI 兼容服务的模型 | `MMGREP_OPENAI_COMPATIBLE_MODEL` |
 | `x-mmgrep-asr-api-key` | 通用兜底 key（旧共用变量语义） | `MMGREP_ASR_API_KEY` |
-| `x-mmgrep-doc-provider` | 本次请求用哪个文档解析 provider（`mineru`） | `MMGREP_DOC_PROVIDER` |
-| `x-mmgrep-mineru-api-key` | MinerU token | `MMGREP_MINERU_API_KEY` |
-| `x-mmgrep-mineru-base-url` | MinerU 基址 | `MMGREP_MINERU_BASE_URL` |
-| `x-mmgrep-mineru-model` | MinerU 模型 | `MMGREP_MINERU_MODEL` |
-| `x-mmgrep-doc-api-key` | 通用兜底 token（旧共用变量语义） | `MMGREP_DOC_API_KEY` |
+| `x-mmgrep-ocr-provider` | 本次请求的 OCR 角色 provider：`mineru` / `none` | `MMGREP_OCR_PROVIDER` |
+| `x-mmgrep-typeset-provider` | 本次请求的 typeset 角色 provider：`builtin` / `mineru` / `none` | `MMGREP_TYPESET_PROVIDER` |
+| `x-mmgrep-mineru-api-key` | MinerU token（两个角色共用） | `MMGREP_MINERU_API_KEY` |
+| `x-mmgrep-mineru-base-url` | MinerU 基址（两个角色共用） | `MMGREP_MINERU_BASE_URL` |
+| `x-mmgrep-mineru-model` | MinerU 模型（两个角色共用） | `MMGREP_MINERU_MODEL` |
 
-优先级（逐字段）：该 provider 的专属请求头 > 通用 `x-mmgrep-<kind>-api-key`（只作用于 key）>
-该 provider 的环境变量 > 服务器启动配置（仅当 provider 相同）> provider 内置默认值。
+优先级（逐字段）：该 provider 的专属请求头 > 该 provider 的环境变量 >
+服务器启动配置（仅当 provider 相同）> provider 内置默认值。ASR 仍保留通用
+`x-mmgrep-asr-api-key` 兜底；文档角色已删除通用 key 头。
 请求头切换 provider 后只读新 provider 的变量组，不会借用另一个 provider 的 key；
 头里写了未知的 provider id → HTTP 400（JSON-RPC `-32602`）。空头（空串 / 全空白）等于没带。
 
-要让某个 provider 的专属头生效，得先用 `x-mmgrep-asr-provider` / `x-mmgrep-doc-provider`
-选中它（或服务器本身就选了同一个）。只带 provider 专属 key 头、provider 仍是 `none` 时，
+要让某个 provider 的专属头生效，得先用 `x-mmgrep-asr-provider` /
+`x-mmgrep-ocr-provider` / `x-mmgrep-typeset-provider` 选中它（或服务器本身就选了同一个）。
+只带 provider 专属 key 头、provider 仍是 `none` 时，
 这个头不会自动启用 provider；**provider 的选择只对当前请求生效**。
 
 **安全**：这些头的值只活在本次请求里——不写日志、不进缓存、不出现在响应里。server 会把本次请求
@@ -291,21 +294,22 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 | `MMGREP_OPENAI_COMPATIBLE_MODEL` | `whisper-1` | OpenAI 兼容服务的转写模型名 |
 | `MMGREP_ASR_LANGUAGE` | `auto` | 强制语言（BCP-47，如 `zh` / `en`）；`auto` = 让服务自己判断 |
 | `MMGREP_ASR_TIMEOUT_MS` | `120000` | ASR 单次请求超时 |
-| `MMGREP_DOC_PROVIDER` | `none` | 文档解析后端：`none`（只出页图）/ `mineru` |
-| `MMGREP_MINERU_API_KEY` | 空 | MinerU 的 token（<https://mineru.net/apiManage/token>） |
-| `MMGREP_MINERU_BASE_URL` | `https://mineru.net/api/v4` | MinerU 的 API 基址 |
+| `MMGREP_OCR_PROVIDER` | `none` | OCR 角色：只处理没有文字层的页。`none` / `mineru` |
+| `MMGREP_TYPESET_PROVIDER` | `builtin` | typeset 角色：只处理有文字层的页，恢复结构、不重识别字符。`builtin` / `mineru` / `none` |
+| `MMGREP_MINERU_API_KEY` | 空 | MinerU 的 token（两个角色共用；<https://mineru.net/apiManage/token>） |
+| `MMGREP_MINERU_BASE_URL` | `https://mineru.net/api/v4` | MinerU 的 API 基址（两个角色共用） |
 | `MMGREP_MINERU_MODEL` | 空 | 解析模型名；留空 = 用服务端默认（MinerU 可选 `pipeline` / `vlm` / `MinerU-HTML`） |
 | `MMGREP_DOC_TIMEOUT_MS` | `180000` | 文档解析单次请求超时（3 分钟）。MinerU 是「上传 → 排队 → 解析 → 下载」整段墙钟时间，排队久就调大 |
-| `MMGREP_OCR_PROVIDER` | `none` | 预留给独立的本地 OCR 通道（契约 §12.4）。**当前版本未实现**：OCR 由文档解析 provider（MinerU）承担，这个变量只出现在启动横幅，不影响任何工具行为 |
 | `MMGREP_MAX_IMAGE_TOKENS` | `4000` | 单次调用的图片 token **软预算**。超了自动模式会降形，显式模式只警告 |
 | `MMGREP_MAX_IMAGE_EDGE` | `1600` | 单张图最长边的全局上限（px）。请求超过 → `BUDGET_EXCEEDED` |
 | `MMGREP_LOG_LEVEL` | `info` | 日志级别：`error` / `warn` / `info` / `debug`。日志**一律走 stderr**（stdout 是协议通道） |
 
 传输相关的命令行开关（`--http` / `--host` / `--port` / `--token`）优先于上表的环境变量。
 
-> 旧的 `MMGREP_ASR_API_KEY` / `MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 与
-> `MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL` 仍会在对应的
-> provider 专属变量未设置时兜底，但启动时会记一条弃用 warning；计划在 0.2.0 删除。
+> 旧的 `MMGREP_ASR_API_KEY` / `MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 仍会在
+> 对应的 provider 专属变量未设置时兜底，但启动时会记一条弃用 warning。
+> **0.2.0 已删除** `MMGREP_DOC_PROVIDER` / `MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` /
+> `MMGREP_DOC_MODEL`：设置这些变量不会再生效，启动时会 warn 并指出新变量名。
 > 同一进程里可以同时存在多家 provider 的 key，server 只读当前选中 provider 的那一组。
 
 另有 `MMGREP_FFMPEG_PATH` / `MMGREP_FFPROBE_PATH`（默认按 `PATH` 查找）、

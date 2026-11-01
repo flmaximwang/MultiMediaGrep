@@ -319,19 +319,37 @@ MMGREP_OPENAI_COMPATIBLE_MODEL=whisper-1
 > （例如 `MMGREP_OPENAI_COMPATIBLE_API_KEY=local`）。
 > 另外：只有本地地址时 `MMGREP_ASR_PROVIDER` 要写 `openai-compatible`，别写 `elevenlabs`。
 
-### 3.3 文档解析：MinerU
+### 3.3 文档解析：OCR 与 typeset 两个角色（MinerU）
 
-1. 到 <https://mineru.net/apiManage/token> 取 token。
-2. 配上：
+0.2.0 起，文档 provider 拆成两个角色，分别配置：
+
+- **OCR**（`MMGREP_OCR_PROVIDER`，默认 `none`）：只处理**没有文字层**的扫描页 / 图片。
+- **typeset**（`MMGREP_TYPESET_PROVIDER`，默认 `builtin`）：只处理**有文字层**的页，
+  恢复阅读顺序与结构，**不会重新识别字符**。`builtin` 是本地实现，不联网；想让 MinerU
+  也参与排版结构时再设成 `mineru`。
+
+只想给扫描件加 OCR（最常见）：
 
 ```bash
-MMGREP_DOC_PROVIDER=mineru
+MMGREP_OCR_PROVIDER=mineru
 MMGREP_MINERU_API_KEY=你的token
 # 默认值，一般不用动
 MMGREP_MINERU_BASE_URL=https://mineru.net/api/v4
 MMGREP_MINERU_MODEL=          # 留空 = 用服务端默认模型；也可填 pipeline / vlm / MinerU-HTML
 MMGREP_DOC_TIMEOUT_MS=180000
 ```
+
+如果还要 MinerU 做 typeset（有文字层页的阅读顺序 / 结构）：
+
+```bash
+MMGREP_TYPESET_PROVIDER=mineru
+```
+
+两个角色共用 `MMGREP_MINERU_*` 凭据与 `MMGREP_DOC_TIMEOUT_MS`。两个角色都是 `mineru`
+且配置相同时，server 只发一次解析请求（按逐页 `textOrigin` 分配结果）。
+
+1. 到 <https://mineru.net/apiManage/token> 取 token。
+2. 按上面的变量配置。
 
 注意：
 
@@ -340,8 +358,11 @@ MMGREP_DOC_TIMEOUT_MS=180000
 - 单文件 ≤ 200 MB、单次 ≤ 200 页；provider 会按 200 页一批自动切批。
 - ⚠️ **源文件的物理页数**超过 200 页时，MinerU 可能直接拒绝（业务码 `-60006`），
   即使你只请求其中几页——那种超长 PDF 需要先在本地拆开。
-- 文档 provider 失败时，`media_overview` **不报错**——降级成「只有页面图 + 一条警告」；
-  但 `media_locate`（必须要文字）会报 `PROVIDER_FAILED` / `PROVIDER_NOT_CONFIGURED`。
+- 文档 provider 失败时，`media_overview` **不报错**——有文字层的页退回原生文字层，
+  没有文字层的页降级成「只有页面图 + 一条警告」；但 `media_locate`（必须要文字）会报
+  `PROVIDER_FAILED` / `PROVIDER_NOT_CONFIGURED`。
+- **旧变量已删除**：`MMGREP_DOC_PROVIDER` / `MMGREP_DOC_API_KEY` /
+  `MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL` 不再生效；启动时会 warn 并指出替代变量。
 
 ### 3.4 key 的处理
 
@@ -434,8 +455,8 @@ rm -rf ~/.cache/multimediagrep/ab/abcdef.../
 | `TOOL_NOT_FOUND: no PDF page rasterizer is available on this machine (pdftoppm, mutool, and gs were all missing).` | 没装 PDF 栅格化工具 | 装 `poppler-utils` / `mupdf-tools` / `ghostscript` 任意一个 |
 | `TOOL_NOT_FOUND: cannot read PDF metadata: no PDF tool is installed (pdfinfo, mutool, or qpdf).` | 同上（缺的是元信息工具） | 同上 |
 | probe 说 `asr: unavailable — No ASR provider is configured (set MMGREP_ASR_PROVIDER and the matching provider key: MMGREP_ELEVENLABS_API_KEY or MMGREP_OPENAI_COMPATIBLE_API_KEY).` | 没配 ASR | 配 `MMGREP_ASR_PROVIDER` + 对应 provider 的 key（§3.1 / §3.2），或传一个本地字幕文件 |
-| probe 说 `ocr: unavailable — No document parser is configured (MMGREP_DOC_PROVIDER is "none"). Scanned pages and images are returned as page images only.` | 没配文档解析 | 配 `MMGREP_DOC_PROVIDER=mineru` + `MMGREP_MINERU_API_KEY`（§3.3）；扫描件没 OCR 就只能看页图 |
-| `PROVIDER_NOT_CONFIGURED`（文档） | 选了 provider 但缺 key | `MMGREP_MINERU_API_KEY` 填上，或把 `MMGREP_DOC_PROVIDER` 去掉退回「只有页图」 |
+| probe 说 `ocr: unavailable — No OCR provider is configured (MMGREP_OCR_PROVIDER is "none"). Pages without a text layer are returned as page images only.` | 没配 OCR | 配 `MMGREP_OCR_PROVIDER=mineru` + `MMGREP_MINERU_API_KEY`（§3.3）；扫描件没 OCR 就只能看页图 |
+| `PROVIDER_NOT_CONFIGURED`（文档） | 选了 provider 但缺 key | `MMGREP_MINERU_API_KEY` 填上，或把对应角色设成 `none`（`MMGREP_OCR_PROVIDER=none` / `MMGREP_TYPESET_PROVIDER=none`）退回「只有页图」/「原生文字层」 |
 | `PROVIDER_FAILED: … HTTP 401/403 …` | key 不对 / token 过期 | 换 key；MinerU 常见业务码 `A0202`（token 错）、`A0211`（token 过期） |
 | `PROVIDER_FAILED`，但我明明用的是自己的服务 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_MODEL` 没改 | 这两个的默认值是 OpenAI 官方的 `https://api.openai.com/v1` + `whisper-1`；用自己的服务时显式写上（见 §3.2） |
 | `PROVIDER_FAILED: … HTTP 404 …` | 基址写错 | 检查 `MMGREP_ELEVENLABS_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_MINERU_BASE_URL` |

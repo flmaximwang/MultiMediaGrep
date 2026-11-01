@@ -29,7 +29,8 @@ const SERVER_ENV = Object.freeze({
   MMGREP_ELEVENLABS_BASE_URL: 'https://env.elevenlabs.example/v1',
   MMGREP_ELEVENLABS_MODEL: 'env-elevenlabs-model',
   MMGREP_OPENAI_COMPATIBLE_API_KEY: 'env-openai-key',
-  MMGREP_DOC_PROVIDER: 'mineru',
+  MMGREP_OCR_PROVIDER: 'mineru',
+  MMGREP_TYPESET_PROVIDER: 'mineru',
   MMGREP_MINERU_API_KEY: 'env-mineru-key',
   MMGREP_MINERU_BASE_URL: 'https://env.mineru.example/api/v4',
 });
@@ -56,9 +57,18 @@ test('REQUEST_HEADERS：头名就是环境变量名的小写连字符形式', ()
         },
       },
     },
-    doc: {
-      provider: 'x-mmgrep-doc-provider',
-      genericApiKey: 'x-mmgrep-doc-api-key',
+    ocr: {
+      provider: 'x-mmgrep-ocr-provider',
+      providers: {
+        mineru: {
+          apiKey: 'x-mmgrep-mineru-api-key',
+          baseUrl: 'x-mmgrep-mineru-base-url',
+          model: 'x-mmgrep-mineru-model',
+        },
+      },
+    },
+    typeset: {
+      provider: 'x-mmgrep-typeset-provider',
       providers: {
         mineru: {
           apiKey: 'x-mmgrep-mineru-api-key',
@@ -195,11 +205,22 @@ test('未知 provider → INVALID_ARGUMENT，消息列出允许值', () => {
   );
 
   assert.throws(
-    () => resolveConfigForRequest(baseConfig(), { 'x-mmgrep-doc-provider': 'tesseract' }, SERVER_ENV),
+    () => resolveConfigForRequest(baseConfig(), { 'x-mmgrep-ocr-provider': 'tesseract' }, SERVER_ENV),
     (error) => {
       assert.equal(error.code, 'INVALID_ARGUMENT');
-      assert.match(error.message, /x-mmgrep-doc-provider/);
+      assert.match(error.message, /x-mmgrep-ocr-provider/);
       assert.match(error.message, /mineru/);
+      assert.match(error.message, /none/);
+      return true;
+    },
+  );
+
+  assert.throws(
+    () => resolveConfigForRequest(baseConfig(), { 'x-mmgrep-typeset-provider': 'tesseract' }, SERVER_ENV),
+    (error) => {
+      assert.equal(error.code, 'INVALID_ARGUMENT');
+      assert.match(error.message, /x-mmgrep-typeset-provider/);
+      assert.match(error.message, /builtin/);
       return true;
     },
   );
@@ -248,32 +269,77 @@ test('专属 key 头优先于通用 key 头', () => {
   assert.equal(config.asr.apiKeySource, 'x-mmgrep-elevenlabs-api-key');
 });
 
-test('doc 分组同理：专属头 / 通用头 / env / 切 provider', () => {
+test('文档角色头：ocr / typeset 各自选 provider，共用 MinerU 凭据头', () => {
   const headerConfig = resolveConfigForRequest(
     baseConfig(),
     {
-      'x-mmgrep-doc-provider': 'mineru',
+      'x-mmgrep-ocr-provider': 'mineru',
+      'x-mmgrep-typeset-provider': 'mineru',
       'x-mmgrep-mineru-api-key': 'header-mineru-key',
       'x-mmgrep-mineru-model': 'pipeline',
     },
     SERVER_ENV,
   );
-  assert.equal(headerConfig.doc.provider, 'mineru');
-  assert.equal(headerConfig.doc.apiKey, 'header-mineru-key');
-  assert.equal(headerConfig.doc.apiKeySource, 'x-mmgrep-mineru-api-key');
-  assert.equal(headerConfig.doc.model, 'pipeline');
+  assert.equal(headerConfig.ocr.provider, 'mineru');
+  assert.equal(headerConfig.ocr.apiKey, 'header-mineru-key');
+  assert.equal(headerConfig.ocr.apiKeySource, 'x-mmgrep-mineru-api-key');
+  assert.equal(headerConfig.ocr.model, 'pipeline');
+  assert.equal(headerConfig.typeset.provider, 'mineru');
+  assert.equal(headerConfig.typeset.apiKey, 'header-mineru-key');
 
-  const generic = resolveConfigForRequest(
+  // 没有角色 provider 头时沿用 env。
+  const fromEnv = resolveConfigForRequest(baseConfig(), {}, SERVER_ENV);
+  assert.equal(fromEnv.ocr.provider, 'mineru');
+  assert.equal(fromEnv.ocr.apiKey, 'env-mineru-key');
+  assert.equal(fromEnv.ocr.apiKeySource, 'MMGREP_MINERU_API_KEY');
+  assert.equal(fromEnv.typeset.provider, 'mineru');
+  assert.equal(fromEnv.typeset.apiKey, 'env-mineru-key');
+});
+
+test('文档角色头可以选 builtin / none（仅 typeset 允许 builtin）', () => {
+  const builtin = resolveConfigForRequest(
     baseConfig(),
-    { 'x-mmgrep-doc-provider': 'mineru', 'x-mmgrep-doc-api-key': 'doc-generic-key' },
+    { 'x-mmgrep-ocr-provider': 'none', 'x-mmgrep-typeset-provider': 'builtin' },
     SERVER_ENV,
   );
-  assert.equal(generic.doc.apiKey, 'doc-generic-key');
-  assert.equal(generic.doc.apiKeySource, 'x-mmgrep-doc-api-key');
+  assert.equal(builtin.ocr.provider, 'none');
+  assert.equal(builtin.ocr.apiKey, '');
+  assert.equal(builtin.typeset.provider, 'builtin');
+  assert.equal(builtin.typeset.apiKey, '');
 
-  const fromEnv = resolveConfigForRequest(baseConfig(), {}, SERVER_ENV);
-  assert.equal(fromEnv.doc.apiKey, 'env-mineru-key');
-  assert.equal(fromEnv.doc.apiKeySource, 'MMGREP_MINERU_API_KEY');
+  const none = resolveConfigForRequest(
+    baseConfig(),
+    { 'x-mmgrep-ocr-provider': 'mineru', 'x-mmgrep-typeset-provider': 'none' },
+    SERVER_ENV,
+  );
+  assert.equal(none.typeset.provider, 'none');
+  assert.equal(none.typeset.apiKey, '');
+  assert.equal(none.ocr.provider, 'mineru');
+  assert.equal(none.ocr.apiKey, 'env-mineru-key');
+
+  // ocr 角色不允许 builtin。
+  assert.throws(
+    () => resolveConfigForRequest(baseConfig(), { 'x-mmgrep-ocr-provider': 'builtin' }, SERVER_ENV),
+    (error) => error.code === 'INVALID_ARGUMENT' && /x-mmgrep-ocr-provider/.test(error.message),
+  );
+});
+
+test('角色 provider 头切到 mineru 时只读 MinerU 的变量组，不借用 baseConfig 的旧凭据', () => {
+  const env = {
+    MMGREP_OCR_PROVIDER: 'none',
+    MMGREP_TYPESET_PROVIDER: 'builtin',
+    MMGREP_MINERU_API_KEY: 'env-mineru-only-key',
+  };
+  const base = baseConfig(env);
+  const config = resolveConfigForRequest(
+    base,
+    { 'x-mmgrep-ocr-provider': 'mineru' },
+    env,
+  );
+  assert.equal(config.ocr.provider, 'mineru');
+  assert.equal(config.ocr.apiKey, 'env-mineru-only-key');
+  assert.equal(config.ocr.apiKeySource, 'MMGREP_MINERU_API_KEY');
+  assert.equal(config.typeset.provider, 'builtin');
 });
 
 test('内联上限请求头：头 > env > 默认 24000，超过 200000 按上限截断', () => {
@@ -378,7 +444,8 @@ test('requestOverrides 只记录头名，绝不出现任何头的值', () => {
       'x-mmgrep-asr-provider': 'openai-compatible',
       'x-mmgrep-openai-compatible-api-key': asrKey,
       'x-mmgrep-openai-compatible-base-url': asrBase,
-      'x-mmgrep-doc-provider': 'mineru',
+      'x-mmgrep-ocr-provider': 'mineru',
+      'x-mmgrep-typeset-provider': 'builtin',
       'x-mmgrep-mineru-api-key': docKey,
       'x-mmgrep-max-text-inline-chars': '5000',
     },
@@ -391,8 +458,9 @@ test('requestOverrides 只记录头名，绝不出现任何头的值', () => {
       'x-mmgrep-asr-provider',
       'x-mmgrep-openai-compatible-api-key',
       'x-mmgrep-openai-compatible-base-url',
-      'x-mmgrep-doc-provider',
+      'x-mmgrep-ocr-provider',
       'x-mmgrep-mineru-api-key',
+      'x-mmgrep-typeset-provider',
     ],
     asr: {
       provider: 'x-mmgrep-asr-provider',
@@ -400,9 +468,15 @@ test('requestOverrides 只记录头名，绝不出现任何头的值', () => {
       baseUrl: 'x-mmgrep-openai-compatible-base-url',
       model: null,
     },
-    doc: {
-      provider: 'x-mmgrep-doc-provider',
+    ocr: {
+      provider: 'x-mmgrep-ocr-provider',
       apiKey: 'x-mmgrep-mineru-api-key',
+      baseUrl: null,
+      model: null,
+    },
+    typeset: {
+      provider: 'x-mmgrep-typeset-provider',
+      apiKey: null,
       baseUrl: null,
       model: null,
     },
@@ -421,7 +495,7 @@ test('requestOverrides 只记录头名，绝不出现任何头的值', () => {
 
 test('返回新配置：冻结、不改 baseConfig、非 provider 字段原样继承', () => {
   const base = baseConfig();
-  const before = JSON.stringify({ asr: base.asr, doc: base.doc });
+  const before = JSON.stringify({ asr: base.asr, ocr: base.ocr, typeset: base.typeset });
   const config = resolveConfigForRequest(
     base,
     { 'x-mmgrep-elevenlabs-api-key': 'header-key' },
@@ -431,8 +505,9 @@ test('返回新配置：冻结、不改 baseConfig、非 provider 字段原样�
   assert.notEqual(config, base);
   assert.ok(Object.isFrozen(config));
   assert.ok(Object.isFrozen(config.asr));
-  assert.ok(Object.isFrozen(config.doc));
-  assert.equal(JSON.stringify({ asr: base.asr, doc: base.doc }), before, 'baseConfig 被改动了');
+  assert.ok(Object.isFrozen(config.ocr));
+  assert.ok(Object.isFrozen(config.typeset));
+  assert.equal(JSON.stringify({ asr: base.asr, ocr: base.ocr, typeset: base.typeset }), before, 'baseConfig 被改动了');
 
   assert.deepEqual(config.cache, base.cache);
   assert.deepEqual(config.images, base.images);
@@ -441,7 +516,8 @@ test('返回新配置：冻结、不改 baseConfig、非 provider 字段原样�
   assert.deepEqual(config.transport, base.transport);
   assert.deepEqual(config.warnings, base.warnings);
   assert.equal(config.asr.language, base.asr.language);
-  assert.equal(config.doc.timeoutMs, base.doc.timeoutMs);
+  assert.equal(config.ocr.timeoutMs, base.ocr.timeoutMs);
+  assert.equal(config.typeset.timeoutMs, base.typeset.timeoutMs);
 });
 
 test('没有任何头时：整份配置与 baseConfig 等价（provider / key 都不变）', () => {
@@ -449,7 +525,8 @@ test('没有任何头时：整份配置与 baseConfig 等价（provider / key �
   const config = resolveConfigForRequest(base, {}, SERVER_ENV);
 
   assert.deepEqual(config.asr, base.asr);
-  assert.deepEqual(config.doc, base.doc);
+  assert.deepEqual(config.ocr, base.ocr);
+  assert.deepEqual(config.typeset, base.typeset);
   assert.deepEqual(config.text, base.text);
   assert.deepEqual(config.requestOverrides.present, []);
   assert.deepEqual(config.requestOverrides.asr, {

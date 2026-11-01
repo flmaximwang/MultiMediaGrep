@@ -179,8 +179,10 @@ function secretHeaderValues(headers) {
   const names = [];
   for (const kind of Object.keys(REQUEST_HEADERS)) {
     const spec = REQUEST_HEADERS[kind];
-    names.push(spec.genericApiKey);
-    for (const provider of Object.values(spec.providers)) names.push(provider.apiKey);
+    if (spec.genericApiKey) names.push(spec.genericApiKey);
+    for (const provider of Object.values(spec.providers)) {
+      if (provider.apiKey) names.push(provider.apiKey);
+    }
   }
 
   const values = [];
@@ -251,7 +253,8 @@ async function createRequestRuntime(runtime, config, headers, env, logger = runt
       config,
       logger: requestLogger,
       asrProvider: providers.asrProvider,
-      docProvider: providers.docProvider,
+      ocrProvider: providers.ocrProvider,
+      typesetProvider: providers.typesetProvider,
       providerErrors: providers.providerErrors,
     };
   }

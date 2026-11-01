@@ -473,7 +473,7 @@ test('http：真实进程起得来、鉴权生效、SIGINT 后退出码 0', asyn
       ...process.env,
       MMGREP_CACHE_DIR: path.join(dir, 'cache'),
       MMGREP_ASR_PROVIDER: 'none',
-      MMGREP_DOC_PROVIDER: 'none',
+      MMGREP_OCR_PROVIDER: 'none',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -614,6 +614,83 @@ test('http：逐请求凭据 —— 同一端点两个请求各用各的 provide
   } finally {
     await stub.close();
   }
+});
+
+test('http：x-mmgrep-ocr-provider / x-mmgrep-typeset-provider 覆盖 env（仅本次请求）', async () => {
+  const seen = [];
+  const serverFactory = (runtimeForRequest) => {
+    seen.push(runtimeForRequest);
+    return createServer(runtimeForRequest);
+  };
+
+  await withHttpServer(
+    { MMGREP_OCR_PROVIDER: 'none', MMGREP_TYPESET_PROVIDER: 'builtin' },
+    async ({ endpoint, runtime, logs }) => {
+      const list = { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} };
+      const res = await rpc(endpoint, list, {
+        'x-mmgrep-ocr-provider': 'mineru',
+        'x-mmgrep-typeset-provider': 'mineru',
+        'x-mmgrep-mineru-api-key': 'sentinel-role-key',
+      });
+      assert.equal(res.status, 200);
+      assert.equal(seen.length, 1);
+      assert.notEqual(seen[0], runtime);
+      assert.equal(seen[0].config.ocr.provider, 'mineru');
+      assert.equal(seen[0].config.typeset.provider, 'mineru');
+      assert.equal(seen[0].config.ocr.apiKey, 'sentinel-role-key');
+      assert.equal(seen[0].config.typeset.apiKey, 'sentinel-role-key');
+      assert.equal(seen[0].ocrProvider?.id, 'mineru');
+      assert.equal(seen[0].typesetProvider?.id, 'mineru');
+      // 两个角色同一 provider、同一份配置 → 复用同一个实例。
+      assert.equal(seen[0].ocrProvider, seen[0].typesetProvider);
+
+      // 共享 runtime 不受影响。
+      assert.equal(runtime.config.ocr.provider, 'none');
+      assert.equal(runtime.config.typeset.provider, 'builtin');
+      assert.equal(runtime.ocrProvider, null);
+      assert.equal(runtime.typesetProvider?.id, 'builtin');
+
+      // 日志只出现头名，不出现头值。
+      const text = logs.join('\n');
+      assert.match(text, /x-mmgrep-ocr-provider/);
+      assert.match(text, /x-mmgrep-typeset-provider/);
+      assert.ok(!text.includes('sentinel-role-key'), `日志泄漏了角色头的 key：${text}`);
+
+      // 第二个请求：typeset 关掉，ocr 保持 none → 两个 provider 都不建。
+      const off = await rpc(endpoint, { ...list, id: 2 }, {
+        'x-mmgrep-ocr-provider': 'none',
+        'x-mmgrep-typeset-provider': 'none',
+      });
+      assert.equal(off.status, 200);
+      assert.equal(seen.length, 2);
+      assert.equal(seen[1].config.ocr.provider, 'none');
+      assert.equal(seen[1].config.typeset.provider, 'none');
+      assert.equal(seen[1].ocrProvider, null);
+      assert.equal(seen[1].typesetProvider, null);
+    },
+    { serverFactory },
+  );
+});
+
+test('http：未知文档角色 provider 头 → 400 / -32602，列出允许值', async () => {
+  const seen = [];
+  const serverFactory = (runtimeForRequest) => {
+    seen.push(runtimeForRequest);
+    return createServer(runtimeForRequest);
+  };
+
+  await withHttpServer({}, async ({ endpoint }) => {
+    const res = await rpc(
+      endpoint,
+      { jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} },
+      { 'x-mmgrep-ocr-provider': 'tesseract' },
+    );
+    assert.equal(res.status, 400);
+    assert.equal(res.json.error.code, -32602);
+    assert.match(res.json.error.message, /x-mmgrep-ocr-provider/);
+    assert.match(res.json.error.message, /mineru/);
+    assert.equal(seen.length, 0);
+  }, { serverFactory });
 });
 
 test('http：日志只脱敏 key 值，凭据头名保持完整', async () => {
