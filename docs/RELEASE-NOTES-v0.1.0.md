@@ -5,7 +5,7 @@
 ＋**按时间/页码对齐的文本清单**。
 
 - 仓库：<https://github.com/flmaximwang/MultiMediaGrep>
-- 许可：Apache-2.0（含 vendor 的 dsh-video-storyboard v0.5.9，署名见 `NOTICE` / `CREDITS.md`）
+- 许可：Apache-2.0（部分模块改写自 dsh-video-storyboard v0.5.9，署名见 `NOTICE` / `CREDITS.md`）
 - 契约：[`docs/mcp-contract.md`](docs/mcp-contract.md)｜安装运维：[`docs/install.md`](docs/install.md)
 
 ## 装
