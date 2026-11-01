@@ -10,7 +10,7 @@
 
 ## 1. 这份契约是什么
 
-MultiMediaGrep 是一个 **stdio MCP server**。它给任何 MCP client 的 agent 提供「看 / 听」本地媒体的能力：
+MultiMediaGrep 是一个 **MCP server**：默认走 stdio（由宿主拉起），也可以显式开启 Streamable HTTP（`POST /mcp`）。它给任何 MCP client 的 agent 提供「看 / 听」本地媒体的能力：
 
 | 媒体 | agent 能拿到什么 |
 |---|---|
@@ -21,8 +21,8 @@ MultiMediaGrep 是一个 **stdio MCP server**。它给任何 MCP client 的 agen
 三条不可动摇的边界：
 
 1. **server 自己绝不调用 LLM。** server 只做「取帧 / 转写 / 排版」，理解由 agent 自己的多模态模型完成。
-2. **server 不做取数。** 只收本地文件的绝对路径；拒绝 URL；不碰 cookie / 凭据 / 下载器。
-3. **server 不做鉴权、不落用户凭据。** 需要字幕就让取数层把字幕文件交给它。
+2. **server 不做取数。** 只收本地文件的绝对路径；拒绝 URL；不碰 cookie、不替你管理凭据、不下载。provider key 只由调用方显式提供（环境变量或 HTTP 请求头）。
+3. **server 不保存用户凭据。** stdio 模式不做鉴权；HTTP 模式只做 Bearer 令牌这一层接入控制。请求头里的 provider key 只活在这一个请求内，不落盘、不缓存、不回显。需要字幕就让取数层把字幕文件交给它。
 
 契约里出现的一切**工具名、参数名、字段名、工具描述文本**都是英文（agent 的 API 面）；本文件的**正文说明是中文**。
 
@@ -260,6 +260,29 @@ progress token 形如 `media_overview 3/5 · scanning 0-300s`，让宿主 UI 能
 | 落盘产物 | `content.md` + `segments.jsonl` + `manifest.json`（三个必备）+ `document.json`（可选，cangjie `SourceDocument Contract v1`） |
 
 细节见 §9。
+
+### 2.8 传输方式：stdio 与 HTTP
+
+| | stdio（默认） | Streamable HTTP（显式开启） |
+|---|---|---|
+| 怎么开 | 不传 `--http`、不设 `MMGREP_TRANSPORT` | `--http` 或 `MMGREP_TRANSPORT=http` |
+| 监听 | 不监听端口；宿主用 stdin/stdout 通信 | `POST /mcp`，默认 `127.0.0.1:3927` |
+| 鉴权 | 无（进程由宿主拉起，边界是宿主） | 可选 Bearer 令牌；配了令牌后每个请求都要带 `Authorization: Bearer <令牌>` |
+| 凭据 | 只读 server 启动时的环境变量 / 配置 | 可用 `x-mmgrep-*` 请求头逐请求覆盖（见 §12.7） |
+| 生命周期 | 进程阻塞到 client 关闭 stdin | 无状态：每个请求新建 server + transport，处理完即关 |
+| 工具语义 | 完全相同 | 完全相同 |
+
+两边的差异只影响「怎么连、用谁的 key」，不影响任何工具的参数、返回结构、错误码或图片预算。
+HTTP 模式下，带了凭据头的请求会用本次请求解析出的配置新建 provider；**凭据不按请求缓存**，
+请求结束即丢弃。没带任何凭据头的请求复用启动时的 runtime。
+
+HTTP 端点对 `Accept` / `Content-Type` 有要求：请求必须同时接受 `application/json` 与
+`text/event-stream`（否则 406），`Content-Type` 必须是 `application/json`（否则 415）。
+端点只接受 `POST /mcp`；其它路径 404，其它方法 405。配了令牌时，缺失或错误的 `Authorization`
+返回 401（`WWW-Authenticate: Bearer realm="multimediagrep"`），且鉴权在方法判断之前执行。
+请求体上限 1 MiB（超出 413）；单次请求超时 120 s，超时会中止在途工具调用，响应尚未开始时回 504。
+
+> HTTP 模式是 **opt-in**：不显式开启时 server 不监听任何端口，现有的 stdio 接入方式不需要改动。
 
 ---
 
@@ -1375,6 +1398,46 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 
 > **MCP 的 stdout 是协议通道**：日志一律走 stderr，`LOG_LEVEL` 控制不了这一点。
 
+### 12.6 传输（HTTP 模式）
+
+| 变量 | 类型 | 默认值 | 作用 | 没配 / 配错时的行为 |
+|---|---|---|---|---|
+| `MMGREP_TRANSPORT` | string | `stdio` | 传输方式：`stdio`（默认）或 `http` | 写错 → 记 warning 并回落 `stdio` |
+| `MMGREP_HTTP_HOST` | string | `127.0.0.1` | HTTP 监听地址 | 非回环地址且没配令牌 → 记 warning（仍会启动并接受未认证请求） |
+| `MMGREP_HTTP_PORT` | integer | `3927` | HTTP 监听端口（1–65535） | 非法值 → 记 warning 并用 `3927` |
+| `MMGREP_HTTP_TOKEN` | string | 空 | Bearer 令牌；设置后每个请求必须带 `Authorization: Bearer <令牌>`。令牌请用 ASCII 字符串 | 空 = 不鉴权。只认 Authorization 头，不接受 query string；非 ASCII 令牌无法通过校验 |
+
+命令行 `--http` / `--host` / `--port` / `--token` 优先于环境变量；`--host` / `--port` / `--token`
+不带 `--http` 时不会改变传输方式。端点的 `Accept` / `Content-Type` 要求与状态码见 §2.8。
+
+### 12.7 每请求凭据头（仅 HTTP）
+
+请求头名与 provider 专属环境变量一一对应（`MMGREP_FOO_BAR` → `x-mmgrep-foo-bar`）：
+
+| 请求头 | 作用 | 对应环境变量 |
+|---|---|---|
+| `x-mmgrep-asr-provider` | 本次请求的 ASR provider：`elevenlabs` / `openai-compatible` | `MMGREP_ASR_PROVIDER` |
+| `x-mmgrep-elevenlabs-api-key` | ElevenLabs key | `MMGREP_ELEVENLABS_API_KEY` |
+| `x-mmgrep-elevenlabs-base-url` | ElevenLabs 基址 | `MMGREP_ELEVENLABS_BASE_URL` |
+| `x-mmgrep-elevenlabs-model` | ElevenLabs 模型 | `MMGREP_ELEVENLABS_MODEL` |
+| `x-mmgrep-openai-compatible-api-key` | OpenAI 兼容服务 key | `MMGREP_OPENAI_COMPATIBLE_API_KEY` |
+| `x-mmgrep-openai-compatible-base-url` | OpenAI 兼容服务基址 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` |
+| `x-mmgrep-openai-compatible-model` | OpenAI 兼容服务模型 | `MMGREP_OPENAI_COMPATIBLE_MODEL` |
+| `x-mmgrep-asr-api-key` | 通用兜底 key（旧共用变量语义） | `MMGREP_ASR_API_KEY` |
+| `x-mmgrep-doc-provider` | 本次请求的文档解析 provider：`mineru` | `MMGREP_DOC_PROVIDER` |
+| `x-mmgrep-mineru-api-key` | MinerU token | `MMGREP_MINERU_API_KEY` |
+| `x-mmgrep-mineru-base-url` | MinerU 基址 | `MMGREP_MINERU_BASE_URL` |
+| `x-mmgrep-mineru-model` | MinerU 模型 | `MMGREP_MINERU_MODEL` |
+| `x-mmgrep-doc-api-key` | 通用兜底 token（旧共用变量语义） | `MMGREP_DOC_API_KEY` |
+
+优先级（逐字段计算）：该 provider 的专属请求头 > 通用 `x-mmgrep-<kind>-api-key`（只作用于 apiKey）
+> 该 provider 的环境变量 > 启动配置（仅当 provider 相同）> provider 内置默认值。
+
+- 请求头里的 provider 选择**只对当前请求生效**；未知 provider id → HTTP 400 / JSON-RPC `-32602`。
+- 空头（空串或全空白）等于没带，不会覆盖服务器配置。
+- 只带 provider 专属 key 头、却没选中该 provider（`x-mmgrep-asr-provider` 缺失且服务器 provider 为 `none`）时，该头不会自动启用 provider。
+- 这些头的**值**不写日志、不进缓存、不出现在响应里；日志中出现的头值统一替换为 `[redacted]`。
+
 ---
 
 ## 13. 与上游 `dsh-video-storyboard` 的差异
@@ -1387,7 +1450,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 |---|---|---|---|
 | 1 | 按**媒体**命名：`video_probe` / `video_storyboard` / `video_zoom` / `video_locate` / `video_subtitles` | 按**动作**命名：`media_probe` / `media_overview` / `media_zoom` / `media_locate` / `video_subtitles` | 跨媒体复用：同一动作在视频 / 录音 / 文档上语义一致，agent 学一套动词就够。`video_storyboard` → `media_overview`（"storyboard" 是视频特有的词，录音没故事板）。`video_subtitles` 是唯一保留媒体前缀的，因为「字幕轨 / 字幕文件」本身就是媒体专属概念 |
 | 2 | 参数名 `input` | 参数名 `path` | `path` 直接表达「本地路径」这条硬约束；`input` 什么都能装 |
-| 3 | `input` 接受 http(s) 链接；另有 `cookies` / `allowAnonymous` / `quality` / `scanHeight` / `zoomHeight` / `size` | **全部删除** | server 不做取数、不碰凭据。这些参数是为 yt-dlp 下载链路的清晰度服务的，本地文件用不上 |
+| 3 | `input` 接受 http(s) 链接；另有 `cookies` / `allowAnonymous` / `quality` / `scanHeight` / `zoomHeight` / `size` | **全部删除** | server 不做取数、不碰 cookie、不下载。这些参数是为 yt-dlp 下载链路的清晰度服务的，本地文件用不上 |
 | 4 | `from` / `to` | `start` / `end` | 与 `at`（时刻）、`pages`（页码）在语义上更整齐；`from` 在 JS/DB 里含义太多 |
 | 5 | 无 `pages` | 新增 `pages` | 文档没有「秒」，只有页码。上游完全没有文档概念 |
 | 6 | 无裁切参数（只有字幕用的 `band`） | 新增 `crop` | 特写的核心能力就是取局部 |
@@ -1420,7 +1483,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | URL 解析与下载（yt-dlp 集成） | `src/storyboard/fetch.js`（`resolveInput`）、`src/storyboard/ytdlp.js`、`src/storyboard/direct-url.js` | server 不做取数。取数在取数层（skills / 其它 agent），本 server 只处理已经落到本地的文件 |
 | 浏览器时间线抓取 | `src/storyboard/browser-time.js` | 同上，属取数层 |
 | 站点字幕轨抓取（如 C 站 CC） | `src/storyboard/subtitles.js`（`fetchRemoteSubtitles`） | 同上 |
-| cookies / `allowAnonymous` / `DSH_VIDEO_COOKIES` | `src/storyboard/tool-spec.js` | 不碰凭据 |
+| cookies / `allowAnonymous` / `DSH_VIDEO_COOKIES` | `src/storyboard/tool-spec.js` | 不碰 cookie |
 | 下载清晰度控制（`quality` / `scanHeight` / `zoomHeight` / `size`） | 同上 | 本地文件永远读原分辨率，这些旋钮无意义 |
 | 硬字幕带裁切（把画面上的字幕裁成竖长图） | `src/storyboard/subtitle-strip.js` | 与本契约 `video_subtitles` 的语义不同（见 §13.1 #16）。作为 `media_zoom` + `crop` 的后置项 |
 | 字幕带自动检测（`band` 参数 + 检测逻辑） | `src/storyboard/subtitle-strip.js` | 同上 |

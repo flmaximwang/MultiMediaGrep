@@ -11,7 +11,7 @@
 
 | 是 | 不是 |
 |---|---|
-| 一个 **stdio MCP server**，只吃**本地绝对路径** | 不下载、不检索、不登录、不碰 cookie / 凭据（取数属于 IntelligenceAtlas） |
+| 一个 **MCP server**（默认 stdio，可选 Streamable HTTP），只吃**本地绝对路径** | 不下载、不检索、不登录、不替你取数（取数属于 IntelligenceAtlas） |
 | 只做「材料化」：出图 + 出带时间码/页码的文本清单 | 不调 LLM：不做总结、不做问答、不做转述 |
 | ASR 与文档解析/OCR 走**你自己配**的外部服务与 key | 不内置本地 ASR / OCR 模型（mlx-whisper、rapidocr 都不再维护） |
 | 缓存只写自己的缓存目录 | **绝不在你的文件旁边写任何东西** |
@@ -96,8 +96,62 @@ npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.1.0/
 > 从 GitHub 源码装会把整个仓库拉下来（源码与文档），首次安装比 npm 慢；
 > release 里的 `.tgz` 只含运行时（src + 署名材料）。
 
-**只有 stdio 传输。** 没有 HTTP / SSE 端点，也没有 `--port` 之类的开关——它被谁拉起、怎么拉起，
-由 MCP client 决定。
+**stdio 是默认传输方式；HTTP 是显式开启的选项。** 不传 `--http`、也不设 `MMGREP_TRANSPORT=http`
+时，server 不会监听任何端口，仍由 MCP client 用 stdio 拉起——现有配置不需要任何改动。
+HTTP 模式见下一节。
+
+---
+
+## HTTP 模式
+
+不想让宿主用 stdio 拉起、或要让同一台机器上的多个进程共用一个 server 时，用 Streamable HTTP：
+
+```bash
+# 默认只监听 127.0.0.1:3927；stdio 仍是默认，必须显式 --http
+npx -y multimediagrep-mcp --http
+
+# 换个端口，并设置 Bearer 令牌（设置后每个请求都要带 Authorization）
+npx -y multimediagrep-mcp --http --port 4000 --token '<你的令牌>'
+
+# 也可以用环境变量（命令行优先于环境变量）
+MMGREP_TRANSPORT=http MMGREP_HTTP_PORT=4000 MMGREP_HTTP_TOKEN='<你的令牌>' \
+  npx -y multimediagrep-mcp
+```
+
+- 端点固定为 `POST /mcp`，默认地址 `http://127.0.0.1:3927/mcp`；`GET /mcp` → 405，
+  其它路径 → 404。配了令牌时，未授权的请求在判断方法之前就先回 401。
+- 启动横幅会写实际地址和 `auth: bearer set|unset`（只报有没有配，不打印令牌值）。
+- 请求必须同时接受 JSON 和 SSE：`Accept: application/json, text/event-stream`；
+  `Content-Type: application/json`。缺了分别回 406 / 415。
+- 令牌只从 `Authorization: Bearer <令牌>` 读，不接受 query string（`?token=` 会被忽略并回 401）。
+- HTTP 模式是**无状态**的：每个请求独立处理，不在内存里保留会话。
+
+最小宿主配置（Claude Code 的 `claude mcp add`）：
+
+```bash
+claude mcp add --scope user --transport http multimediagrep \
+  http://127.0.0.1:3927/mcp \
+  --header "Authorization: Bearer <你的令牌>"
+```
+
+通用 JSON 形状（多数宿主叫 `mcpServers`；可复制的一份见
+[`examples/mcp-config-http.json`](examples/mcp-config-http.json)）：
+
+```json
+{
+  "mcpServers": {
+    "multimediagrep": {
+      "type": "http",
+      "url": "http://127.0.0.1:3927/mcp",
+      "headers": { "Authorization": "Bearer <你的令牌>" }
+    }
+  }
+}
+```
+
+> 监听非回环地址（如 `--host 0.0.0.0`）时必须配令牌。没配时 server **仍会启动**，只在启动横幅里
+> 记一条 warning，端点对所有能连到该地址的人开放。不要在没有 TLS 的网络上裸跑；
+> 反向代理与 curl 自测见 [`docs/install.md` §2.6](docs/install.md)。
 
 ---
 
@@ -157,6 +211,40 @@ hermes mcp add multimediagrep \
 可复制的一份见 [`examples/mcp-config.json`](examples/mcp-config.json)，
 各宿主的完整写法见 [`docs/install.md`](docs/install.md) §2。
 
+### 每请求凭据（仅 HTTP 模式）
+
+HTTP 端点常被多个调用方共用，provider 的 key 不必都写死在 server 的环境变量里：
+每个请求可以在头里临时覆盖 ASR / 文档解析的 provider、key、基址和模型。
+
+| 请求头 | 作用 | 对应环境变量 |
+|---|---|---|
+| `x-mmgrep-asr-provider` | 本次请求用哪个 ASR provider：`elevenlabs` / `openai-compatible` | `MMGREP_ASR_PROVIDER` |
+| `x-mmgrep-elevenlabs-api-key` | ElevenLabs key | `MMGREP_ELEVENLABS_API_KEY` |
+| `x-mmgrep-elevenlabs-base-url` | ElevenLabs 基址 | `MMGREP_ELEVENLABS_BASE_URL` |
+| `x-mmgrep-elevenlabs-model` | ElevenLabs 模型 | `MMGREP_ELEVENLABS_MODEL` |
+| `x-mmgrep-openai-compatible-api-key` | OpenAI 兼容服务的 key | `MMGREP_OPENAI_COMPATIBLE_API_KEY` |
+| `x-mmgrep-openai-compatible-base-url` | OpenAI 兼容服务的基址 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` |
+| `x-mmgrep-openai-compatible-model` | OpenAI 兼容服务的模型 | `MMGREP_OPENAI_COMPATIBLE_MODEL` |
+| `x-mmgrep-asr-api-key` | 通用兜底 key（旧共用变量语义） | `MMGREP_ASR_API_KEY` |
+| `x-mmgrep-doc-provider` | 本次请求用哪个文档解析 provider（`mineru`） | `MMGREP_DOC_PROVIDER` |
+| `x-mmgrep-mineru-api-key` | MinerU token | `MMGREP_MINERU_API_KEY` |
+| `x-mmgrep-mineru-base-url` | MinerU 基址 | `MMGREP_MINERU_BASE_URL` |
+| `x-mmgrep-mineru-model` | MinerU 模型 | `MMGREP_MINERU_MODEL` |
+| `x-mmgrep-doc-api-key` | 通用兜底 token（旧共用变量语义） | `MMGREP_DOC_API_KEY` |
+
+优先级（逐字段）：该 provider 的专属请求头 > 通用 `x-mmgrep-<kind>-api-key`（只作用于 key）>
+该 provider 的环境变量 > 服务器启动配置（仅当 provider 相同）> provider 内置默认值。
+请求头切换 provider 后只读新 provider 的变量组，不会借用另一个 provider 的 key；
+头里写了未知的 provider id → HTTP 400（JSON-RPC `-32602`）。空头（空串 / 全空白）等于没带。
+
+要让某个 provider 的专属头生效，得先用 `x-mmgrep-asr-provider` / `x-mmgrep-doc-provider`
+选中它（或服务器本身就选了同一个）。只带 provider 专属 key 头、provider 仍是 `none` 时，
+这个头不会自动启用 provider；**provider 的选择只对当前请求生效**。
+
+**安全**：这些头的值只活在本次请求里——不写日志、不进缓存、不出现在响应里。server 会把本次请求
+带过的所有凭据头值从日志里替换成 `[redacted]`。不要把真实 key 写进多人共享的客户端配置：
+更稳妥的做法是让宿主连一个你自己控制的代理，由代理注入凭据头。
+
 ---
 
 ## 给第一次来的 agent：5 分钟上手
@@ -188,6 +276,10 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 
 | 变量 | 默认值 | 作用 |
 |---|---|---|
+| `MMGREP_TRANSPORT` | `stdio` | 传输方式：`stdio`（默认）或 `http`。`http` 时监听 `POST /mcp`；写错回落 `stdio` 并记 warning |
+| `MMGREP_HTTP_HOST` | `127.0.0.1` | HTTP 监听地址。非回环地址必须配令牌；没配时只记 warning，端点仍会接受未认证请求 |
+| `MMGREP_HTTP_PORT` | `3927` | HTTP 监听端口（1–65535；非法值回落 `3927`） |
+| `MMGREP_HTTP_TOKEN` | 空 | Bearer 令牌。设置后每个请求必须带 `Authorization: Bearer <令牌>`；不接受 query string。令牌请用 ASCII 字符串 |
 | `MMGREP_CACHE_DIR` | `~/.cache/multimediagrep` | 缓存根目录（抽帧、页图、转写、全文落盘都在这）。`~` 会展开；相对路径按 cwd 解析 |
 | `MMGREP_CACHE_MAX_BYTES` | `10737418240`（10 GiB） | 缓存上限，支持 `512MB` / `10GB` / 纯字节数；超出按 LRU 淘汰 |
 | `MMGREP_ASR_PROVIDER` | `none` | ASR 后端：`none`（不转写）/ `elevenlabs` / `openai-compatible`。选定后只读该 provider 自己那组变量 |
@@ -208,6 +300,8 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 | `MMGREP_MAX_IMAGE_TOKENS` | `4000` | 单次调用的图片 token **软预算**。超了自动模式会降形，显式模式只警告 |
 | `MMGREP_MAX_IMAGE_EDGE` | `1600` | 单张图最长边的全局上限（px）。请求超过 → `BUDGET_EXCEEDED` |
 | `MMGREP_LOG_LEVEL` | `info` | 日志级别：`error` / `warn` / `info` / `debug`。日志**一律走 stderr**（stdout 是协议通道） |
+
+传输相关的命令行开关（`--http` / `--host` / `--port` / `--token`）优先于上表的环境变量。
 
 > 旧的 `MMGREP_ASR_API_KEY` / `MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 与
 > `MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL` 仍会在对应的
