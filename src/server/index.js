@@ -204,8 +204,16 @@ export function createServer(runtimeOrOptions = {}) {
   return server;
 }
 
-/** 启动信息（只写 stderr；绝不写 stdout） */
-export function logStartupBanner(runtime) {
+/**
+ * 启动信息（只写 stderr；绝不写 stdout）。
+ *
+ * @param {object} runtime
+ * @param {object} [options]
+ * @param {string} [options.url] HTTP 模式下的真实地址；不给就走原来的 stdio 横幅（逐字不变）
+ * @param {boolean} [options.tokenSet] 是否配了 Bearer 令牌（**只说 set / unset，不说值**）
+ * @param {string|null} [options.warn] 需要额外提醒的一行（例如对外暴露且没有令牌）
+ */
+export function logStartupBanner(runtime, options = {}) {
   const { logger, config, backends } = runtime;
   const backendLabels = Object.entries(backends ?? {})
     .map(([mediaType, backend]) => {
@@ -213,7 +221,13 @@ export function logStartupBanner(runtime) {
       return `${mediaType}=${status?.placeholder === false ? 'ready' : 'placeholder'}`;
     })
     .join(' ');
-  logger.info(`${config.server.name}@${config.server.version} ready on stdio`);
+  if (options.url) {
+    logger.info(`${config.server.name}@${config.server.version} ready on ${options.url}`);
+    logger.info(`auth: bearer ${options.tokenSet ? 'set' : 'unset'}`);
+    if (options.warn) logger.warn(options.warn);
+  } else {
+    logger.info(`${config.server.name}@${config.server.version} ready on stdio`);
+  }
   logger.info(`cache: ${config.cache.dir} (max ${config.cache.maxBytes} bytes)`);
   logger.info(`asr: ${config.asr.provider}${config.asr.apiKey ? '' : ' (no API key)'} · doc: ${config.doc.provider} · ocr: ${config.ocr.provider}`);
   logger.info(`backends: ${backendLabels || '(none)'}`);
