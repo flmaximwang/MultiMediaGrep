@@ -1041,6 +1041,122 @@ function generateSampleImage(outDir) {
 }
 
 // ---------------------------------------------------------------------------
+// sample-mixed.pdf  (page 1 is an image-only cover; pages 2+ have a text layer)
+//
+// 这是「图片封面 + 数字正文」这一最常见形态的回归素材：只看第 1 页会把整份
+// 文档误判成没有文字层。
+// ---------------------------------------------------------------------------
+
+const MIXED_COVER_WIDTH_PX = 1240;
+const MIXED_COVER_HEIGHT_PX = 1754; // A4 at 150 dpi
+
+const MIXED_TEXT_PAGES = [
+  {
+    page: 2,
+    title: 'BODY PAGE ONE',
+    lines: [
+      'PAGE 2 HAS A REAL TEXT LAYER.',
+      'THE COVER PAGE BEFORE IT IS AN IMAGE ONLY.',
+      'A DOC MUST NOT BE CALLED TEXTLESS BECAUSE OF PAGE ONE.',
+    ],
+  },
+  {
+    page: 3,
+    title: 'BODY PAGE TWO',
+    lines: [
+      'THIRD PAGE OF THE MIXED FIXTURE.',
+      'ALPHA BRAVO CHARLIE DELTA.',
+      'ONE TWO THREE FOUR FIVE.',
+    ],
+  },
+  {
+    page: 4,
+    title: 'BODY PAGE THREE',
+    lines: [
+      'LAST PAGE OF THE MIXED FIXTURE.',
+      'THIS PAGE ALSO CARRIES A TEXT LAYER.',
+      'END OF DOCUMENT.',
+    ],
+  },
+];
+
+function generateSampleMixedPdf(outDir) {
+  const tmpDir = path.join(outDir, '.tmp-mixed');
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  // Page 1: image-only cover (an image page carries no /Font resource → no text layer).
+  const coverRaster = new Raster(MIXED_COVER_WIDTH_PX, MIXED_COVER_HEIGHT_PX, [244, 241, 235]);
+  const coverLines = [];
+  const coverTitle = coverRaster.drawText('MIXED FIXTURE COVER', 120, 200, { scale: 6, color: [18, 18, 18] });
+  coverLines.push({ text: 'MIXED FIXTURE COVER', box: coverTitle });
+  const coverNote = coverRaster.drawText('THIS COVER PAGE IS AN IMAGE ONLY.', 120, 320, { scale: 3, color: [30, 30, 30] });
+  coverLines.push({ text: 'THIS COVER PAGE IS AN IMAGE ONLY.', box: coverNote });
+  const coverPng = encodePNG(MIXED_COVER_WIDTH_PX, MIXED_COVER_HEIGHT_PX, coverRaster.toRGB());
+  const coverPngPath = path.join(tmpDir, 'cover.png');
+  const coverJpgPath = path.join(tmpDir, 'cover.jpg');
+  fs.writeFileSync(coverPngPath, coverPng);
+  pngToJPEG(coverPngPath, coverJpgPath, { quality: 2 });
+  const coverJpeg = fs.readFileSync(coverJpgPath);
+
+  const pages = [
+    {
+      kind: 'image',
+      width: PDF_WIDTH,
+      height: PDF_HEIGHT,
+      imageWidth: MIXED_COVER_WIDTH_PX,
+      imageHeight: MIXED_COVER_HEIGHT_PX,
+      jpeg: coverJpeg,
+    },
+  ];
+  const pageTruth = [{ page: 1, lines: coverLines, table: null, hasTextLayer: false }];
+
+  for (const spec of MIXED_TEXT_PAGES) {
+    const ops = [];
+    const textOps = [];
+    const lines = [];
+    const titleY = PDF_HEIGHT - PDF_MARGIN;
+    ops.push(pdfTextOp(PDF_MARGIN, titleY, spec.title, { font: 'F2', size: 16 }));
+    lines.push({ text: spec.title, xPt: PDF_MARGIN, yPt: titleY, font: 'F2', size: 16 });
+    textOps.push({ text: spec.title, xPt: PDF_MARGIN, yPt: titleY });
+
+    spec.lines.forEach((text, i) => {
+      const y = titleY - 30 - i * 20;
+      ops.push(pdfTextOp(PDF_MARGIN, y, text, { font: 'F1', size: 11 }));
+      lines.push({ text, xPt: PDF_MARGIN, yPt: y, font: 'F1', size: 11 });
+      textOps.push({ text, xPt: PDF_MARGIN, yPt: y });
+    });
+
+    pages.push({ kind: 'text', width: PDF_WIDTH, height: PDF_HEIGHT, ops, fonts: ['F1', 'F2'] });
+    pageTruth.push({ page: spec.page, lines, textOps, hasTextLayer: true });
+  }
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+
+  const pdf = buildPDF({ pages });
+  writeFile(outDir, 'sample-mixed.pdf', pdf);
+
+  return {
+    id: 'sample-mixed-pdf',
+    kind: 'pdf',
+    file: 'sample-mixed.pdf',
+    generator: 'fixtures/generate.mjs',
+    pageCount: pages.length,
+    pageWidthPt: PDF_WIDTH,
+    pageHeightPt: PDF_HEIGHT,
+    marginPt: PDF_MARGIN,
+    hasTextLayer: true,
+    coverPage: 1,
+    textLayerPages: MIXED_TEXT_PAGES.map((spec) => spec.page),
+    noTextLayerPages: [1],
+    imageWidthPx: MIXED_COVER_WIDTH_PX,
+    imageHeightPx: MIXED_COVER_HEIGHT_PX,
+    imageFormat: 'jpeg',
+    jpegQuality: 2,
+    pages: pageTruth,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // optional: macOS `say` speech sample (skipped on other platforms)
 // ---------------------------------------------------------------------------
 
@@ -1126,6 +1242,7 @@ async function main() {
   groundTruths.push(generateSampleTextPdf(outDir));
   groundTruths.push(generateSampleScannedPdf(outDir));
   groundTruths.push(generateSampleImage(outDir));
+  groundTruths.push(generateSampleMixedPdf(outDir));
   const optional = generateOptionalSpeech(outDir);
   if (optional) groundTruths.push(optional);
 

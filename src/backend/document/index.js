@@ -225,7 +225,15 @@ async function inspectDocument(filePath, ctx, pdfSupport, cache) {
   let width = null;
   let height = null;
   let unit = null;
+  // null = 判不出来（本机没有文字抽取器），与「这份文档没有文字层」是两件事。
   let hasTextLayer = false;
+  let textLayer = {
+    checked: false,
+    reason: null,
+    sampledPages: [],
+    checkedPages: [],
+    textPage: null,
+  };
 
   if (classified.kind === 'pdf') {
     const meta = await pdfSupport.readMetadata(filePath, { signal: ctx.signal });
@@ -240,17 +248,28 @@ async function inspectDocument(filePath, ctx, pdfSupport, cache) {
         height = measured.height;
       }
     }
-    const sampled = await pdfSupport.sampleHasText(filePath, { signal: ctx.signal });
-    hasTextLayer = sampled.hasText;
+    // 采样首页 / 中间页 / 末页：图片封面 + 数字正文也是「有文字层」。
+    const sampled = await pdfSupport.sampleHasText(filePath, { pageCount, signal: ctx.signal });
+    const reason = sampled.reason ?? null;
+    hasTextLayer = reason ? null : Boolean(sampled.hasText);
+    textLayer = {
+      checked: reason === null,
+      reason,
+      sampledPages: sampled.sampledPages ?? [],
+      checkedPages: sampled.checkedPages ?? [],
+      textPage: sampled.textPage ?? null,
+    };
   } else if (classified.kind === 'image') {
     const size = await readImageSize(filePath, { signal: ctx.signal });
     width = size.width;
     height = size.height;
     unit = 'px';
     hasTextLayer = false;
+    textLayer = { checked: true, reason: null, sampledPages: [], checkedPages: [], textPage: null };
   } else {
     // 纯文本：一页，没有像素尺寸，但「文字层」恒为真（任务口径）。
     hasTextLayer = true;
+    textLayer = { checked: true, reason: null, sampledPages: [], checkedPages: [], textPage: null };
   }
 
   const info = {
@@ -262,6 +281,7 @@ async function inspectDocument(filePath, ctx, pdfSupport, cache) {
     height,
     unit,
     hasTextLayer,
+    textLayer,
   };
 
   if (cache.size >= INSPECT_CACHE_MAX) {
@@ -858,6 +878,15 @@ export function createDocumentBackend(ctx = {}) {
         transcriptSource,
         transcriptOrigin: transcriptSource,
         transcriptPath: null,
+        // 文字层探测的细节：采样了哪些页、命中的是哪一页、判不出来时的原因。
+        // hasTextLayer 只是汇总结论；这里给出「结论是怎么来的」。
+        textLayer: {
+          checked: info.textLayer?.checked ?? false,
+          reason: info.textLayer?.reason ?? null,
+          sampledPages: info.textLayer?.sampledPages ?? [],
+          checkedPages: info.textLayer?.checkedPages ?? [],
+          textPage: info.textLayer?.textPage ?? null,
+        },
       },
       recommended: recommendedFor(info),
     };
@@ -970,6 +999,31 @@ export function createDocumentBackend(ctx = {}) {
     };
   }
 
+  /**
+   * 逐页文字层结果 —— 「逐页路由」的输入：
+   * 有文字层的页可以按原样引用（typeset），没文字层的页才需要 OCR。
+   *
+   * @param {{path: string, pages?: number[]|null}} input pages 省略 = 整份文档
+   * @returns {Promise<{
+   *   pages: Map<number, {text: string, hasTextLayer: boolean}>,
+   *   textExtractor: string|null,
+   *   reason: string|null,
+   * }>}
+   */
+  async function pageTextLayers(input, callCtx = backendCtx()) {
+    const c = withSupport(callCtx);
+    const info = await inspectDocument(input.path, c, pdfSupport, inspectCache);
+    if (info.kind !== 'pdf') {
+      return {
+        pages: new Map(),
+        textExtractor: null,
+        reason: 'only PDF documents have a per-page text layer.',
+      };
+    }
+    const pages = normalizePages(input.pages ?? null, info.pageCount);
+    return pdfSupport.extractTextLayers(info.path, pages, { signal: c.signal });
+  }
+
   async function locate(input, callCtx = backendCtx()) {
     const c = withSupport(callCtx);
     const info = await inspectDocument(input.path, c, pdfSupport, inspectCache);
@@ -1076,7 +1130,7 @@ export function createDocumentBackend(ctx = {}) {
     };
   }
 
-  return { probe, overview, zoom, locate };
+  return { probe, overview, zoom, locate, pageTextLayers };
 }
 
 export default createDocumentBackend;

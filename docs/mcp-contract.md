@@ -364,7 +364,7 @@ path, and it only prepares images and text for your own model to look at.
 | `sampleRateHz` | integer \| null | 采样率 | Hz |
 | `audioHealth` | object \| null | 音频体检结果（video/audio 才有；见 §4.3.1） | — |
 | `pageCount` | integer \| null | 总页数（document） | 页 |
-| `hasTextLayer` | boolean \| null | 是否已有文字层（document） | — |
+| `hasTextLayer` | boolean \| null | 是否已有文字层（document；**采样**首页/中间页/末页的结论，见 §4.3.2；本机没有文字抽取器时为 `null` = 判不出来） | — |
 | `subtitleTracks` | array | 内嵌字幕轨 | — |
 | `subtitleTracks[].index` | integer | 轨道序号 | — |
 | `subtitleTracks[].language` | string \| null | 语言标签（BCP-47，可能为 null） | — |
@@ -381,6 +381,11 @@ path, and it only prepares images and text for your own model to look at.
 | `capabilities.transcriptOrigin` | `"file"` \| `"embedded"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道（外部文件 / 内嵌轨 / ASR / OCR） | — |
 | `capabilities.transcriptPath` | string \| null | 若来源是文件，具体是哪个文件 | — |
 | `capabilities.transcriptReason` | string \| null | 文件里有字幕轨、但本次没有用上时的可读原因（如只剩图形字幕轨）；与 `warnings` 中的条目同源 | — |
+| `capabilities.textLayer.checked` | boolean | 是否真的查过文字层（document） | — |
+| `capabilities.textLayer.reason` | string \| null | 判不出来时的原因（本机没装文字抽取器）；与「这份文档没有文字层」不是一回事 | — |
+| `capabilities.textLayer.sampledPages` | integer[] | 计划采样的页码，按采样顺序 | 页 |
+| `capabilities.textLayer.checkedPages` | integer[] | 实际读过的采样页（提前返回时比 `sampledPages` 短） | 页 |
+| `capabilities.textLayer.textPage` | integer \| null | 第一个读到文字的采样页（`null` = 全部采样页都空，或根本没查） | 页 |
 | `recommended.mode` | `"single"` \| `"sequence"` | 短素材一次读完 / 长素材分段读 | — |
 | `recommended.segmentSec` | integer | 分段读时的建议窗口长度 | s |
 | `recommended.overviewImages` | integer | 建议的 overview 图片数 | 张 |
@@ -414,6 +419,21 @@ path, and it only prepares images and text for your own model to look at.
 **静音判定用的短时门限是 `-45 dBFS`**（短时 RMS 低于它算静音段），`speechRatio` 按此统计。
 
 `effective = false` 时，`media_overview` / `media_locate` **不会**调用 ASR，而是返回空转写 + 明确原因。agent 应据此改用「只看画面」或要求用户换一份更清楚的录音。
+
+#### 4.3.2 文字层探测（`hasTextLayer` / `capabilities.textLayer`）
+
+文档的「有没有文字层」是**采样**结论，不是逐页保证：
+
+- 采样页 = 首页 / 中间页（`ceil(n/2)`）/ 末页，按这个顺序去重（`n ≤ 2` 时自然退化）。
+- 任一采样页有非空文字 → `hasTextLayer = true`，并在该页**提前结束**采样（`capabilities.textLayer.checkedPages` 只记读到的那几页）。
+- 全部采样页都空 → `hasTextLayer = false`（全篇扫描件仍然是这个结论）。
+- 本机**一个文字抽取器都没装**（pdftotext / mutool）→ `hasTextLayer = null`（= **判不出来**，不是「没有文字层」），`capabilities.textLayer.reason` 写明原因。
+
+为什么不能只看第 1 页：图片封面 / 扫描信笺头 / 期刊 cover page 后面接数字正文，是极常见的 PDF 形态。只看第 1 页会把这种文档误判成「只能靠 OCR」，而 OCR provider 往往根本没配，于是一本能直接抽全文的文档被判死。
+
+**逐页**结论不在这个探针字段上，而在抽取路径上：`media_overview` / `media_locate` 逐页拿文字层（有文字层的页可以按原样引用，没有的才需要 OCR）。
+
+文本输出里的 `textLayer="..."` 属性随探针文案一并调整（见 9z5.21）：`null` 要渲染成 `unknown`，不能渲染成 `no` —— 否则等于在说「这份 PDF 没有文字层」。
 
 ### 4.4 文本输出形态
 
