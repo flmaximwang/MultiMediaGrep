@@ -18,7 +18,12 @@ import http from 'node:http';
 
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
-import { createServer as createMcpServer } from './index.js';
+import {
+  credentialHeaderValues,
+  presentCredentialHeaders,
+  resolveConfigForRequest,
+} from './credentials.js';
+import { createServer as createMcpServer, loadProviders } from './index.js';
 
 /** MCP 端点路径 */
 export const HTTP_PATH = '/mcp';
@@ -120,6 +125,72 @@ export function formatHostForUrl(host) {
   return text;
 }
 
+/** JSON-RPC 请求的 id（批量 / 非对象请求回 null） */
+function requestId(parsed) {
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') return null;
+  return parsed.id ?? null;
+}
+
+function safeStringify(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * 给请求级日志套一层脱敏：本次请求带过的**所有**凭据头值（key / base URL / model /
+ * provider id）一律替换成 [redacted]。
+ *
+ * 为什么连 provider id、baseUrl 也屏蔽：安全要求是「日志里不出现任何请求头的值」，
+ * 不只是 key；而 provider 工厂 / 工具层的报错文本未必知道哪些片段来自请求头。
+ */
+function createRequestLogger(logger, values) {
+  if (!logger || values.length === 0) return logger;
+  const redact = (text) => {
+    let out = String(text);
+    for (const value of values) out = out.split(value).join('[redacted]');
+    return out;
+  };
+  const mapArg = (arg) => (typeof arg === 'string' ? redact(arg) : redact(safeStringify(arg)));
+  const wrap = (method) => (typeof logger[method] === 'function'
+    ? (...args) => logger[method](...args.map(mapArg))
+    : () => {});
+  return {
+    level: logger.level,
+    error: wrap('error'),
+    warn: wrap('warn'),
+    info: wrap('info'),
+    debug: wrap('debug'),
+  };
+}
+
+/**
+ * 为「带了凭据头」的请求造一份独立 runtime。
+ *
+ * 共享的东西：cache、logger（外面套脱敏）、backends、dispatcher；它们不含凭据状态，
+ * 重建反而会丢掉缓存。
+ * 重建的东西：config 与 asr / doc provider——provider 持有 apiKey 闭包，必须逐请求新建，
+ * **绝不按 key / 头做缓存**，否则明文密钥会在内存里活过这次请求。
+ */
+async function createRequestRuntime(runtime, config, headers, env, logger = runtime?.logger) {
+  const requestLogger = createRequestLogger(logger, credentialHeaderValues(headers));
+  const names = presentCredentialHeaders(headers);
+  requestLogger?.info?.(
+    `http: applying per-request credentials (${names.join(', ')}); providers are built for this request only.`,
+  );
+  const providers = await loadProviders(config, env, requestLogger, { pinCredentials: true });
+  return {
+    ...runtime,
+    config,
+    logger: requestLogger,
+    asrProvider: providers.asrProvider,
+    docProvider: providers.docProvider,
+    providerErrors: providers.providerErrors,
+  };
+}
+
 /**
  * 处理一个已经解析好的 POST /mcp。
  *
@@ -128,8 +199,35 @@ export function formatHostForUrl(host) {
 async function handleMcpPost(req, res, ctx) {
   const { runtime, logger, serverFactory, parsed, timeoutMs } = ctx;
 
+  // 先算「本请求的凭据覆盖」，再碰任何 provider：provider id 写错是客户端的参数问题，
+  // 必须在建 server / 构造 provider 之前就回 400。
+  let requestRuntime = runtime;
+  const headers = req.headers ?? {};
+  const present = presentCredentialHeaders(headers);
+  if (present.length > 0) {
+    try {
+      const env = runtime?.env ?? process.env;
+      const config = resolveConfigForRequest(runtime?.config ?? {}, headers, env);
+      requestRuntime = await createRequestRuntime(runtime, config, headers, env, logger);
+    } catch (error) {
+      if (error?.code === 'INVALID_ARGUMENT') {
+        // 这条消息只含 provider id 与允许值（由 credentials.js 构造），不含任何 key。
+        sendJson(res, 400, jsonRpcError(`Invalid params: ${error.message}`, -32602, requestId(parsed)));
+      } else {
+        // 不记录 error.message：它可能带着请求头里的某个值；只记错误类型。
+        createRequestLogger(logger, credentialHeaderValues(headers))?.error?.(
+          `http: per-request credentials could not be applied (${error?.name ?? 'Error'}).`,
+        );
+        sendJson(res, 500, jsonRpcError('Internal error.'));
+      }
+      return;
+    }
+  }
+
+  const log = requestRuntime.logger ?? logger;
+
   // 用的是 stdio 那条路同一个工厂：同一个 runtime，同一批工具定义。
-  const server = serverFactory(runtime);
+  const server = serverFactory(requestRuntime);
   const transport = new StreamableHTTPServerTransport({
     // undefined = 无会话：server 不生成 sessionId，也不校验 Mcp-Session-Id 头
     sessionIdGenerator: undefined,
@@ -147,7 +245,7 @@ async function handleMcpPost(req, res, ctx) {
       // SDK 随即 abort 在途请求的 AbortController——工具调用因此能感知到取消。
       await server.close();
     } catch (error) {
-      logger?.warn(`http: error while closing the per-request server: ${error?.message ?? error}`);
+      log?.warn(`http: error while closing the per-request server: ${error?.message ?? error}`);
     }
   };
 
@@ -167,7 +265,7 @@ async function handleMcpPost(req, res, ctx) {
   let settleTimeout;
   const timeoutPromise = new Promise((resolve) => { settleTimeout = resolve; });
   const timer = setTimeout(() => {
-    logger?.warn('http: the request timed out; the in-flight tool call was aborted.');
+    log?.warn('http: the request timed out; the in-flight tool call was aborted.');
     // 关掉 transport → SDK abort 在途请求 → 工具调用收到 AbortSignal
     void closeOnce();
     if (!res.headersSent) sendJson(res, 504, jsonRpcError('Request timed out.'));
@@ -177,7 +275,7 @@ async function handleMcpPost(req, res, ctx) {
   try {
     await Promise.race([
       transport.handleRequest(req, res, parsed).catch((error) => {
-        logger?.warn(`http: the MCP transport failed: ${error?.message ?? error}`);
+        log?.warn(`http: the MCP transport failed: ${error?.message ?? error}`);
         if (!res.headersSent) sendJson(res, 500, jsonRpcError('Internal error.'));
       }),
       timeoutPromise,
