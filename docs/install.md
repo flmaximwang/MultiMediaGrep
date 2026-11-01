@@ -211,7 +211,7 @@ MMGREP_TRANSPORT=http MMGREP_HTTP_HOST=127.0.0.1 MMGREP_HTTP_PORT=43927 \
 （包括 `0.0.0.0`）时，必须设置 `--token` / `MMGREP_HTTP_TOKEN`。注意：server **不会拒绝启动**，
 只会在启动横幅里记一条 warning——没配令牌的端点对任何能连到该地址的人开放。
 令牌只认 `Authorization: Bearer <令牌>`，query string 里的令牌会被忽略（仍然回 401）。
-令牌请用 **ASCII** 字符串：Node 的 HTTP 头按 latin1 解码，非 ASCII 令牌会一直回 401。
+令牌可以是任意 UTF-8 字符串（服务端按原始字节比较）。
 
 **不要在没有 TLS 的网络上裸跑。** 让 server 继续监听 `127.0.0.1`，由反向代理终结 TLS：
 

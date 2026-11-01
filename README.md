@@ -279,7 +279,7 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 | `MMGREP_TRANSPORT` | `stdio` | 传输方式：`stdio`（默认）或 `http`。`http` 时监听 `POST /mcp`；写错回落 `stdio` 并记 warning |
 | `MMGREP_HTTP_HOST` | `127.0.0.1` | HTTP 监听地址。非回环地址必须配令牌；没配时只记 warning，端点仍会接受未认证请求 |
 | `MMGREP_HTTP_PORT` | `3927` | HTTP 监听端口（1–65535；非法值回落 `3927`） |
-| `MMGREP_HTTP_TOKEN` | 空 | Bearer 令牌。设置后每个请求必须带 `Authorization: Bearer <令牌>`；不接受 query string。令牌请用 ASCII 字符串 |
+| `MMGREP_HTTP_TOKEN` | 空 | Bearer 令牌。设置后每个请求必须带 `Authorization: Bearer <令牌>`；不接受 query string。令牌可以是任意 UTF-8 字符串 |
 | `MMGREP_CACHE_DIR` | `~/.cache/multimediagrep` | 缓存根目录（抽帧、页图、转写、全文落盘都在这）。`~` 会展开；相对路径按 cwd 解析 |
 | `MMGREP_CACHE_MAX_BYTES` | `10737418240`（10 GiB） | 缓存上限，支持 `512MB` / `10GB` / 纯字节数；超出按 LRU 淘汰 |
 | `MMGREP_ASR_PROVIDER` | `none` | ASR 后端：`none`（不转写）/ `elevenlabs` / `openai-compatible`。选定后只读该 provider 自己那组变量 |

@@ -10,7 +10,8 @@
 // 安全约定（改这个文件前请先读完这三条）：
 //   1. 令牌只从 Authorization 头读，**绝不**从 query string 读——query 会进访问日志、
 //      进浏览器历史、进代理日志，是泄漏令牌最常见的姿势；
-//   2. **任何请求头都不打日志**：后续请求头里会带 provider 的 API key，一行日志就能泄底；
+//   2. **任何请求头的值都不打日志**（只记头名）：后续请求头里会带 provider 的 API key，
+//      一行日志就能泄底；key 值另有一层脱敏兜底；
 //   3. 令牌值本身永远不出现在日志里，只说 set / unset。
 
 import crypto from 'node:crypto';
@@ -19,7 +20,7 @@ import http from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
 import {
-  credentialHeaderValues,
+  REQUEST_HEADERS,
   presentCredentialHeaders,
   resolveConfigForRequest,
 } from './credentials.js';
@@ -49,20 +50,35 @@ function sendJson(res, status, payload, extraHeaders = {}) {
   res.end(body);
 }
 
+/** 只削掉 ASCII 空白（HTTP 头里的 OWS 只可能是空格 / 制表符）。
+ *
+ * 为什么不用 String#trim()：令牌允许任意 UTF-8。node:http 把请求头按 latin1 解码，
+ * 一个字节对应一个字符；UTF-8 字节 0xA0 会变成 U+00A0（NBSP），而 trim() 把 NBSP
+ * 当空白削掉——令牌里恰好含这个字节（很多多字节字符的末字节就是 0xA0）就会被悄悄改写。
+ */
+function trimAsciiWhitespace(text) {
+  return text.replace(/^[ \t]+|[ \t]+$/g, '');
+}
+
 /**
  * 校验 Bearer 令牌。
  *
  * 用 crypto.timingSafeEqual 比较：等长才比，长度不同直接判否（timingSafeEqual 对
  * 不等长会抛异常）。没配令牌时一律放行——「没配令牌」和「令牌校验通过」是两回事，
  * 但结果一样是允许请求。
+ *
+ * 为什么要显式做 latin1 → 原始字节的还原：node:http 按 latin1 解码请求头值，收到的
+ * 字符串里每个字符对应一个原始字节。若直接 Buffer.from(provided, 'utf8')，非 ASCII
+ * 令牌（如「测试令牌」）会被二次编码，永远匹配不上。这里按 latin1 还原出客户端发来的
+ * UTF-8 字节，再与期望令牌的 UTF-8 字节逐字节比较。
  */
 export function isAuthorized(req, token) {
   if (!token) return true;
   const header = req.headers.authorization;
   if (typeof header !== 'string') return false;
-  const match = /^Bearer[ \t]+(.+)$/i.exec(header.trim());
+  const match = /^Bearer[ \t]+(.+)$/i.exec(trimAsciiWhitespace(header));
   if (!match) return false;
-  const provided = Buffer.from(match[1].trim(), 'utf8');
+  const provided = Buffer.from(trimAsciiWhitespace(match[1]), 'latin1');
   const expected = Buffer.from(token, 'utf8');
   if (provided.length !== expected.length) return false;
   return crypto.timingSafeEqual(provided, expected);
@@ -140,17 +156,51 @@ function safeStringify(value) {
 }
 
 /**
- * 给请求级日志套一层脱敏：本次请求带过的**所有**凭据头值（key / base URL / model /
- * provider id）一律替换成 [redacted]。
+ * 本请求里真正算「秘密」的头值：只有 api-key（provider 专属 + 通用兜底两种）。
  *
- * 为什么连 provider id、baseUrl 也屏蔽：安全要求是「日志里不出现任何请求头的值」，
- * 不只是 key；而 provider 工厂 / 工具层的报错文本未必知道哪些片段来自请求头。
+ * 为什么不再把 provider id / baseUrl / model 也当敏感值：它们不是秘密，而且 provider id
+ * 往往就是头名的一部分（`x-mmgrep-elevenlabs-api-key`）——把 elevenlabs 当子串替换，
+ * 日志里就会冒出 `x-mmgrep-[redacted]-api-key`，头名被毁，排查时就不知道是哪个头了。
+ * 值一律去空白后再收集，与 credentials.js 的读取口径一致。
  */
-function createRequestLogger(logger, values) {
-  if (!logger || values.length === 0) return logger;
+function secretHeaderValues(headers) {
+  // 与 credentials.js 的 normalizeHeaders 同口径：键转小写，同名只取第一个字符串值。
+  const normalized = Object.create(null);
+  for (const [key, value] of Object.entries(headers ?? {})) {
+    if (typeof value !== 'string') continue;
+    const name = String(key).toLowerCase();
+    if (!(name in normalized)) normalized[name] = value;
+  }
+
+  const names = [];
+  for (const kind of Object.keys(REQUEST_HEADERS)) {
+    const spec = REQUEST_HEADERS[kind];
+    names.push(spec.genericApiKey);
+    for (const provider of Object.values(spec.providers)) names.push(provider.apiKey);
+  }
+
+  const values = [];
+  for (const name of names) {
+    const raw = normalized[name];
+    if (typeof raw !== 'string') continue;
+    const trimmed = raw.trim();
+    if (trimmed !== '') values.push(trimmed);
+  }
+  // 长的先替换，避免短 key 是长 key 的前缀时先把长值拆碎（与 credentials.js 同策略）。
+  return values.sort((a, b) => b.length - a.length);
+}
+
+/**
+ * 给请求级日志套一层脱敏：把本请求带过的 **api-key 头值**替换成 [redacted]。
+ *
+ * 只屏蔽 key：provider id / baseUrl / model 会正常出现在日志上下文里（尤其是头名），
+ * 屏蔽它们只会把日志打烂，换不来任何安全收益。key 的值仍然保证不会出现在任何日志行。
+ */
+function createRequestLogger(logger, secrets) {
+  if (!logger || secrets.length === 0) return logger;
   const redact = (text) => {
     let out = String(text);
-    for (const value of values) out = out.split(value).join('[redacted]');
+    for (const value of secrets) out = out.split(value).join('[redacted]');
     return out;
   };
   const mapArg = (arg) => (typeof arg === 'string' ? redact(arg) : redact(safeStringify(arg)));
@@ -175,7 +225,7 @@ function createRequestLogger(logger, values) {
  * **绝不按 key / 头做缓存**，否则明文密钥会在内存里活过这次请求。
  */
 async function createRequestRuntime(runtime, config, headers, env, logger = runtime?.logger) {
-  const requestLogger = createRequestLogger(logger, credentialHeaderValues(headers));
+  const requestLogger = createRequestLogger(logger, secretHeaderValues(headers));
   const names = presentCredentialHeaders(headers);
   requestLogger?.info?.(
     `http: applying per-request credentials (${names.join(', ')}); providers are built for this request only.`,
@@ -215,7 +265,7 @@ async function handleMcpPost(req, res, ctx) {
         sendJson(res, 400, jsonRpcError(`Invalid params: ${error.message}`, -32602, requestId(parsed)));
       } else {
         // 不记录 error.message：它可能带着请求头里的某个值；只记错误类型。
-        createRequestLogger(logger, credentialHeaderValues(headers))?.error?.(
+        createRequestLogger(logger, secretHeaderValues(headers))?.error?.(
           `http: per-request credentials could not be applied (${error?.name ?? 'Error'}).`,
         );
         sendJson(res, 500, jsonRpcError('Internal error.'));
