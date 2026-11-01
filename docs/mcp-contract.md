@@ -480,10 +480,13 @@ The storyboard grid is for FINDING things, not for reading them: cells are small
 inside a cell is usually unreadable. To read text on screen, call media_zoom on that moment
 and read the cropped single frame.
 
-The full text is NOT inlined. It is written to disk and the returned paths point at it:
-content.md (readable), segments.jsonl (one segment per line, machine-readable), manifest.json
-(what was produced and how). Read those files section by section and summarise them in
-chunks yourself — do not ask for the same range again just to get more inline text.
+The full text is NOT inlined. It is written to disk, and the text of the result ends with a line
+like "full text: /abs/path/content.md (segments.jsonl, manifest.json in the same directory)".
+That absolute path is what you read: content.md is the readable full text, segments.jsonl has
+one segment per line, manifest.json records what was produced and how. Read those files section
+by section and summarise them in chunks yourself — do not ask for the same range again just to
+get more inline text. If the export could not be written, the line reads
+"full text: NOT written — <reason>" instead.
 
 Always call media_probe first: it tells you how long the file is, whether a subtitle source
 exists, and which transcript source applies, for free. Long media must be narrowed with
@@ -549,7 +552,8 @@ through the rest.
 | `fullText.segmentsJsonl` | string | `segments.jsonl` 绝对路径 | — |
 | `fullText.manifestJson` | string | `manifest.json` 绝对路径 | — |
 | `fullText.documentJson` | string \| null | `document.json` 绝对路径（cangjie 契约产物；不产出时为 null） | — |
-| `truncated` | boolean | 内联清单是否被截断 | — |
+| `fullTextReason` | string \| null | 全文落盘失败的人话原因（`fullText = null` 时给出） | — |
+| `truncated` | boolean | 内联清单是否是抽样/截断后的预览（不是全文） | — |
 | `continuation` | object \| null | 续读提示 | — |
 | `continuation.nextStartMs` / `nextStartSec` | integer / number | 下一段起点（video/audio） | ms / s |
 | `continuation.nextPage` | integer | 下一批起始页（document） | 页 |
@@ -559,6 +563,12 @@ through the rest.
 | `budget.estimatedTokens` | integer | 本次总图片 token 估算（`images: 0` 时是 0） | token |
 | `budget.limit` | integer | 本次调用的图片 token 上限 | token |
 | `budget.warning` | string \| null | 超软预算时的降级建议 | — |
+
+**全文路径必须同时出现在 `content[0].text` 里。** text 末尾固定有一行
+`full text: <content.md 绝对路径> (segments.jsonl, manifest.json in the same directory)`；
+落盘失败时这一行是 `full text: NOT written — <reason>`，同时 `structuredContent.fullText = null`
+且 `fullTextReason` 给出原因（调用本身仍然成功）。续读提示 `continuation.note` 也出现在 text
+末尾——只靠 `structuredContent` 的宿主否则永远看不到它们。
 
 ### 5.4 三种媒体的文本清单形态
 
@@ -574,6 +584,7 @@ through the rest.
 cost: 2 image(s) x ~1229 = ~2458 vision tokens · transcript from subtitle file (0 s)
 note: the grids are for locating. To read text on screen, media_zoom({ path, at }) and read
       the cropped single frame.
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
 
 **零像素纯文本模式（`images: 0`）**——没有宫格就没有格位，段落按转写行列出：
@@ -587,6 +598,7 @@ note: the grids are for locating. To read text on screen, media_zoom({ path, at 
 note: text-only mode (images: 0) — no storyboard grid was rendered and no frame was decoded;
       the list below is the transcript of this window.
 note: to see the picture, call media_zoom({ path, at }) for a single frame.
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
 
 **录音（audio）**——按段落：
@@ -598,6 +610,7 @@ note: to see the picture, call media_zoom({ path, at }) for a single frame.
 [seg 2   ] 00:04.120-00:09.480  (asr)  「……」
 note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not
       quote these lines as the speaker's exact words.
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
 
 **文档（document）**——按页：
@@ -609,6 +622,7 @@ note: source is asr — machine transcription. Names, numbers and jargon may be 
 [page 2  ] (ocr)  「……」
 note: page text comes from OCR of the rendered pages — verify names and numbers against the
       page image via media_zoom({ path, page }).
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
 
 ### 5.5 降级形态（没有 ASR / OCR 时）
@@ -947,7 +961,7 @@ media_overview({ path, images: 0, transcript: "subtitle", subtitle: "zh" })
 
 ## 9. 全文落盘格式
 
-`media_overview` 会把**全文**写到缓存目录，返回绝对路径。**全文不内联返回**；内联的只有受长度上限约束的节选。
+`media_overview` 会把**全文**写到缓存目录，返回绝对路径。**全文不内联返回**；内联的只有受长度上限约束的节选。绝对路径同时写进 `content[0].text` 末尾的 `full text:` 行（见 §5.3）——只读 text content 的宿主也拿得到；落盘失败时该行是 `full text: NOT written — <reason>`，调用本身不失败。
 
 落盘产物有 **4 个**：`content.md`（人读）、`segments.jsonl`（程序读）、`manifest.json`（本次导出的元信息），以及 **可选件** `document.json`（cangjie `SourceDocument Contract v1` 适配层，下游不需要 cangjie 时可以完全不看它）。
 
@@ -1286,9 +1300,10 @@ How to read a file with MultiMediaGrep:
    — say so rather than inventing what was said.
 2. media_overview is the main read. Video: numbered storyboard grids + a time-aligned text
    index. Audio: a timestamped transcript. Document: page thumbnails + per-page text.
-   The complete text is written to disk (content.md / segments.jsonl / manifest.json) and the
-   paths come back with the result — read those files section by section and summarise them in
-   chunks yourself. Do not call again just to get more inline text.
+   The full text of the requested range is written to disk, and the result text ends with a
+   "full text: /abs/path/content.md ..." line. Read that file (segments.jsonl and manifest.json
+   sit in the same directory) section by section and summarise it in chunks yourself. Do not
+   call again just to get more inline text.
 3. media_zoom only for the parts that matter. One frame of a video (at, or a start/end window)
    or one page of a document, optionally cropped. It is the most expensive call per image.
 4. media_locate answers "where was this said / on which page". Text only by default; add
@@ -1337,9 +1352,11 @@ READING ORDER
    transcript by design.
 2. media_overview — the main read. Video: numbered storyboard grids plus a time-aligned text
    index. Audio: a timestamped transcript. Document: page thumbnails plus per-page text.
-   The complete text is written to disk (content.md / segments.jsonl / manifest.json) and the
-   paths come back with the result. Read those files section by section and summarise them in
-   chunks yourself — do not re-call the tool just to get more inline text.
+   The full text of the requested range is written to disk, and the result text ends with a
+   "full text: /abs/path/content.md ..." line. That absolute path is what you read
+   (segments.jsonl and manifest.json sit in the same directory): read those files section by
+   section and summarise them in chunks yourself — do not re-call the tool just to get more
+   inline text.
 3. media_zoom — only for parts that matter. One frame of a video (at, or a start/end window)
    or one page of a document, optionally cropped.
 4. media_locate — "where was X said" (timestamp) or "on which page" (page number). Text only
@@ -1383,9 +1400,10 @@ FORMATS
 - Video and audio ranges are closed intervals of seconds: start/end, both ends included.
 - Document ranges use a comma-separated list of 1-based page numbers and closed ranges, e.g.
   "3-10,15". Out-of-range pages are an error, never a silent truncation.
-- The full text of an overview is written to disk; the result returns the paths of
-  content.md, segments.jsonl and manifest.json. Read those instead of asking for more inline
-  text.
+- The full text of an overview is written to disk; the result text ends with the absolute path
+  of content.md (segments.jsonl and manifest.json sit in the same directory). Read those instead
+  of asking for more inline text. If the export failed, the line says "full text: NOT written —
+  <reason>" and the inline preview is all you have.
 
 TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文档 / 转写 / 字幕 /
 关键帧 / 放大 / 提取文字 / 定位 / 截图), so Chinese requests match them too.
@@ -1442,7 +1460,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 |---|---|---|---|---|
 | `MMGREP_MAX_IMAGE_TOKENS` | integer | `4000` | 单次调用的图片 token 软预算（§10.3） | 用默认值。自动模式保证不超；显式模式超出只警告 |
 | `MMGREP_MAX_IMAGE_EDGE` | integer | `1600` | 单张图最长边的全局上限（§10.2） | 用默认值。请求超过它 → `BUDGET_EXCEEDED` |
-| `MMGREP_MAX_TEXT_INLINE_CHARS` | integer | `24000` | 内联文本清单的字符上限。超出在段落/格边界截断，并给续读提示 | 用默认值。**全文永远落盘，不受此限制** |
+| `MMGREP_MAX_TEXT_INLINE_CHARS` | integer | `24000` | 内联文本预览的字符上限（含 header / notes / `full text:` 行）。超出时按完整单元等距抽样并写明未覆盖范围 | 用默认值。**全文永远落盘，不受此限制** |
 | `MMGREP_MAX_CONCURRENCY` | integer | `2` | 单次调用内并行跑的 ffmpeg / 渲染任务数 | 用默认值。机器弱时调成 `1` |
 | `MMGREP_AUDIO_MIN_DBFS` | number | `-35` | 音频体检：判定「有有效声音」的平均音量下限（dBFS）。低于它 → `too-quiet`，**不跑 ASR** | 用默认值。录音确实偏小声时调低（如 `-45`） |
 | `MMGREP_AUDIO_MIN_SPEECH_RATIO` | number | `0.05` | 音频体检：判定「有有效声音」的非静音时长占比下限（0–1） | 用默认值。与 `MMGREP_AUDIO_MIN_DBFS` 是 **或** 的关系，任一不满足即判 `too-quiet` |

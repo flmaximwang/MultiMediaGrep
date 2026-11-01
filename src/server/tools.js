@@ -95,10 +95,13 @@ The storyboard grid is for FINDING things, not for reading them: cells are small
 inside a cell is usually unreadable. To read text on screen, call media_zoom on that moment
 and read the cropped single frame.
 
-The full text is NOT inlined. It is written to disk and the returned paths point at it:
-content.md (readable), segments.jsonl (one segment per line, machine-readable), manifest.json
-(what was produced and how). Read those files section by section and summarise them in
-chunks yourself — do not ask for the same range again just to get more inline text.
+The full text is NOT inlined. It is written to disk, and the text of the result ends with a line
+like "full text: /abs/path/content.md (segments.jsonl, manifest.json in the same directory)".
+That absolute path is what you read: content.md is the readable full text, segments.jsonl has
+one segment per line, manifest.json records what was produced and how. Read those files section
+by section and summarise them in chunks yourself — do not ask for the same range again just to
+get more inline text. If the export could not be written, the line reads
+"full text: NOT written — <reason>" instead.
 
 Always call media_probe first: it tells you how long the file is, whether a subtitle source
 exists, and which transcript source applies, for free. Long media must be narrowed with
@@ -699,6 +702,7 @@ function formatProbeText(result) {
 
 function formatOverviewText({
   mediaType, base, window, pages, durationSec, segments, transcript, imageDescriptors, textOnly, budget, hasAudio,
+  fullTextNote = null,
 }) {
   const lines = [];
   const attrs = [`path="${base.path}"`, `type="${mediaType}"`];
@@ -768,6 +772,8 @@ function formatOverviewText({
     notes.push('note: page text comes from OCR of the rendered pages — verify names and numbers against the page image via media_zoom({ path, page }).');
   }
   if (budget.warning) notes.push(`budget: ${budget.warning}`);
+  // 全文落盘路径必须出现在模型能看到的 text content 里（不是只放在 structuredContent）。
+  if (fullTextNote) notes.push(fullTextNote);
   const text = [truncated.text, ...notes].filter(Boolean).join('\n');
   return { text, truncated: truncated.truncated, keptCount: truncated.keptCount };
 }
@@ -1127,6 +1133,11 @@ async function handleOverview(args, call) {
     durationSec,
     pageCount,
   });
+  // 落盘成功与否都要在 text content 里说明（.22）：只放 structuredContent 的话，
+  // 依赖文本通道的宿主永远看不到路径。
+  const fullTextNote = exported.ok
+    ? exported.note
+    : `full text: NOT written — ${exported.reason}`;
 
   const text = formatOverviewText({
     mediaType,
@@ -1144,6 +1155,7 @@ async function handleOverview(args, call) {
       perImageTokens: plan?.perImageTokens ?? null,
     },
     hasAudio: probe.hasAudio ?? mediaType !== 'document',
+    fullTextNote,
   });
 
   // 内联清单只包含前 N 条，结构化返回与文本保持一致（contract §5.3：节选）
@@ -1173,19 +1185,25 @@ async function handleOverview(args, call) {
     segments: inlineSegments,
     transcript,
     pages: mediaType === 'document' ? buildPageTexts(segments) : null,
-    fullText: {
-      dir: exported.outDir,
-      contentMd: exported.contentPath,
-      segmentsJsonl: exported.segmentsPath,
-      manifestJson: exported.manifestPath,
-    },
+    fullText: exported.ok
+      ? {
+        dir: exported.outDir,
+        contentMd: exported.contentPath,
+        segmentsJsonl: exported.segmentsPath,
+        manifestJson: exported.manifestPath,
+      }
+      : null,
+    fullTextReason: exported.ok ? null : exported.reason,
     truncated: text.truncated,
     continuation,
     budget,
   };
 
+  // 续读提示也进 text content（.22）：它在 structuredContent 里，但宿主只看文本。
+  const textWithContinuation = continuation?.note ? `${text.text}\n${continuation.note}` : text.text;
+
   return {
-    content: [{ type: 'text', text: text.text }, ...blocks],
+    content: [{ type: 'text', text: textWithContinuation }, ...blocks],
     structuredContent,
   };
 }
@@ -1253,6 +1271,7 @@ async function persistOverview({ call, base, mediaType, segments, transcript, wi
 
   const key = `sha256:${sha256}`;
   let outDir;
+  let fallbackDir = false;
   if (cache?.prepareDir) {
     try {
       outDir = await cache.prepareDir(key);
@@ -1260,47 +1279,59 @@ async function persistOverview({ call, base, mediaType, segments, transcript, wi
       logger?.warn?.(`could not prepare the cache directory: ${error?.message ?? error}`);
     }
   }
-  if (!outDir) outDir = path.join(os.tmpdir(), 'multimediagrep', sha256);
+  if (!outDir) {
+    outDir = path.join(os.tmpdir(), 'multimediagrep', sha256);
+    fallbackDir = true;
+  }
 
-  const exported = await exportAnalysis({
-    outDir,
-    source: {
-      path: base.path,
-      mediaType,
-      sizeBytes: base.sizeBytes,
-      modifiedMs: base.modifiedMs,
-      sha256,
-      durationSec,
-      pageCount,
-    },
-    mediaType: cangjieMediaType(mediaType, base.path),
-    segments,
-    transcript: {
-      source: transcript.source,
-      origin: transcript.origin,
-      language: transcript.language,
+  let exported;
+  try {
+    exported = await exportAnalysis({
+      outDir,
+      source: {
+        path: base.path,
+        mediaType,
+        sizeBytes: base.sizeBytes,
+        modifiedMs: base.modifiedMs,
+        sha256,
+        durationSec,
+        pageCount,
+      },
+      mediaType: cangjieMediaType(mediaType, base.path),
+      segments,
+      transcript: {
+        source: transcript.source,
+        origin: transcript.origin,
+        language: transcript.language,
+        provider: transcript.provider,
+        model: transcript.model,
+        file: transcript.file,
+      },
+      overview: {
+        images: descriptors.map((d) => ({
+          index: d.index,
+          width: d.width,
+          height: d.height,
+          cells: d.cells,
+          mimeType: d.mimeType,
+          bytes: d.bytes,
+          estimatedTokens: d.estimatedTokens,
+        })),
+        estimatedTokens: budget.estimatedTokens,
+      },
+      window: window ? { startMs: window.startMs, endMs: window.endMs } : null,
+      pages,
       provider: transcript.provider,
-      model: transcript.model,
-      file: transcript.file,
-    },
-    overview: {
-      images: descriptors.map((d) => ({
-        index: d.index,
-        width: d.width,
-        height: d.height,
-        cells: d.cells,
-        mimeType: d.mimeType,
-        bytes: d.bytes,
-        estimatedTokens: d.estimatedTokens,
-      })),
-      estimatedTokens: budget.estimatedTokens,
-    },
-    window: window ? { startMs: window.startMs, endMs: window.endMs } : null,
-    pages,
-    provider: transcript.provider,
-    warnings,
-    tool: 'media_overview',
-  });
+      warnings,
+      tool: 'media_overview',
+    });
+  } catch (error) {
+    // 落盘失败不能让整个 overview 调用失败：inline 预览仍然有用，
+    // 但必须在 text content 里把「没写成 + 原因」说清楚（.22）。
+    const reason = error?.message ?? String(error);
+    logger?.warn?.(`could not write the full text export: ${reason}`);
+    return { ok: false, reason };
+  }
 
   if (cache?.register) {
     try {
@@ -1309,7 +1340,15 @@ async function persistOverview({ call, base, mediaType, segments, transcript, wi
       logger?.debug?.(`could not register the export entry in the cache: ${error?.message ?? error}`);
     }
   }
-  return exported;
+  const noteSuffix = fallbackDir
+    ? '; the cache directory was unavailable, so this copy went to the OS temp directory and may be cleaned up'
+    : '';
+  return {
+    ok: true,
+    ...exported,
+    fallbackDir,
+    note: `full text: ${exported.contentPath} (segments.jsonl, manifest.json in the same directory${noteSuffix})`,
+  };
 }
 
 /** 没有 cache 模块时的兜底哈希（流式，不把整个视频读进内存） */

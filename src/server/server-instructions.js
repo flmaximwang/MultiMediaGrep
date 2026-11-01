@@ -15,9 +15,11 @@ READING ORDER
    transcript by design.
 2. media_overview — the main read. Video: numbered storyboard grids plus a time-aligned text
    index. Audio: a timestamped transcript. Document: page thumbnails plus per-page text.
-   The complete text is written to disk (content.md / segments.jsonl / manifest.json) and the
-   paths come back with the result. Read those files section by section and summarise them in
-   chunks yourself — do not re-call the tool just to get more inline text.
+   The full text of the requested range is written to disk, and the result text ends with a
+   "full text: /abs/path/content.md ..." line. That absolute path is what you read
+   (segments.jsonl and manifest.json sit in the same directory): read those files section by
+   section and summarise them in chunks yourself — do not re-call the tool just to get more
+   inline text.
 3. media_zoom — only for parts that matter. One frame of a video (at, or a start/end window)
    or one page of a document, optionally cropped.
 4. media_locate — "where was X said" (timestamp) or "on which page" (page number). Text only
@@ -61,9 +63,10 @@ FORMATS
 - Video and audio ranges are closed intervals of seconds: start/end, both ends included.
 - Document ranges use a comma-separated list of 1-based page numbers and closed ranges, e.g.
   "3-10,15". Out-of-range pages are an error, never a silent truncation.
-- The full text of an overview is written to disk; the result returns the paths of
-  content.md, segments.jsonl and manifest.json. Read those instead of asking for more inline
-  text.
+- The full text of an overview is written to disk; the result text ends with the absolute path
+  of content.md (segments.jsonl and manifest.json sit in the same directory). Read those instead
+  of asking for more inline text. If the export failed, the line says "full text: NOT written —
+  <reason>" and the inline preview is all you have.
 
 TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文档 / 转写 / 字幕 /
 关键帧 / 放大 / 提取文字 / 定位 / 截图), so Chinese requests match them too.`;
