@@ -290,7 +290,7 @@ export function providerApiKeyEnv(kind, providerId) {
 
 /** server 身份（与 package.json 保持一致的硬编码，避免运行时读包信息） */
 export const SERVER_NAME = 'multimediagrep';
-export const SERVER_VERSION = '0.1.0';
+export const SERVER_VERSION = '0.2.0';
 
 const LOG_LEVELS = Object.freeze({ error: 0, warn: 1, info: 2, debug: 3 });
 
