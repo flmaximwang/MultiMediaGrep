@@ -76,7 +76,7 @@ flowchart TD
   AU3 -. "envelope=true 时" .-> AU4["音频包络 PNG"]
 
   D --> D1["页面栅格化<br/>→ 页图"]
-  D --> D2["文档解析 provider<br/>MMGREP_DOC_PROVIDER = mineru"]
+  D --> D2["文档 provider<br/>MMGREP_OCR_PROVIDER / MMGREP_TYPESET_PROVIDER"]
   D2 --> D3["每页文字"]
 
   V4 --> T["统一 segments 模型<br/>{ startMs, endMs, text, page }"]
@@ -691,7 +691,7 @@ full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, m
 | video，无音轨 | 同上，原因写「no audio track」 | 只有画面 |
 | audio，**体检结论 too-quiet / silent** | **不跑 ASR**（避免幻觉段落）；`transcript.source = "none"`；说明写明「no effective speech」 | 什么都没有，只有一句说明 + 原因 |
 | audio，有字幕但无 ASR | 用字幕，`transcript.source = "subtitle"` | 画面 + 字幕文字（同上，核对专名与数字） |
-| document，`MMGREP_DOC_PROVIDER=none` | 照常出页缩略图宫格；`pages[].text` 为空；`transcript.source = "none"` | 只有页面缩略图 |
+| document，`MMGREP_OCR_PROVIDER=none` 且无文字层 | 照常出页缩略图宫格；`pages[].text` 为空；`transcript.source = "none"` | 只有页面缩略图 |
 | document，扫描件且 OCR 未配置 | 同上，且 `capabilities.ocr.available = false` | 只有页面缩略图；需要读字就 `media_zoom` 单页放大 |
 
 **关键原则一：宁可明说「没有文字」，也不要把 `transcript.source` 写成 `none` 却让文本清单看起来像有内容。** 清单里每格没有台词时，格后面明确留空并给一行 `transcript: NONE (…reason…)`。
@@ -1539,22 +1539,30 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 
 > 兼容兜底：`MMGREP_ASR_API_KEY` / `MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 在对应的 provider 专属变量未设置时仍然生效，但会在 `config.warnings` 里记一条弃用提示；计划在 0.2.0 删除。旧 `MMGREP_ASR_MODEL` 与 `openai-compatible` 同用时还会额外警告该值可能不适配。
 
-### 12.3 文档解析 provider
+### 12.3 文档 provider：OCR 角色
+
+0.2.0 起文档 provider 拆成 **ocr** / **typeset** 两个角色（契约 v2）。OCR 角色只处理
+**没有文字层**的页（以及 `ocrMode=force` 的页）。
 
 | 变量 | 类型 | 默认值 | 作用 | 没配 / 配错时的行为 |
 |---|---|---|---|---|
-| `MMGREP_DOC_PROVIDER` | string | `none` | 文档解析后端。`none` = 不抽文字层；`mineru` = MinerU | `none` → 文档**只出页缩略图**，`pages[].text` 为空，`reason` 写明「MMGREP_DOC_PROVIDER is \"none\"」。未知 provider id → 记 warning 并回落到 `none` |
-| `MMGREP_MINERU_API_KEY` | string | 空 | MinerU 的 API token | 云端 provider 缺 key → `PROVIDER_NOT_CONFIGURED`；回环地址免 key |
-| `MMGREP_MINERU_BASE_URL` | string | `https://mineru.net/api/v4` | MinerU 的 API 基址 | 用内置默认值 |
-| `MMGREP_MINERU_MODEL` | string | 空 | MinerU 的解析模型名；留空 = 服务端默认 | 用内置默认值 |
+| `MMGREP_OCR_PROVIDER` | string | `none` | 无文字层页面的文字识别后端：`mineru` \| `none` | `none` → 扫描件 / 图片只出页图，`textOrigin = "unknown"`，`reason` 写明「MMGREP_OCR_PROVIDER is \"none\"」。未知 provider id → 记 warning 并回落到 `none` |
+| `MMGREP_MINERU_API_KEY` | string | 空 | MinerU 的 API token（两个角色共用） | 云端 provider 缺 key → `PROVIDER_NOT_CONFIGURED`；回环地址免 key |
+| `MMGREP_MINERU_BASE_URL` | string | `https://mineru.net/api/v4` | MinerU 的 API 基址（两个角色共用） | 用内置默认值 |
+| `MMGREP_MINERU_MODEL` | string | 空 | MinerU 的解析模型名；留空 = 服务端默认（两个角色共用） | 用内置默认值 |
 
-> 兼容兜底：`MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL` 在 `MMGREP_MINERU_*` 未设置时仍然生效，并记一条弃用提示；计划在 0.2.0 删除。
+> 0.2.0 删除：`MMGREP_DOC_PROVIDER` / `MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` /
+> `MMGREP_DOC_MODEL` **不再读取**。启动时检测到会 warn 并指出替代变量
+> （`MMGREP_OCR_PROVIDER` / `MMGREP_TYPESET_PROVIDER` / `MMGREP_MINERU_*`），不静默忽略。
 
-### 12.4 OCR provider
+### 12.4 文档 provider：typeset 角色
+
+typeset 角色只处理**有文字层**的页，恢复阅读顺序与结构；**不得重新识别字符**。
+provider 无法保证原字符时必须返回 `textOrigin = "ocr"` / `"unknown"`。
 
 | 变量 | 类型 | 默认值 | 作用 | 没配 / 配错时的行为 |
 |---|---|---|---|---|
-| `MMGREP_OCR_PROVIDER` | string | `none` | 扫描件的文字识别后端。`none` / `mineru` / `tesseract` | `none` → 扫描件只出页图，无文字层。`MMGREP_DOC_PROVIDER` 已配置时，**文档 provider 优先**（MinerU 自带 OCR），此变量只作用于独立的本地 OCR 路径 |
+| `MMGREP_TYPESET_PROVIDER` | string | `builtin` | 有文字层页面的排版后端：`builtin` \| `mineru` \| `none` | `none` → 有文字层的页直接用原生 `pdftotext` 文本（无结构重排）。未知 provider id → 记 warning 并回落到 `builtin`。`builtin` 是本地实现，不联网 |
 
 ### 12.5 运行时与预算
 
@@ -1607,14 +1615,15 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | `x-mmgrep-openai-compatible-base-url` | OpenAI 兼容服务基址 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` |
 | `x-mmgrep-openai-compatible-model` | OpenAI 兼容服务模型 | `MMGREP_OPENAI_COMPATIBLE_MODEL` |
 | `x-mmgrep-asr-api-key` | 通用兜底 key（旧共用变量语义） | `MMGREP_ASR_API_KEY` |
-| `x-mmgrep-doc-provider` | 本次请求的文档解析 provider：`mineru` | `MMGREP_DOC_PROVIDER` |
-| `x-mmgrep-mineru-api-key` | MinerU token | `MMGREP_MINERU_API_KEY` |
-| `x-mmgrep-mineru-base-url` | MinerU 基址 | `MMGREP_MINERU_BASE_URL` |
-| `x-mmgrep-mineru-model` | MinerU 模型 | `MMGREP_MINERU_MODEL` |
-| `x-mmgrep-doc-api-key` | 通用兜底 token（旧共用变量语义） | `MMGREP_DOC_API_KEY` |
+| `x-mmgrep-ocr-provider` | 本次请求的 OCR 角色 provider：`mineru` / `none` | `MMGREP_OCR_PROVIDER` |
+| `x-mmgrep-typeset-provider` | 本次请求的 typeset 角色 provider：`builtin` / `mineru` / `none` | `MMGREP_TYPESET_PROVIDER` |
+| `x-mmgrep-mineru-api-key` | MinerU token（两个角色共用） | `MMGREP_MINERU_API_KEY` |
+| `x-mmgrep-mineru-base-url` | MinerU 基址（两个角色共用） | `MMGREP_MINERU_BASE_URL` |
+| `x-mmgrep-mineru-model` | MinerU 模型（两个角色共用） | `MMGREP_MINERU_MODEL` |
 
-优先级（逐字段计算）：该 provider 的专属请求头 > 通用 `x-mmgrep-<kind>-api-key`（只作用于 apiKey）
-> 该 provider 的环境变量 > 启动配置（仅当 provider 相同）> provider 内置默认值。
+优先级（逐字段计算）：该 provider 的专属请求头 > 该 provider 的环境变量 >
+启动配置（仅当 provider 相同）> provider 内置默认值。ASR 仍保留通用
+`x-mmgrep-asr-api-key` 兜底；文档角色已删除通用 key 头。
 
 - 请求头里的 provider 选择**只对当前请求生效**；未知 provider id → HTTP 400 / JSON-RPC `-32602`。
 - 空头（空串或全空白）等于没带，不会覆盖服务器配置。
