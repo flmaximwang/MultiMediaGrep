@@ -869,6 +869,114 @@ function generateSampleTextPdf(outDir) {
 }
 
 // ---------------------------------------------------------------------------
+// 5b. sample-longpage.pdf  (one page far above the 24k-char inline limit)
+//
+// 预览管线（9z5.20）必须能处理「单页正文超过内联上限」：不能把整页丢掉，
+// 也不能再宣称「下面是每一页的全文」。这个 fixture 把三种情况放在一份文件里：
+//   page 4：约 25k 字符，切成很多完整句子（抽样）
+//   page 6：一个没有句末标点的长单元（硬截断 …[+N chars]）
+// 其余页面是短页，用来验证 pages:"4-6" 时三页都出现。
+// 页面用大尺寸（1000x1400 pt）写，字号保持可读，不靠挤小字堆字符数。
+// ---------------------------------------------------------------------------
+
+const LONGPAGE_WIDTH = 1000;
+const LONGPAGE_HEIGHT = 1400;
+const LONGPAGE_MARGIN = 50;
+const LONGPAGE_TITLE_SIZE = 16;
+const LONGPAGE_BODY_SIZE = 7;
+const LONGPAGE_LEADING = 10;
+const LONGPAGE_TITLE_OFFSET = 40;
+
+const LONG_WORDS = [
+  'alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel',
+  'india', 'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar', 'papa',
+  'quebec', 'romeo', 'sierra', 'tango', 'uniform', 'victor', 'whiskey', 'xray',
+  'yankee', 'zulu',
+];
+
+/** 一条完整句子（<= ~206 字符），保证抽样单元不会都被硬截断 */
+function longPageSentence(index) {
+  let text = `Sentence ${String(index).padStart(3, '0')} of the long page fixture. `
+    + 'This line exists so that the inline preview has to sample complete units instead of dropping the page.';
+  let step = 0;
+  while (text.length < 205) {
+    text += ` ${LONG_WORDS[(index + step) % LONG_WORDS.length]}`;
+    step += 1;
+  }
+  return text.endsWith('.') ? text : `${text}.`;
+}
+
+/** 不含 . ! ? ; 的正文行：整个页面会被断句器看成一个超长单元 */
+function longPageUnpunctuatedLine(index) {
+  const parts = [];
+  for (let step = 0; step < 26; step += 1) {
+    parts.push(LONG_WORDS[(index * 7 + step) % LONG_WORDS.length]);
+  }
+  let text = parts.join(' ');
+  while (text.length < 200) text += ` ${LONG_WORDS[(index + text.length) % LONG_WORDS.length]}`;
+  return text;
+}
+
+const LONGPAGE_SENTENCES = Array.from({ length: 125 }, (_, i) => longPageSentence(i + 1));
+const LONGPAGE_UNPUNCTUATED = Array.from({ length: 25 }, (_, i) => longPageUnpunctuatedLine(i + 1));
+
+const LONGPAGE_PAGES = Array.from({ length: 6 }, (_, i) => {
+  const page = i + 1;
+  if (page === 4) return { page, title: 'PAGE FOUR: LONG BODY FOR INLINE PREVIEW', lines: LONGPAGE_SENTENCES };
+  if (page === 6) return { page, title: 'PAGE SIX UNPUNCTUATED BODY', lines: LONGPAGE_UNPUNCTUATED };
+  return {
+    page,
+    title: `PAGE ${page} OF THE LONG-PAGE FIXTURE`,
+    lines: [`PAGE ${page} SHORT LINE ONE.`, `PAGE ${page} SHORT LINE TWO.`, `PAGE ${page} ENDS HERE.`],
+  };
+});
+
+function generateSampleLongPagePdf(outDir) {
+  const pages = [];
+  const pageTruth = [];
+  const charsByPage = {};
+
+  for (const spec of LONGPAGE_PAGES) {
+    const ops = [];
+    const lines = [];
+    const titleY = LONGPAGE_HEIGHT - LONGPAGE_MARGIN;
+    ops.push(pdfTextOp(LONGPAGE_MARGIN, titleY, spec.title, { font: 'F2', size: LONGPAGE_TITLE_SIZE }));
+    lines.push({ text: spec.title, xPt: LONGPAGE_MARGIN, yPt: titleY, font: 'F2', size: LONGPAGE_TITLE_SIZE });
+
+    spec.lines.forEach((text, i) => {
+      const y = titleY - LONGPAGE_TITLE_OFFSET - i * LONGPAGE_LEADING;
+      ops.push(pdfTextOp(LONGPAGE_MARGIN, y, text, { font: 'F1', size: LONGPAGE_BODY_SIZE }));
+      lines.push({ text, xPt: LONGPAGE_MARGIN, yPt: y, font: 'F1', size: LONGPAGE_BODY_SIZE });
+    });
+
+    charsByPage[spec.page] = lines.reduce((sum, line) => sum + line.text.length + 1, 0);
+    pages.push({ kind: 'text', width: LONGPAGE_WIDTH, height: LONGPAGE_HEIGHT, ops, fonts: ['F1', 'F2'] });
+    // 这个 fixture 只关心「页文字总量 / 断句」，不重复写 textOps（ground truth 体积减半）
+    pageTruth.push({ page: spec.page, lines });
+  }
+
+  const pdf = buildPDF({ pages });
+  writeFile(outDir, 'sample-longpage.pdf', pdf);
+
+  return {
+    id: 'sample-longpage-pdf',
+    kind: 'pdf',
+    file: 'sample-longpage.pdf',
+    generator: 'fixtures/generate.mjs',
+    pageCount: pages.length,
+    pageWidthPt: LONGPAGE_WIDTH,
+    pageHeightPt: LONGPAGE_HEIGHT,
+    marginPt: LONGPAGE_MARGIN,
+    hasTextLayer: true,
+    fonts: ['Helvetica', 'Helvetica-Bold'],
+    longPage: 4,
+    unpunctuatedPage: 6,
+    charsByPage,
+    pages: pageTruth,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 6. sample-scanned.pdf  (image-only pages: no text layer)
 // ---------------------------------------------------------------------------
 
@@ -1124,6 +1232,7 @@ async function main() {
   groundTruths.push(generateSampleZoom(outDir));
   groundTruths.push(...generateSampleTone(outDir));
   groundTruths.push(generateSampleTextPdf(outDir));
+  groundTruths.push(generateSampleLongPagePdf(outDir));
   groundTruths.push(generateSampleScannedPdf(outDir));
   groundTruths.push(generateSampleImage(outDir));
   const optional = generateOptionalSpeech(outDir);

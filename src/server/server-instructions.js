@@ -14,12 +14,14 @@ READING ORDER
    health check (level, speech ratio): a recording with no effective speech yields an EMPTY
    transcript by design.
 2. media_overview — the main read. Video: numbered storyboard grids plus a time-aligned text
-   index. Audio: a timestamped transcript. Document: page thumbnails plus per-page text.
+   index. Audio: a timestamped transcript. Document: page thumbnails plus page text.
    The full text of the requested range is written to disk, and the result text ends with a
    "full text: /abs/path/content.md ..." line. That absolute path is what you read
    (segments.jsonl and manifest.json sit in the same directory): read those files section by
    section and summarise them in chunks yourself — do not re-call the tool just to get more
-   inline text.
+   inline text. The inline list is a preview: complete when the range fits, otherwise sampled
+   from complete units, with a "preview: sampled ..." line that names the units inlined and the
+   pages/ranges not represented.
 3. media_zoom — only for parts that matter. One frame of a video (at, or a start/end window)
    or one page of a document, optionally cropped.
 4. media_locate — "where was X said" (timestamp) or "on which page" (page number). Text only
@@ -43,7 +45,8 @@ that moment, then read the cropped single frame.
 
 TOKEN DISCIPLINE
 - Long media must be narrowed with start/end (video, audio) or pages (document) before you
-  overview it, then paged through with the continuation hint in the result.
+  overview it, then paged through with the continuation hint in the result. A sampled preview
+  is not the full text — read content.md from disk instead of assuming the preview is complete.
 - Prefer more images with fewer cells over one image with many cells: 2 images x 9 legible
   cells beats 1 image x 16 tiny ones at the same token order.
 - Zoom only what the overview showed you is worth zooming into.

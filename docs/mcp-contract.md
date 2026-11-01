@@ -461,10 +461,13 @@ Build an overview of a local media file so you can read it without guessing.
 
 What you get depends on the media:
 - video    : one or more numbered storyboard grids (each cell carries its cell number) plus a
-             time-aligned text index of every cell
+             time-aligned text index of the cells
 - audio    : a timestamped transcript, segment by segment
-- document : a grid of page thumbnails plus the text of each page, when a document parser is
-             configured
+- document : a grid of page thumbnails plus page text, when a document parser is configured
+
+Pass images: 0 for a text-only, zero-pixel overview: no grid is rendered and no frame is
+decoded (a video costs no ffmpeg work at all), so you get only the transcript — or the page
+text for a document — and the reported budget is all zeros. Use it when you only need the words.
 
 TEXT SOURCE ORDER — subtitles first, ASR only as a fallback:
 1. a subtitle you select explicitly (external subtitle file, track index or language code),
@@ -487,6 +490,14 @@ one segment per line, manifest.json records what was produced and how. Read thos
 by section and summarise them in chunks yourself — do not ask for the same range again just to
 get more inline text. If the export could not be written, the line reads
 "full text: NOT written — <reason>" instead.
+
+The inline text is a PREVIEW. It is complete when the requested range fits (the result says
+"complete text ... nothing omitted"); otherwise it is SAMPLED from complete units — document
+sentences, video/audio transcript segments — and the result carries a line like
+"preview: sampled 84 of 312 sentences across pages 1-28; not represented: 2-6, 8-12". Sampling
+never drops a whole page silently: every requested page gets at least one unit when the budget
+allows, pages that could not be represented are listed, and a single over-long unit is
+truncated with a trailing "…[+N chars]". Read content.md when you need the complete text.
 
 Always call media_probe first: it tells you how long the file is, whether a subtitle source
 exists, and which transcript source applies, for free. Long media must be narrowed with
@@ -532,8 +543,8 @@ through the rest.
 | `images[].bytes` | integer | 编码后字节数 | byte |
 | `images[].estimatedTokens` | integer | 这张图的 token 估算 | token |
 | `images[].source` | `"visual"` | 图内容恒为画面（宫格图里没有任何可引用的文字） | — |
-| `segments[]` | array | 内联的段落/格清单（**节选**，非全文） | — |
-| `segments[].index` | integer | 序号（1-based） | — |
+| `segments[]` | array | 实际内联的单元清单（**节选**：文档 = 句子，视频/录音 = 转写段落） | — |
+| `segments[].index` | integer | 序号（1-based；文档为句子在全文单元列表里的位置） | — |
 | `segments[].startMs` / `endMs` | integer \| null | 时间范围（document 为 null） | ms |
 | `segments[].startSec` / `endSec` | number \| null | 同上，秒 | s |
 | `segments[].text` | string | 该段文字（可能为 ""，表示无台词） | — |
@@ -554,6 +565,10 @@ through the rest.
 | `fullText.documentJson` | string \| null | `document.json` 绝对路径（cangjie 契约产物；不产出时为 null） | — |
 | `fullTextReason` | string \| null | 全文落盘失败的人话原因（`fullText = null` 时给出） | — |
 | `truncated` | boolean | 内联清单是否是抽样/截断后的预览（不是全文） | — |
+| `preview.mode` | `"whole"` \| `"sampled"` | `whole` = 请求范围整体内联（完整）；`sampled` = 按完整单元抽样 | — |
+| `preview.units` | integer | 实际内联的单元数（文档 = 句子，视频/录音 = 转写段落） | 条 |
+| `preview.totalUnits` | integer | 请求范围内的单元总数 | 条 |
+| `preview.notRepresented` | integer[] | 抽样时没有内联任何单元的页码（文档；其它媒体为空数组） | 页 |
 | `continuation` | object \| null | 续读提示 | — |
 | `continuation.nextStartMs` / `nextStartSec` | integer / number | 下一段起点（video/audio） | ms / s |
 | `continuation.nextPage` | integer | 下一批起始页（document） | 页 |
@@ -595,8 +610,7 @@ full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, m
 [seg 1   ] 00:00.000-00:03.120  (subtitle)  「……」
 [seg 2   ] 00:03.120-00:07.480  (subtitle)  「……」
 ...
-note: text-only mode (images: 0) — no storyboard grid was rendered and no frame was decoded;
-      the list below is the transcript of this window.
+note: text-only mode (images: 0) — no storyboard grid was rendered and no frame was decoded.
 note: to see the picture, call media_zoom({ path, at }) for a single frame.
 full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
@@ -619,7 +633,19 @@ full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, m
 <overview path="/abs/a.pdf" type="document" pages="1-12" grid="12 pages x 2 image(s)"
   image="1280x720" tokens="~2458" text="mineru" source="ocr" />
 [page 1  ] (ocr)  「……」
+[page 2  ] (ocr)  「……」 「……」
+preview: sampled 84 of 312 sentences across pages 1-12; not represented: 8-12.
+note: page text comes from OCR of the rendered pages — verify names and numbers against the
+      page image via media_zoom({ path, page }).
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
+```
+
+请求范围整体放得下时是 tier 1，允许宣称完整（且只有此时可以）：
+
+```
+[page 1  ] (ocr)  「……」
 [page 2  ] (ocr)  「……」
+note: complete text of pages 1-2 (nothing omitted).
 note: page text comes from OCR of the rendered pages — verify names and numbers against the
       page image via media_zoom({ path, page }).
 full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
@@ -1299,11 +1325,13 @@ How to read a file with MultiMediaGrep:
    ratio): if the recording has no effective speech, the transcript will be EMPTY on purpose
    — say so rather than inventing what was said.
 2. media_overview is the main read. Video: numbered storyboard grids + a time-aligned text
-   index. Audio: a timestamped transcript. Document: page thumbnails + per-page text.
+   index. Audio: a timestamped transcript. Document: page thumbnails + page text.
    The full text of the requested range is written to disk, and the result text ends with a
    "full text: /abs/path/content.md ..." line. Read that file (segments.jsonl and manifest.json
    sit in the same directory) section by section and summarise it in chunks yourself. Do not
-   call again just to get more inline text.
+   call again just to get more inline text. The inline list is a preview: complete when the
+   range fits, otherwise sampled from complete units, with a "preview: sampled ..." line that
+   names the units inlined and the pages/ranges not represented.
 3. media_zoom only for the parts that matter. One frame of a video (at, or a start/end window)
    or one page of a document, optionally cropped. It is the most expensive call per image.
 4. media_locate answers "where was this said / on which page". Text only by default; add
@@ -1351,12 +1379,14 @@ READING ORDER
    health check (level, speech ratio): a recording with no effective speech yields an EMPTY
    transcript by design.
 2. media_overview — the main read. Video: numbered storyboard grids plus a time-aligned text
-   index. Audio: a timestamped transcript. Document: page thumbnails plus per-page text.
+   index. Audio: a timestamped transcript. Document: page thumbnails plus page text.
    The full text of the requested range is written to disk, and the result text ends with a
    "full text: /abs/path/content.md ..." line. That absolute path is what you read
    (segments.jsonl and manifest.json sit in the same directory): read those files section by
    section and summarise them in chunks yourself — do not re-call the tool just to get more
-   inline text.
+   inline text. The inline list is a preview: complete when the range fits, otherwise sampled
+   from complete units, with a "preview: sampled ..." line that names the units inlined and the
+   pages/ranges not represented.
 3. media_zoom — only for parts that matter. One frame of a video (at, or a start/end window)
    or one page of a document, optionally cropped.
 4. media_locate — "where was X said" (timestamp) or "on which page" (page number). Text only
@@ -1380,7 +1410,8 @@ that moment, then read the cropped single frame.
 
 TOKEN DISCIPLINE
 - Long media must be narrowed with start/end (video, audio) or pages (document) before you
-  overview it, then paged through with the continuation hint in the result.
+  overview it, then paged through with the continuation hint in the result. A sampled preview
+  is not the full text — read content.md from disk instead of assuming the preview is complete.
 - Prefer more images with fewer cells over one image with many cells: 2 images x 9 legible
   cells beats 1 image x 16 tiny ones at the same token order.
 - Zoom only what the overview showed you is worth zooming into.
