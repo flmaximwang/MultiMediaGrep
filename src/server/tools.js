@@ -18,6 +18,7 @@ import { z } from 'zod';
 import { formatTimestamp } from '../export/format.js';
 import { exportAnalysis } from '../export/index.js';
 import { detectMediaType } from '../media/detect.js';
+import { DOC_SNIPPET_RADIUS, buildSnippet, countHits } from '../media/match.js';
 import {
   METHOD_MATRIX,
   ToolError,
@@ -144,6 +145,12 @@ export const LOCATE_DESCRIPTION = `Find where something appears in a local media
 Use it when you know roughly what was said but not when ("where does it mention X"), or when
 you need to know which page a phrase is on. Matching ignores punctuation, spacing and case,
 and works for both Chinese and English. Long phrases match better than single characters.
+
+For a video or recording, each match is a time window with a match score (0..1) and the
+matched line. For a document, each match is a page: the page number, how many times the
+query appears on that page (hits), and a short snippet around the first hit — never the
+whole page. Pages that matched but did not fit are listed as "N more pages match: ...".
+Read a full page with media_overview({ path, pages }).
 
 Text only by default — no image, no pixels spent. Add includeFrame: true to also get the
 picture at the best match (one image, roughly 1,900 vision tokens).
@@ -1226,22 +1233,113 @@ function formatZoomText({ base, mediaType, target, image, cropLabel }) {
   return `${header}\n${body}`;
 }
 
-function formatLocateText({ query, matches, totalSegments, mediaType }) {
+/* ------------------------------------------------------------------ *
+ * 文档 locate 的输出计划（ticket 9z5.23）
+ *
+ * 文档的 segment 粒度就是整页，命中即整页：直接回吐等于把命中的页复述一遍
+ * （实测一次调用 12 KB+）。文档侧的定位指标改成「页码 + 命中次数 + 命中附近的片段」：
+ *   - hits   —— 这一页命中几次（精确短语；没有精确命中就退回 token 覆盖，标 fuzzy）
+ *   - snippet—— 首个命中 ±150 字符，对齐词边界，折叠换行与排版空白
+ * 视频 / 录音不变：仍是 score（0..1）+ 时间戳 + 整段原文。
+ * ------------------------------------------------------------------ */
+
+/** 文档 locate 的总输出预算（约 3 KB）：超了就少展示几页，其余折叠成一行 */
+const DOC_LOCATE_TEXT_BUDGET = 3072;
+
+/** 向后端要的候选页上限（后端 locate 的 max 上限也是 20）；排序后再按用户的 max 截断 */
+const DOC_LOCATE_CANDIDATE_MAX = 20;
+
+const DOC_LOCATE_FOOTER = 'Feed any of these pages to media_zoom({ path, page }) — no need to re-read the whole file.';
+
+/** 文档命中行：`page 11  hits=3  「…片段…」`（没有 score：文档侧不用分数） */
+function documentMatchLine(match) {
+  const fuzzy = match.fuzzy ? ' (fuzzy)' : '';
+  return `  page ${match.page}  hits=${match.hits}${fuzzy}  「${match.snippet}」`;
+}
+
+/** 没展示的命中页折成一行：`  3 more pages match: 3, 9, 14`（页码升序） */
+function documentMorePagesLine(morePages) {
+  const pages = morePages
+    .map((match) => match.page)
+    .sort((a, b) => (a ?? 0) - (b ?? 0))
+    .join(', ');
+  return `  ${morePages.length} more pages match: ${pages}`;
+}
+
+/**
+ * 决定展示哪几页：先按 hits 排序（已排好），再受用户的 max 与总预算（约 3 KB）约束。
+ * 返回 { matches, morePages }：morePages 是命中了但没展示的页。
+ */
+function planDocumentLocate({ query, matches, totalSegments, max }) {
+  const capped = matches.slice(0, max);
+  const overflow = matches.slice(max);
+  const render = (shown) => {
+    const hidden = capped.slice(shown.length).concat(overflow);
+    const lines = [`matches for "${query}" (${shown.length} of ${totalSegments} pages):`];
+    for (const match of shown) lines.push(documentMatchLine(match));
+    if (hidden.length > 0) lines.push(documentMorePagesLine(hidden));
+    lines.push(DOC_LOCATE_FOOTER);
+    return { hidden, text: lines.join('\n') };
+  };
+
+  let best = null;
+  for (let shown = 0; shown <= capped.length; shown += 1) {
+    const candidate = render(capped.slice(0, shown));
+    if (Buffer.byteLength(candidate.text, 'utf8') > DOC_LOCATE_TEXT_BUDGET) continue;
+    best = { matches: capped.slice(0, shown), morePages: candidate.hidden };
+  }
+  if (best) return best;
+
+  // 连一行都放不下（片段异常长）：至少展示第一页，片段按预算裁短
+  const first = capped[0];
+  if (!first) return { matches: [], morePages: overflow };
+  const overhead = Buffer.byteLength(`matches for "${query}" (1 of ${totalSegments} pages):\n${DOC_LOCATE_FOOTER}`, 'utf8');
+  const room = Math.max(0, DOC_LOCATE_TEXT_BUDGET - overhead - 64);
+  return {
+    matches: [{ ...first, snippet: trimToBytes(first.snippet, room) }],
+    morePages: capped.slice(1).concat(overflow),
+  };
+}
+
+/** 按 UTF-8 字节裁字符串 */
+function trimToBytes(text, maxBytes) {
+  if (maxBytes <= 0) return '';
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  let out = '';
+  let bytes = 0;
+  for (const ch of text) {
+    const size = Buffer.byteLength(ch, 'utf8');
+    if (bytes + size > maxBytes) break;
+    out += ch;
+    bytes += size;
+  }
+  return out;
+}
+
+function formatLocateText({ query, matches, totalSegments, mediaType, morePages = null }) {
   const header = `matches for "${query}" (${matches.length} of ${totalSegments} ${mediaType === 'document' ? 'pages' : 'segments'}):`;
   if (matches.length === 0) {
     return `no line matched "${query}" among ${totalSegments} ${mediaType === 'document' ? 'page texts' : 'transcript segments'}. `
       + 'Try shorter keywords, or a phrase that appears verbatim.';
   }
   const lines = [header];
+  if (mediaType === 'document') {
+    for (const match of matches) {
+      lines.push(documentMatchLine(match));
+    }
+    if (morePages && morePages.length > 0) {
+      lines.push(documentMorePagesLine(morePages));
+    }
+    lines.push(DOC_LOCATE_FOOTER);
+    return lines.join('\n');
+  }
   for (const match of matches) {
     const position = match.page !== null && match.page !== undefined
       ? `page ${match.page}`
       : rangeLabel(match.startMs, match.endMs);
     lines.push(`  ${position}  (${Number(match.score ?? 0).toFixed(2)})  ${quoteBySource(match.text, match.source)}`);
   }
-  lines.push(mediaType === 'document'
-    ? 'Feed any of these pages to media_zoom({ path, page }) — no need to re-read the whole file.'
-    : 'Feed any of these windows to media_zoom({ path, start, end }) — no need to re-read the whole file.');
+  lines.push('Feed any of these windows to media_zoom({ path, start, end }) — no need to re-read the whole file.');
   return lines.join('\n');
 }
 
@@ -1928,7 +2026,8 @@ async function handleLocate(args, call) {
   const input = {
     ...baseInput({ ...base, mediaType }),
     query: args.query,
-    max,
+    // 文档：向后端多要几页候选，才能按 hits 排序后再按用户的 max 截断
+    max: mediaType === 'document' ? DOC_LOCATE_CANDIDATE_MAX : max,
     subtitle: args.subtitle ?? null,
     transcript: mediaType === 'document' ? undefined : (args.transcript ?? 'auto'),
     startMs: window?.startMs ?? null,
@@ -1943,7 +2042,12 @@ async function handleLocate(args, call) {
   };
 
   const result = (await call.dispatcher.call(mediaType, 'locate', input, call.backendCtx)) ?? {};
-  const matches = normalizeMatches(result.matches, pageCount);
+  const rawMatches = normalizeMatches(result.matches, pageCount);
+  // 文档分支：整页命中 → 页码 + 命中次数 + 命中附近的片段（score 在文档侧没有意义）
+  const documentMatches = mediaType === 'document'
+    ? buildDocumentMatches(rawMatches, args.query)
+    : null;
+  const matches = documentMatches ?? rawMatches;
   const transcriptSource = result.transcript?.source ?? matches[0]?.source ?? 'none';
   const transcriptOrigin = result.transcript?.origin ?? matches[0]?.origin ?? 'none';
   const totalSegments = Number.isInteger(result.totalSegments) ? result.totalSegments : matches.length;
@@ -1970,11 +2074,17 @@ async function handleLocate(args, call) {
     }
   }
 
+  const plan = documentMatches
+    ? planDocumentLocate({ query: args.query, matches: documentMatches, totalSegments, max })
+    : null;
+  const shownMatches = plan ? plan.matches : matches;
+
   const text = formatLocateText({
     query: args.query,
-    matches,
+    matches: shownMatches,
     totalSegments,
     mediaType,
+    morePages: plan ? plan.morePages : null,
   });
 
   const structuredContent = {
@@ -1983,7 +2093,7 @@ async function handleLocate(args, call) {
     query: args.query,
     transcriptSource,
     transcriptOrigin,
-    matches,
+    matches: shownMatches,
     totalSegments,
     searchedWindow: {
       startMs: window?.startMs ?? null,
@@ -2023,6 +2133,45 @@ function normalizeMatches(rawMatches, pageCount) {
       page,
     };
   });
+}
+
+/**
+ * 文档分支：把「整页命中」变成「页码 + 命中次数 + 命中附近的片段」。
+ *
+ * - hits：这页命中几次（精确短语；没有精确命中就退回 token 覆盖，标 fuzzy）
+ * - snippet：首个命中 ±150 字符，对齐词边界，折叠换行与排版空白
+ * - 不带 score：文档没有「分数」，同一字段两种语义会打架（9z5.23 / 9z5.25）
+ * - 不带 text：整页正文不再返回（要整页用 media_overview({ pages }) 或 content.md）
+ * 排序：精确命中优先 → 命中次数降序 → 页码升序。
+ */
+function buildDocumentMatches(matches, query) {
+  const out = [];
+  for (const match of matches) {
+    const { hits, fuzzy, index } = countHits(match.text, query);
+    if (hits <= 0) continue;
+    out.push({
+      page: match.page,
+      hits,
+      fuzzy,
+      snippet: buildSnippet(match.text, query, { index, radius: DOC_SNIPPET_RADIUS }),
+      source: match.source,
+      origin: match.origin,
+    });
+  }
+  // 排序：精确命中优先 → 命中次数降序 → 页码升序。
+  // 精确命中优先是必要的：token 覆盖（fuzzy）会把只命中一个常见词的页也算进来，
+  // 那些页的 hits 可能比整句命中的一页还多（“SECOND PAGE” vs 每页都有的 “PAGE”）。
+  out.sort((a, b) => (Number(a.fuzzy) - Number(b.fuzzy))
+    || (b.hits - a.hits)
+    || ((a.page ?? 0) - (b.page ?? 0)));
+  return out.map((match, index) => ({
+    rank: index + 1,
+    startMs: null,
+    endMs: null,
+    startSec: null,
+    endSec: null,
+    ...match,
+  }));
 }
 
 /* ------------------------------------------------------------------ *

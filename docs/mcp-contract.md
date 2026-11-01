@@ -239,6 +239,10 @@ flowchart TD
 
 > **硬约束：ASR 转写不得被当作原话引用。** ASR 会把人名、数字、专业术语听错——上游 `dsh-video-storyboard` 专门写了一个 OCR 模块来用画面里的硬字幕校正 ASR 文本，理由就是「画面更可信」。所以凡是 `source = "asr"` 的段落，工具描述与 server instructions 都要提醒 agent 标注不确定。
 
+> **定位指标按媒体类型分两套。** 视频 / 录音的 `media_locate` 报 `score`（0–1，越大越像）；
+> 文档的 `media_locate` 报 `hits`（该页命中几次）+ `snippet`（命中附近的片段），**没有 `score`**：
+> 文档的 segment 粒度就是整页，同一个字段两种语义会打架。详见 §7.3.1。
+
 ### 2.6 长任务与进度通知
 
 | 工具 | `timeoutMs` | 是否发 progress notification |
@@ -797,6 +801,12 @@ Use it when you know roughly what was said but not when ("where does it mention 
 you need to know which page a phrase is on. Matching ignores punctuation, spacing and case,
 and works for both Chinese and English. Long phrases match better than single characters.
 
+For a video or recording, each match is a time window with a match score (0..1) and the
+matched line. For a document, each match is a page: the page number, how many times the
+query appears on that page (hits), and a short snippet around the first hit — never the
+whole page. Pages that matched but did not fit are listed as "N more pages match: ...".
+Read a full page with media_overview({ path, pages }).
+
 Text only by default — no image, no pixels spent. Add includeFrame: true to also get the
 picture at the best match (one image, roughly 1,900 vision tokens).
 
@@ -832,16 +842,19 @@ speaker's exact words.
 | `query` | string | 原始查询串 | — |
 | `transcriptSource` | `"subtitle"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 用的哪份转写（可信度口径，见 §2.5） | — |
 | `transcriptOrigin` | `"file"` \| `"embedded"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道 | — |
-| `matches[]` | array | 匹配列表，按分数降序 | — |
+| `matches[]` | array | 匹配列表（视频/录音按分数降序；文档按 §7.3.1 排序） | — |
 | `matches[].rank` | integer | 名次（1-based） | — |
-| `matches[].score` | number | 匹配分数（0–1，越大越像） | — |
+| `matches[].score` | number | 匹配分数（0–1，越大越像）——**仅视频 / 录音**，文档没有这个字段 | — |
+| `matches[].hits` | integer | 该页命中次数——**仅文档**（精确短语计数） | 次 |
+| `matches[].snippet` | string | 命中附近的片段——**仅文档**（首个命中 ±150 字符，对齐词边界） | — |
+| `matches[].fuzzy` | boolean | 是否退化成 token 覆盖（没有整句命中）——**仅文档** | — |
 | `matches[].startMs` / `endMs` | integer \| null | 时间范围（document 为 null） | ms |
 | `matches[].startSec` / `endSec` | number \| null | 同上，秒 | s |
-| `matches[].text` | string | 命中的原文 | — |
+| `matches[].text` | string | 命中的原文（**文档不返回整页正文**，用 `snippet`） | — |
 | `matches[].source` | `"subtitle"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 这段文字的来源与可信度（见 §2.5） | — |
 | `matches[].origin` | `"file"` \| `"embedded"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道 | — |
 | `matches[].page` | integer \| null | 页码（document） | 页 |
-| `totalSegments` | integer | 搜索范围内的段落总数 | 条 |
+| `totalSegments` | integer | 搜索范围内的段落总数（document = 页数） | 条 |
 | `searchedWindow.startMs` / `endMs` | integer \| null | 搜索范围 | ms |
 | `searchedWindow.pages` | integer[] \| null | 搜索页码 | 页 |
 | `frame` | object \| null | `includeFrame: true` 时的画面 | — |
@@ -850,13 +863,42 @@ speaker's exact words.
 | `frame.estimatedTokens` | integer | token 估算 | token |
 | `text` | string | 人类/模型可读说明 | — |
 
+#### 7.3.1 文档的定位口径（与视频 / 录音不同）
+
+文档后端的 segment 粒度就是「一整页」：命中即整页，把整页回吐等于复述全文（一次调用可吐 12 KB+）。
+所以文档侧不用 `score`，改用**命中次数 + 片段**：
+
+| 项 | 口径 |
+|---|---|
+| `hits` | 该页的命中次数：精确短语（归一化 + 紧凑化后逐字匹配）出现次数；没有精确命中时退回 token 覆盖，`hits` = 命中 token 的出现次数，并置 `fuzzy = true` |
+| `snippet` | 原文里首个命中 ±150 字符，对齐到词边界，折叠换行与排版空白；被截断处用 `…` 标记 |
+| 排序 | **精确命中优先** → `hits` 降序 → 页码升序（token 覆盖会把只命中一个常见词的页也算进来，精确命中必须压过它们） |
+| 整页正文 | **不再返回**。要整页用 `media_overview({ path, pages })` 或缓存里的 `content.md` |
+| 输出预算 | 文本输出约 3 KB 上限：超了就少展示几页，其余折叠成一行 `N more pages match: 3, 9, 14`（页码升序）。被折叠的页**不算丢失**，文本里写明了页码 |
+| 候选窗口 | 一次 locate 最多向后端要 20 页候选（后端上限）：`N more pages match` 列的是**已知命中但没展示**的页；想看更后面的页，用 `pages` 缩小范围再查 |
+
+> 视频 / 录音的 `score`（0–1）与文档的 `hits` 是两种粒度下的两种指标：前者比「像不像」，
+> 后者比「命中几次」。同一字段两种语义会打架，所以文档侧**删掉** `score`，不要两套都留。
+
 ### 7.4 文本输出形态
+
+视频 / 录音：
 
 ```
 matches for "柏氏矢量" (2 of 128 segments):
   00:12.480-00:18.900  (0.92)  "我们今天讲的是柏氏矢量"
   03:41.100-03:47.260  (0.61)  "柏氏矢量这个概念"
 Feed any of these windows to media_zoom({ path, start, end }) — no need to re-read the whole file.
+```
+
+文档（一行一页：页码 + 命中次数 + 命中附近的片段，没有分数）：
+
+```
+matches for "deimmunization" (2 of 28 pages):
+  page 11  hits=3  「…workflow for artificial intelligence-directed deimmunization.…」
+  page 4  hits=1  「…the chimera was deimmunized by injection of…」
+  2 more pages match: 7, 19
+Feed any of these pages to media_zoom({ path, page }) — no need to re-read the whole file.
 ```
 
 ### 7.5 错误行为
