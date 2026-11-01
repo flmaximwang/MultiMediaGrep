@@ -14,8 +14,11 @@ import { createDocumentBackend } from '../../src/backend/document/index.js';
 import {
   createPdfSupport,
   normalizePageText,
+  pageLabelFromQpdf,
   parseMutoolInfo,
   parsePdfinfo,
+  parseQpdfOutlineJson,
+  romanNumeral,
   toContiguousRuns,
 } from '../../src/backend/document/pdf.js';
 import {
@@ -221,6 +224,39 @@ test('PDF 输出解析：pdfinfo / mutool / 页文本整理 / 连续区间', () 
 
   assert.equal(normalizePageText('A  \r\nB\r\n\r\n\r\nC'), 'A\nB\n\nC');
   assert.deepEqual(toContiguousRuns([1, 2, 3, 5, 6, 8]), [[1, 2, 3], [5, 6], [8]]);
+});
+
+test('PDF 书签解析：qpdf 的 destpageposfrom1 + /PageLabels 字典 → 物理页与打印标签', () => {
+  // qpdf 给的是 /PageLabels 字典（/St 已按页递增），不是算好的字符串。
+  assert.equal(pageLabelFromQpdf({ '/S': '/r', '/St': 1 }), 'i');
+  assert.equal(pageLabelFromQpdf({ '/S': '/r', '/St': 4 }), 'iv');
+  assert.equal(pageLabelFromQpdf({ '/S': '/R', '/St': 14 }), 'XIV');
+  assert.equal(pageLabelFromQpdf({ '/S': '/D', '/St': 37 }), '37');
+  assert.equal(pageLabelFromQpdf({ '/S': '/D', '/P': 'A-', '/St': 7 }), 'A-7');
+  assert.equal(pageLabelFromQpdf({ '/S': '/a', '/St': 27 }), 'aa');
+  assert.equal(pageLabelFromQpdf(null), null);
+  assert.equal(romanNumeral(1990), 'mcmxc');
+
+  const parsed = parseQpdfOutlineJson({
+    pages: [
+      { pageposfrom1: 1, label: { '/S': '/r', '/St': 1 } },
+      { pageposfrom1: 2, label: { '/S': '/r', '/St': 2 } },
+      { pageposfrom1: 3, label: { '/S': '/D', '/St': 1 } },
+    ],
+    outlines: [
+      {
+        title: 'Chapter One\r',
+        destpageposfrom1: 1,
+        kids: [{ title: 'Section 1.1', destpageposfrom1: 2, kids: [] }],
+      },
+      { title: 'Chapter Two', destpageposfrom1: 3, kids: [] },
+    ],
+  });
+  assert.deepEqual(parsed, [
+    { level: 1, title: 'Chapter One', page: 1, label: 'i' },
+    { level: 2, title: 'Section 1.1', page: 2, label: 'ii' },
+    { level: 1, title: 'Chapter Two', page: 3, label: '1' },
+  ]);
 });
 
 /* ------------------------------------------------------------------ *

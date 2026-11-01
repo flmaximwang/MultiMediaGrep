@@ -6,6 +6,7 @@
 import { stat } from 'node:fs/promises';
 
 import { audioConfig, computeAudioHealth } from '../../media/audio-health.js';
+import { chaptersToOutline } from '../../media/chapters.js';
 import { ffprobeJson, run } from '../../media/ffmpeg.js';
 import { ToolError } from '../../media/interface.js';
 import {
@@ -289,6 +290,7 @@ export async function shapeProbe({ media, audioHealth, input, ctx }) {
     audioHealth,
     pageCount: null,
     hasTextLayer: null,
+    outline: chaptersToOutline(media.info),
     subtitleTracks: media.subtitleTracks,
     audioTracks: media.audioTracks,
     capabilities: {

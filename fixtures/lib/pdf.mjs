@@ -55,10 +55,20 @@ export function extractTextOps(contentStream) {
 /**
  * Build a PDF file.
  *
- * @param {{pages: Array}} spec
+ * Optional structures (9z5.33 fixtures):
+ *   - `outline`: [{title, page, children?: [...]}, ...] — a PDF outline / bookmark
+ *     tree. `page` is the 1-based PHYSICAL page (the page order in `pages`), not a
+ *     printed page label. Nested `children` become level 2, 3, ... entries.
+ *   - `pageLabels`: [{startPage, style, prefix?, start?}, ...] — PDF /PageLabels
+ *     ranges. `startPage` is 1-based physical; `style` is a PDF label style letter
+ *     ("D" decimal, "r"/"R" roman, "a"/"A" alphabetic). E.g.
+ *     [{startPage: 1, style: "r"}, {startPage: 3, style: "D", start: 1}]
+ *     labels physical pages 1-2 "i", "ii" and physical page 3 "1".
+ *
+ * @param {{pages: Array, outline?: Array|null, pageLabels?: Array|null}} spec
  * @returns {Buffer}
  */
-export function buildPDF({ pages }) {
+export function buildPDF({ pages, outline = null, pageLabels = null }) {
   // Object 1 = catalog, object 2 = page tree; user objects start at 3.
   const objects = new Map();
   let nextNum = 3;
@@ -123,6 +133,67 @@ export function buildPDF({ pages }) {
     pageObjNums.push(pageNum);
   }
 
+  // /PageLabels（可选）：页码标签只影响「打印页码」，不影响物理页序号。
+  let pageLabelsNum = null;
+  if (Array.isArray(pageLabels) && pageLabels.length > 0) {
+    const nums = pageLabels.map((spec) => {
+      const index = Math.max(0, Number(spec.startPage ?? 1) - 1);
+      const parts = [];
+      if (spec.style) parts.push(`/S /${String(spec.style).replace(/^\//, '')}`);
+      if (spec.prefix !== undefined) parts.push(`/P (${pdfEscapeString(spec.prefix)})`);
+      if (spec.start !== undefined) parts.push(`/St ${Math.round(Number(spec.start))}`);
+      return `${index} << ${parts.join(' ')} >>`;
+    });
+    pageLabelsNum = add(`<< /Nums [ ${nums.join(' ')} ] >>`);
+  }
+
+  // /Outlines（可选）：书签树。每个条目 /Dest 指向物理页对象，qpdf 会把它解析成
+  // destpageposfrom1（1-based），与 media_overview 的 pages 参数同一口径。
+  let outlineRootNum = null;
+  if (Array.isArray(outline) && outline.length > 0) {
+    const alloc = () => {
+      const num = nextNum;
+      nextNum += 1;
+      return num;
+    };
+    const pageRefFor = (entry) => {
+      const page = Number(entry?.page);
+      if (!Number.isInteger(page) || page < 1 || page > pageObjNums.length) {
+        throw new Error(`outline entry "${entry?.title}" has no valid physical page (${entry?.page})`);
+      }
+      return pageObjNums[page - 1];
+    };
+    const buildLevel = (entries, parentRef) => {
+      const nums = entries.map(() => alloc());
+      let descendantCount = 0;
+      entries.forEach((entry, index) => {
+        const children = Array.isArray(entry.children) ? entry.children : [];
+        const child = children.length > 0 ? buildLevel(children, `${nums[index]} 0 R`) : null;
+        const dict = [
+          `/Title (${pdfEscapeString(entry.title)})`,
+          `/Parent ${parentRef}`,
+          `/Dest [${pageRefFor(entry)} 0 R /Fit]`,
+        ];
+        if (index > 0) dict.push(`/Prev ${nums[index - 1]} 0 R`);
+        if (index < nums.length - 1) dict.push(`/Next ${nums[index + 1]} 0 R`);
+        if (child) dict.push(`/First ${child.first} 0 R /Last ${child.last} 0 R /Count ${child.count}`);
+        objects.set(nums[index], Buffer.from(`<< ${dict.join(' ')} >>`, 'latin1'));
+        descendantCount += 1 + (child?.count ?? 0);
+      });
+      return { first: nums[0], last: nums[nums.length - 1], count: descendantCount };
+    };
+    const rootNum = alloc();
+    const root = buildLevel(outline, `${rootNum} 0 R`);
+    objects.set(
+      rootNum,
+      Buffer.from(
+        `<< /Type /Outlines /First ${root.first} 0 R /Last ${root.last} 0 R /Count ${root.count} >>`,
+        'latin1',
+      ),
+    );
+    outlineRootNum = rootNum;
+  }
+
   const total = nextNum - 1;
 
   const chunks = [];
@@ -142,7 +213,10 @@ export function buildPDF({ pages }) {
     push(Buffer.from('\nendobj\n', 'latin1'));
   };
 
-  writeObject(1, Buffer.from('<< /Type /Catalog /Pages 2 0 R >>', 'latin1'));
+  const catalogParts = ['/Type /Catalog', '/Pages 2 0 R'];
+  if (outlineRootNum !== null) catalogParts.push(`/Outlines ${outlineRootNum} 0 R`);
+  if (pageLabelsNum !== null) catalogParts.push(`/PageLabels ${pageLabelsNum} 0 R`);
+  writeObject(1, Buffer.from(`<< ${catalogParts.join(' ')} >>`, 'latin1'));
   writeObject(
     2,
     Buffer.from(

@@ -1653,6 +1653,17 @@ export function createDocumentBackend(ctx = {}) {
     // 9z5.21：不再把「有任何文字」一律记成 ocr；按本机能力与文字层预判。
     const transcriptSource = probeTranscriptSource(info, ocrState.available);
     const transcriptOrigin = probeTranscriptOrigin(info, transcriptSource);
+    // 9z5.33：PDF 书签是唯一的内置目录。只读 PDF；图片 / 文本没有目录可言。
+    const bookmarks = info.kind === 'pdf' && typeof pdfSupport.readOutline === 'function'
+      ? await pdfSupport.readOutline(input.path, { signal: c.signal })
+      : {
+        reader: null,
+        entries: [],
+        total: 0,
+        reason: info.kind === 'pdf'
+          ? 'PDF bookmarks cannot be read: this PDF support does not implement readOutline.'
+          : `this media type has no bookmarks (only PDF documents define an outline; this is ${info.kind === 'text' ? 'a plain-text file' : 'an image'}).`,
+      };
 
     return {
       mediaType: 'document',
@@ -1675,6 +1686,13 @@ export function createDocumentBackend(ctx = {}) {
       audioHealth: null,
       pageCount: info.pageCount,
       hasTextLayer: info.hasTextLayer,
+      outline: {
+        available: bookmarks.entries.length > 0,
+        source: bookmarks.entries.length > 0 ? 'pdf-bookmarks' : null,
+        total: bookmarks.total,
+        entries: bookmarks.entries,
+        reason: bookmarks.reason,
+      },
       subtitleTracks: [],
       audioTracks: [],
       capabilities: {

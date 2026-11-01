@@ -25,6 +25,7 @@ import {
   resolveSubtitleSource,
 } from '../../media/transcript.js';
 import { audioConfig, computeAudioHealth } from '../../media/audio-health.js';
+import { chaptersToOutline } from '../../media/chapters.js';
 
 export { computeAudioHealth };
 import { mergeTranscripts, planChunks } from './chunks.js';
@@ -107,6 +108,7 @@ async function shapeProbe({ info, audioHealth, input, ctx, stats, durationSec, s
     audioHealth,
     pageCount: null,
     hasTextLayer: null,
+    outline: chaptersToOutline(info),
     subtitleTracks: streams
       .filter((s) => s.codec_type === 'subtitle')
       .map((s, i) => ({ index: s.index ?? i, language: s.tags?.language ?? null, codec: s.codec_name ?? null })),

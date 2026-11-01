@@ -322,6 +322,87 @@ function generateSampleScene(outDir) {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. sample-chapters.mp4 — the scene clip re-muxed with ffmpeg chapters
+//
+// MP4 chapters live in a metadata track. ffmpeg reads them from an ffmetadata
+// text file (`[CHAPTER]` blocks) via `-i metadata.txt -map_chapters 1 -c copy`.
+// The ground truth timestamps line up with the scene cuts, so tests can assert
+// that probe shows the chapter titles with the right timestamps.
+// ---------------------------------------------------------------------------
+
+const CHAPTER_MARKERS = [
+  { title: 'Opening', startMs: 0, endMs: 2000 },
+  { title: 'Build Up', startMs: 2000, endMs: 5000 },
+  { title: 'Main Section', startMs: 5000, endMs: 9000 },
+  { title: 'Wrap Up', startMs: 9000, endMs: 12000 },
+];
+
+function generateSampleChapters(outDir) {
+  const source = path.join(outDir, 'sample-scene.mp4');
+  const tmpDir = path.join(outDir, '.tmp');
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const metadataPath = path.join(tmpDir, 'chapters.ffmetadata');
+  const metadata = [
+    ';FFMETADATA1',
+    ...CHAPTER_MARKERS.flatMap((chapter) => [
+      '[CHAPTER]',
+      'TIMEBASE=1/1000',
+      `START=${chapter.startMs}`,
+      `END=${chapter.endMs}`,
+      `title=${chapter.title}`,
+    ]),
+    '',
+  ].join('\n');
+  fs.writeFileSync(metadataPath, metadata, 'latin1');
+
+  const outFile = path.join(outDir, 'sample-chapters.mp4');
+  ffmpeg([
+    '-y',
+    '-v',
+    'error',
+    '-i',
+    source,
+    '-i',
+    metadataPath,
+    '-map',
+    '0',
+    '-map_metadata',
+    '1',
+    '-map_chapters',
+    '1',
+    '-c',
+    'copy',
+    '-fflags',
+    '+bitexact',
+    '-flags:v',
+    '+bitexact',
+    '-flags:a',
+    '+bitexact',
+    '-movflags',
+    '+faststart',
+    outFile,
+  ]);
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+
+  return {
+    id: 'sample-chapters',
+    kind: 'video',
+    file: 'sample-chapters.mp4',
+    generator: 'fixtures/generate.mjs',
+    derivedFrom: 'sample-scene.mp4',
+    durationMs: 12000,
+    width: VIDEO_WIDTH,
+    height: VIDEO_HEIGHT,
+    fps: FPS,
+    chapters: CHAPTER_MARKERS.map((chapter) => ({
+      title: chapter.title,
+      startMs: chapter.startMs,
+      endMs: chapter.endMs,
+    })),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 2. sample-subtitles.mp4 + sample-subtitles.srt
 // ---------------------------------------------------------------------------
 
@@ -1103,6 +1184,242 @@ function generateSampleTwoColumnPdf(outDir) {
 }
 
 // ---------------------------------------------------------------------------
+// 5a2. sample-outline.pdf  (PDF bookmarks + printed page labels)
+//      sample-headings.pdf (no bookmarks, >= 5 headings -> generated outline)
+//
+// 9z5.33 的内置目录 fixture：
+//   sample-outline.pdf
+//     - 12 pages, ~50 lines each: whole text is far above the 24k inline limit;
+//     - 68 bookmarks in 2 levels (plus 2 level-3 entries) on physical pages 1-12;
+//     - /PageLabels: physical 1-2 = "i","ii"; physical 3-12 = "1".."10".
+//       The outline therefore carries BOTH the physical page and the label.
+//   sample-headings.pdf
+//     - 3 pages, 6 numbered headings separated by blank lines (builtin blocks
+//       turn them into heading blocks), no /Outlines at all.
+// ---------------------------------------------------------------------------
+
+const OUTLINE_PDF_WIDTH = 595;
+const OUTLINE_PDF_HEIGHT = 842;
+const OUTLINE_PDF_MARGIN = 56;
+const OUTLINE_PDF_BODY_SIZE = 9;
+const OUTLINE_PDF_LEADING = 12;
+const OUTLINE_PDF_LINES_PER_PAGE = 58;
+
+/** 一句可读的正文行；字符数固定，便于测试估算「超出上限」 */
+function outlineBodyLine(page, line) {
+  const suffix = ` Page ${page} line ${line} keeps the text layer dense enough that the requested range cannot be inlined whole.`;
+  let text = `Synthetic outline fixture sentence ${String(line).padStart(2, '0')}.${suffix}`;
+  while (text.length < 150) text += ' The quick brown fox jumps over the lazy dog.';
+  return text;
+}
+
+function outlineSectionTitle(section) {
+  const titles = ['Introduction', 'Related Work', 'Methods', 'Results', 'Discussion', 'Conclusion'];
+  return `${section}. ${titles[section - 1] ?? 'Section'}`;
+}
+
+/**
+ * 68 bookmarks: 6 top-level sections + 60 level-2 subsections + 2 level-3 entries.
+ * Pages advance in pairs, so every section starts on an odd physical page.
+ */
+function outlineEntries() {
+  const entries = [];
+  for (let section = 1; section <= 6; section += 1) {
+    const firstPage = section * 2 - 1;
+    const children = [];
+    for (let child = 1; child <= 10; child += 1) {
+      const page = Math.min(12, firstPage + (child > 5 ? 1 : 0));
+      const node = {
+        title: `${section}.${child} ${['Setup', 'Data', 'Analysis', 'Limits', 'Notes', 'Checks', 'Figures', 'Tables', 'Details', 'Outlook'][child - 1]}`,
+        page,
+      };
+      if ((section === 3 || section === 5) && child === 5) {
+        node.children = [{ title: `${section}.${child}.1 Deep dive`, page }];
+      }
+      children.push(node);
+    }
+    entries.push({
+      title: outlineSectionTitle(section),
+      page: Math.min(12, firstPage),
+      children,
+    });
+  }
+  return entries;
+}
+
+/** 把嵌套书签拍平（测试 ground truth 用）：level / title / physical page */
+function flattenOutline(entries, level = 1, out = []) {
+  for (const entry of entries) {
+    out.push({ level, title: entry.title, page: entry.page });
+    if (entry.children) flattenOutline(entry.children, level + 1, out);
+  }
+  return out;
+}
+
+const OUTLINE_ENTRIES = outlineEntries();
+const OUTLINE_FLAT = flattenOutline(OUTLINE_ENTRIES);
+const OUTLINE_PAGE_LABELS = [
+  { startPage: 1, style: 'r' },
+  { startPage: 3, style: 'D', start: 1 },
+];
+
+/** 物理页 → 打印标签（与 /PageLabels 的定义一致，写进 ground truth） */
+function expectedPageLabels(pageCount) {
+  const labels = [];
+  for (let page = 1; page <= pageCount; page += 1) {
+    if (page <= 2) {
+      labels.push({ page, label: page === 1 ? 'i' : 'ii' });
+    } else {
+      labels.push({ page, label: String(page - 2) });
+    }
+  }
+  return labels;
+}
+
+function generateSampleOutlinePdf(outDir) {
+  const pages = [];
+  const pageTruth = [];
+  const charsByPage = {};
+  const labelsByPage = new Map(expectedPageLabels(12).map((entry) => [entry.page, entry.label]));
+
+  for (let page = 1; page <= 12; page += 1) {
+    const ops = [];
+    const lines = [];
+    const title = `SECTION ${Math.ceil(page / 2)} — SYNTHETIC OUTLINE FIXTURE`;
+    const titleY = OUTLINE_PDF_HEIGHT - OUTLINE_PDF_MARGIN;
+    ops.push(pdfTextOp(OUTLINE_PDF_MARGIN, titleY, title, { font: 'F2', size: 13 }));
+    lines.push({ text: title, xPt: OUTLINE_PDF_MARGIN, yPt: titleY, font: 'F2', size: 13 });
+    for (let line = 1; line <= OUTLINE_PDF_LINES_PER_PAGE; line += 1) {
+      const text = outlineBodyLine(page, line);
+      const y = titleY - 30 - (line - 1) * OUTLINE_PDF_LEADING;
+      ops.push(pdfTextOp(OUTLINE_PDF_MARGIN, y, text, { font: 'F1', size: OUTLINE_PDF_BODY_SIZE }));
+      lines.push({ text, xPt: OUTLINE_PDF_MARGIN, yPt: y, font: 'F1', size: OUTLINE_PDF_BODY_SIZE });
+    }
+    charsByPage[page] = lines.reduce((sum, entry) => sum + entry.text.length + 1, 0);
+    pages.push({
+      kind: 'text',
+      width: OUTLINE_PDF_WIDTH,
+      height: OUTLINE_PDF_HEIGHT,
+      ops,
+      fonts: ['F1', 'F2'],
+    });
+    pageTruth.push({ page, lines });
+  }
+
+  const pdf = buildPDF({
+    pages,
+    outline: OUTLINE_ENTRIES,
+    pageLabels: OUTLINE_PAGE_LABELS,
+  });
+  writeFile(outDir, 'sample-outline.pdf', pdf);
+
+  return {
+    id: 'sample-outline-pdf',
+    kind: 'pdf',
+    file: 'sample-outline.pdf',
+    generator: 'fixtures/generate.mjs',
+    pageCount: pages.length,
+    pageWidthPt: OUTLINE_PDF_WIDTH,
+    pageHeightPt: OUTLINE_PDF_HEIGHT,
+    hasTextLayer: true,
+    charsByPage,
+    charsTotal: Object.values(charsByPage).reduce((sum, value) => sum + value, 0),
+    pageLabels: expectedPageLabels(12),
+    outline: {
+      source: 'pdf-bookmarks',
+      total: OUTLINE_FLAT.length,
+      entries: OUTLINE_FLAT.map((entry) => ({ ...entry, label: labelsByPage.get(entry.page) ?? null })),
+    },
+    pages: pageTruth,
+  };
+}
+
+// -- sample-headings.pdf ----------------------------------------------------
+
+const HEADINGS_PDF_PAGES = [
+  {
+    page: 1,
+    blocks: [
+      { kind: 'heading', text: '1. Introduction' },
+      { kind: 'paragraph', text: 'This synthetic heading fixture exists to exercise the outline generated from block headings. It has no PDF bookmarks at all.' },
+      { kind: 'heading', text: '1.1 Scope' },
+      { kind: 'paragraph', text: 'The heading heuristic recognises short numbered lines when they are separated from body paragraphs by a blank line.' },
+      { kind: 'heading', text: '1.2 Motivation' },
+      { kind: 'paragraph', text: 'A document with at least five headings can expose an outline even when its author never added bookmarks.' },
+    ],
+  },
+  {
+    page: 2,
+    blocks: [
+      { kind: 'heading', text: '2. Methods' },
+      { kind: 'paragraph', text: 'Every heading in this page is a single short numbered line; body paragraphs follow after a vertical gap.' },
+      { kind: 'heading', text: '2.1 Sampling' },
+      { kind: 'paragraph', text: 'Sampling paragraphs stay out of the generated outline; only heading blocks become entries.' },
+    ],
+  },
+  {
+    page: 3,
+    blocks: [
+      { kind: 'heading', text: '3. Results' },
+      { kind: 'paragraph', text: 'The generated outline is labelled "outline: generated from headings" so the agent knows it came from block structure, not from the file metadata.' },
+      { kind: 'heading', text: '3.1 Summary' },
+      { kind: 'paragraph', text: 'Six headings in total is above the five-heading threshold for generating an outline.' },
+    ],
+  },
+];
+
+function generateSampleHeadingsPdf(outDir) {
+  const pages = [];
+  const pageTruth = [];
+  const headings = [];
+
+  for (const spec of HEADINGS_PDF_PAGES) {
+    const ops = [];
+    const lines = [];
+    let y = PDF_HEIGHT - PDF_MARGIN;
+    for (const block of spec.blocks) {
+      if (block.kind === 'heading') {
+        ops.push(pdfTextOp(PDF_MARGIN, y, block.text, { font: 'F2', size: 15 }));
+        lines.push({ text: block.text, xPt: PDF_MARGIN, yPt: y, font: 'F2', size: 15 });
+        headings.push({ page: spec.page, level: block.text.split(/\s+/)[0].split('.').length, text: block.text });
+        y -= 36;
+      } else {
+        // Split long paragraphs into two lines so pdftotext keeps them separate
+        // from the next heading (the blank gap above/below is what matters).
+        const words = block.text.split(' ');
+        const first = words.slice(0, Math.ceil(words.length / 2)).join(' ');
+        const second = words.slice(Math.ceil(words.length / 2)).join(' ');
+        for (const text of [first, second]) {
+          ops.push(pdfTextOp(PDF_MARGIN, y, text, { font: 'F1', size: 11 }));
+          lines.push({ text, xPt: PDF_MARGIN, yPt: y, font: 'F1', size: 11 });
+          y -= 16;
+        }
+        y -= 20; // blank line -> pdftotext paragraph break
+      }
+    }
+    pages.push({ kind: 'text', width: PDF_WIDTH, height: PDF_HEIGHT, ops, fonts: ['F1', 'F2'] });
+    pageTruth.push({ page: spec.page, lines });
+  }
+
+  const pdf = buildPDF({ pages });
+  writeFile(outDir, 'sample-headings.pdf', pdf);
+
+  return {
+    id: 'sample-headings-pdf',
+    kind: 'pdf',
+    file: 'sample-headings.pdf',
+    generator: 'fixtures/generate.mjs',
+    pageCount: pages.length,
+    pageWidthPt: PDF_WIDTH,
+    pageHeightPt: PDF_HEIGHT,
+    hasTextLayer: true,
+    bookmarks: 0,
+    headings,
+    pages: pageTruth,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 5b. sample-longpage.pdf  (one page far above the 24k-char inline limit)
 //
 // 预览管线（9z5.20）必须能处理「单页正文超过内联上限」：不能把整页丢掉，
@@ -1686,10 +2003,13 @@ async function main() {
 
   const groundTruths = [];
   groundTruths.push(generateSampleScene(outDir));
+  groundTruths.push(generateSampleChapters(outDir));
   groundTruths.push(generateSampleSubtitles(outDir));
   groundTruths.push(generateSampleZoom(outDir));
   groundTruths.push(...generateSampleTone(outDir));
   groundTruths.push(generateSampleTextPdf(outDir));
+  groundTruths.push(generateSampleOutlinePdf(outDir));
+  groundTruths.push(generateSampleHeadingsPdf(outDir));
   groundTruths.push(generateSampleTwoColumnPdf(outDir));
   groundTruths.push(generateSampleLongPagePdf(outDir));
   groundTruths.push(generateSampleScannedPdf(outDir));
