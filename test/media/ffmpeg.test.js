@@ -12,7 +12,9 @@ import {
   measureLevels,
   normalizeToWav,
   renderWaveform,
+  resolveBinary,
   run,
+  runBuffer,
 } from '../../src/media/ffmpeg.js';
 
 async function ffmpegAvailable() {
@@ -48,6 +50,99 @@ test('run：二进制缺失 → TOOL_NOT_FOUND', async () => {
 test('run：signal: null 不会被当成 AbortSignal 传给 spawn', async () => {
   const { stdout } = await run(process.execPath, ['-e', 'process.stdout.write("ok")'], { signal: null });
   assert.equal(stdout, 'ok');
+});
+
+test('run：stdout 仍以字符串返回', async () => {
+  const { stdout } = await run(process.execPath, ['-e', 'process.stdout.write("ok")']);
+  assert.equal(typeof stdout, 'string');
+  assert.equal(stdout, 'ok');
+});
+
+test('resolveBinary：环境变量优先；未设置/空白回退到 PATH 查找', () => {
+  const prevFfmpeg = process.env.MMGREP_FFMPEG_PATH;
+  const prevFfprobe = process.env.MMGREP_FFPROBE_PATH;
+  try {
+    process.env.MMGREP_FFMPEG_PATH = '/opt/custom/bin/ffmpeg';
+    process.env.MMGREP_FFPROBE_PATH = '  /opt/custom/bin/ffprobe \n';
+    assert.equal(resolveBinary('ffmpeg'), '/opt/custom/bin/ffmpeg');
+    assert.equal(resolveBinary('ffprobe'), '/opt/custom/bin/ffprobe');
+
+    process.env.MMGREP_FFMPEG_PATH = '   ';
+    delete process.env.MMGREP_FFPROBE_PATH;
+    assert.equal(resolveBinary('ffmpeg'), 'ffmpeg');
+    assert.equal(resolveBinary('ffprobe'), 'ffprobe');
+
+    // 其它工具名不受这两个变量影响
+    process.env.MMGREP_FFMPEG_PATH = '/opt/custom/bin/ffmpeg';
+    assert.equal(resolveBinary('some-other-tool'), 'some-other-tool');
+  } finally {
+    if (prevFfmpeg === undefined) delete process.env.MMGREP_FFMPEG_PATH;
+    else process.env.MMGREP_FFMPEG_PATH = prevFfmpeg;
+    if (prevFfprobe === undefined) delete process.env.MMGREP_FFPROBE_PATH;
+    else process.env.MMGREP_FFPROBE_PATH = prevFfprobe;
+  }
+});
+
+test('MMGREP_FFPROBE_PATH 指向不存在的路径 → TOOL_NOT_FOUND 且提示环境变量', async () => {
+  const prev = process.env.MMGREP_FFPROBE_PATH;
+  const missing = path.join(tmpdir(), `mmgrep-missing-ffprobe-${process.pid}-${Date.now()}`);
+  process.env.MMGREP_FFPROBE_PATH = missing;
+  try {
+    await assert.rejects(
+      () => ffprobeJson(path.join(tmpdir(), 'not-read-because-ffprobe-is-missing.mp4')),
+      (e) => {
+        assert.equal(e.code, 'TOOL_NOT_FOUND');
+        assert.ok(e.message.includes(missing), `message should mention "${missing}": ${e.message}`);
+        assert.match(e.message, /MMGREP_FFPROBE_PATH/);
+        return true;
+      },
+    );
+  } finally {
+    if (prev === undefined) delete process.env.MMGREP_FFPROBE_PATH;
+    else process.env.MMGREP_FFPROBE_PATH = prev;
+  }
+});
+
+test('runBuffer：二进制缺失 → TOOL_NOT_FOUND', async () => {
+  await assert.rejects(
+    () => runBuffer('definitely-not-a-real-binary-xyz', ['x']),
+    (e) => e.code === 'TOOL_NOT_FOUND',
+  );
+});
+
+test('runBuffer：input 原样写入 stdin，stdout 按字节返回 Buffer', async () => {
+  // 含 NUL 与非法 UTF-8 字节，证明中间没有经过字符串解码
+  const payload = Buffer.from([0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff, 0x0a]);
+  const { code, stdout } = await runBuffer(
+    process.execPath,
+    ['-e', 'process.stdin.pipe(process.stdout)'],
+    { input: payload },
+  );
+  assert.equal(code, 0);
+  assert.ok(Buffer.isBuffer(stdout), 'stdout 应是 Buffer');
+  assert.deepEqual(stdout, payload);
+});
+
+test('runBuffer：非零退出映射为 INTERNAL 并带 stderr 尾部', async () => {
+  await assert.rejects(
+    () => runBuffer(process.execPath, [
+      '-e',
+      'console.error("boom-1"); console.error("boom-2"); process.exit(3)',
+    ]),
+    (e) => e.code === 'INTERNAL' && /exited with code 3/.test(e.message) && /boom-2/.test(e.message),
+  );
+});
+
+test('runBuffer：rawvideo 输出长度等于像素字节数', { skip }, async () => {
+  const width = 32;
+  const height = 24;
+  const { stdout } = await runBuffer('ffmpeg', [
+    '-hide_banner', '-v', 'error',
+    '-f', 'lavfi', '-i', `color=c=0x336699:s=${width}x${height}:d=1`,
+    '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-',
+  ]);
+  assert.ok(Buffer.isBuffer(stdout), 'stdout 应是 Buffer');
+  assert.equal(stdout.length, width * height * 3);
 });
 
 test('ffprobeJson / measureLevels / detectSilence', { skip }, async () => {
