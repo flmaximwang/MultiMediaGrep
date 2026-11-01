@@ -221,13 +221,13 @@ flowchart TD
 
 ### 2.5 转写来源与可信度
 
-**每个工具的返回里都带「这段文字 / 这张图是哪来的」。** agent 必须知道自己在读的是作者写的字幕、机器猜的转写，还是根本没有文字——这三者的可信度差一个数量级。
+**每个工具的返回里都带「这段文字 / 这张图是哪来的」。** agent 必须知道自己在读的是字幕文件里的文字、机器猜的转写，还是根本没有文字——这三者的可信度差一个数量级。
 
 `source` 枚举（**可信度口径**）：
 
 | 值 | 含义 | 可信度 | agent 该怎么用 |
 |---|---|---|---|
-| `subtitle` | 作者提供的字幕：外部字幕文件或容器内嵌字幕轨 | **最高** | 可以当原话引用 |
+| `subtitle` | 字幕文件或容器内嵌字幕轨里的文字 | 中高 | 通常是作者原话，但**可能是自动生成的**：专有名词、数字要自己核对画面 |
 | `ocr` | 从画面 / 页面上 OCR 出来的文字 | 中高 | 可引用，但专有名词、数字要自己核对 |
 | `asr` | 语音识别转写 | **最低** | **不可当原话引用**——人名、数字、术语会错 |
 | `visual` | 没有文字来源，只有画面 | — | 只能描述画面，不能转述「说了什么」 |
@@ -237,7 +237,9 @@ flowchart TD
 
 两个字段一起给：`source = "subtitle"` + `origin = "embedded"` = 视频自带的字幕轨；`source = "subtitle"` + `origin = "file"` = 取数层给的字幕文件；`source = "asr"` + `origin = "asr"` = 机器转的。
 
-> **硬约束：ASR 转写不得被当作原话引用。** ASR 会把人名、数字、专业术语听错——上游 `dsh-video-storyboard` 专门写了一个 OCR 模块来用画面里的硬字幕校正 ASR 文本，理由就是「画面更可信」。所以凡是 `source = "asr"` 的段落，工具描述与 server instructions 都要提醒 agent 标注不确定。
+> **硬约束一：ASR 转写不得被当作原话引用。** ASR 会把人名、数字、专业术语听错——上游 `dsh-video-storyboard` 专门写了一个 OCR 模块来用画面里的硬字幕校正 ASR 文本，理由就是「画面更可信」。所以凡是 `source = "asr"` 的段落，工具描述与 server instructions 都要提醒 agent 标注不确定。
+
+> **硬约束二：字幕不保证是作者原创，更不保证「可安全引用」。** 字幕轨与字幕文件同样可能是机器自动生成的（自动字幕 / 滚动式字幕）：里面的人名、数字、术语同样会错。所以工具描述、server instructions 与 overview 的 note 一律用中性措辞——`subtitle — from a subtitle file/track; usually the author's words, but may be auto-generated: check names and numbers against the frame.`，**不作任何绝对的可引用承诺**。cue 之间大面积时间重叠（> 30%）时，overview 与 locate 还要额外给出警告 `rolling/auto-style captions detected — treat like ASR: check names and numbers against the frame.`。
 
 ### 2.6 长任务与进度通知
 
@@ -471,7 +473,8 @@ TEXT SOURCE ORDER — subtitles first, ASR only as a fallback:
 2. the subtitle track embedded in the container,
 3. a subtitle file with the same base name in the same directory (a.srt next to a.mp4),
 4. ASR — only when none of the above exists and an ASR provider is configured.
-Every segment is tagged with its source. subtitle = the author's own words, safe to quote.
+Every segment is tagged with its source. subtitle = from a subtitle file/track; usually the
+author's words, but may be auto-generated: check names and numbers against the frame.
 asr = machine transcription: names, numbers and jargon are often wrong, so do NOT quote an ASR
 segment verbatim and do not present it as the speaker's exact words. visual = there is no text
 at all, only the picture.
@@ -574,6 +577,8 @@ through the rest.
 cost: 2 image(s) x ~1229 = ~2458 vision tokens · transcript from subtitle file (0 s)
 note: the grids are for locating. To read text on screen, media_zoom({ path, at }) and read
       the cropped single frame.
+note: source is subtitle — from a subtitle file/track; usually the author's words, but may be
+      auto-generated: check names and numbers against the frame.
 ```
 
 **零像素纯文本模式（`images: 0`）**——没有宫格就没有格位，段落按转写行列出：
@@ -587,6 +592,8 @@ note: the grids are for locating. To read text on screen, media_zoom({ path, at 
 note: text-only mode (images: 0) — no storyboard grid was rendered and no frame was decoded;
       the list below is the transcript of this window.
 note: to see the picture, call media_zoom({ path, at }) for a single frame.
+note: source is subtitle — from a subtitle file/track; usually the author's words, but may be
+      auto-generated: check names and numbers against the frame.
 ```
 
 **录音（audio）**——按段落：
@@ -615,17 +622,17 @@ note: page text comes from OCR of the rendered pages — verify names and number
 
 | 情形 | 降级行为 | agent 能看到什么 |
 |---|---|---|
-| video，有**字幕**（文件或内嵌轨） | 用字幕，`transcript.source = "subtitle"`，**不跑 ASR** | 画面 + 作者原话（可引用） |
+| video，有**字幕**（文件或内嵌轨） | 用字幕，`transcript.source = "subtitle"`，**不跑 ASR** | 画面 + 字幕文字（通常是作者原话，但可能是自动生成的，专名数字要核对画面） |
 | video，无字幕但有音轨，`MMGREP_ASR_PROVIDER=none` | 照常出宫格图；`transcript.source = "none"`；每格 `text` 为空；清单末尾给出原因 | 只有画面。不能编造台词 |
 | video，无音轨 | 同上，原因写「no audio track」 | 只有画面 |
 | audio，**体检结论 too-quiet / silent** | **不跑 ASR**（避免幻觉段落）；`transcript.source = "none"`；说明写明「no effective speech」 | 什么都没有，只有一句说明 + 原因 |
-| audio，有字幕但无 ASR | 用字幕，`transcript.source = "subtitle"` | 画面 + 原话 |
+| audio，有字幕但无 ASR | 用字幕，`transcript.source = "subtitle"` | 画面 + 字幕文字（同上，核对专名与数字） |
 | document，`MMGREP_DOC_PROVIDER=none` | 照常出页缩略图宫格；`pages[].text` 为空；`transcript.source = "none"` | 只有页面缩略图 |
 | document，扫描件且 OCR 未配置 | 同上，且 `capabilities.ocr.available = false` | 只有页面缩略图；需要读字就 `media_zoom` 单页放大 |
 
 **关键原则一：宁可明说「没有文字」，也不要把 `transcript.source` 写成 `none` 却让文本清单看起来像有内容。** 清单里每格没有台词时，格后面明确留空并给一行 `transcript: NONE (…reason…)`。
 
-**关键原则二：字幕优先，ASR 只作兜底。** 只要有字幕（外部文件或内嵌轨），就**不**跑 ASR——字幕是作者写的，又准又免费；ASR 慢、贵、还会听错人名和数字。上游 `dsh-video-storyboard` 也是这个顺序（`transcript: "auto"` = 优先内嵌字幕轨，否则才 ASR）。
+**关键原则二：字幕优先，ASR 只作兜底。** 只要有字幕（外部文件或内嵌轨），就**不**跑 ASR——字幕通常比 ASR 准，又免费；ASR 慢、贵、还会听错人名和数字。上游 `dsh-video-storyboard` 也是这个顺序（`transcript: "auto"` = 优先内嵌字幕轨，否则才 ASR）。注意「字幕优先」说的是**成本与速度**，不是**可信度的绝对保证**：自动生成的字幕同样走这条路，专名与数字仍要核对画面（见 §2.5）。
 
 **关键原则三：宫格图只用来「找位置」，不用来「读文字」。** 宫格的一格通常只有几百像素，里面的字基本看不清。要读画面上的字，必须 `media_zoom` 裁出单帧再看。
 
@@ -860,7 +867,7 @@ media_overview({ path, images: 0, transcript: "subtitle", subtitle: "zh" })
 | `segments[].startMs` / `endMs` | integer | 时间范围 | ms |
 | `segments[].startSec` / `endSec` | number | 同上，秒 | s |
 | `segments[].text` | string | 字幕正文（已剥 markup） | — |
-| `segments[].source` | `"subtitle"` | 字幕恒为 `subtitle`（作者提供，可当原话引用） | — |
+| `segments[].source` | `"subtitle"` | 字幕恒为 `subtitle`（来自字幕文件 / 内嵌轨，可能是自动生成的） | — |
 | `segments[].origin` | `"file"` \| `"embedded"` | 来源渠道 | — |
 | `warnings[]` | array | 字幕来源相关警告（见 §8.5） | — |
 
@@ -875,7 +882,7 @@ media_overview({ path, images: 0, transcript: "subtitle", subtitle: "zh" })
 [seg 2   ] 00:03.000-00:06.000  (subtitle)  「……」
 ```
 
-字幕是**作者提供的文本**，可信度最高，可以当原话引用；这一点与 ASR 转写不同（见 §2.5）。
+字幕文本通常来自作者，但也可能是机器自动生成的：专有名词与数字要核对画面（见 §2.5）。cue 之间大面积时间重叠时（> 30%），overview 与 locate 还会给出警告 `rolling/auto-style captions detected — treat like ASR: check names and numbers against the frame.`。
 
 ### 8.5 字幕来源的判定顺序（写死）
 
@@ -1297,8 +1304,9 @@ How to read a file with MultiMediaGrep:
 TEXT SOURCE ORDER — subtitles first, ASR only as a fallback:
 an external subtitle file you pass in, then the subtitle track embedded in the container, then a
 subtitle file with the same base name in the same directory, then ASR as the last resort.
-Every segment is tagged with its source. "subtitle" is the author's own words and is safe to
-quote. "asr" is machine transcription: names, numbers and jargon are often wrong, so NEVER
+Every segment is tagged with its source. "subtitle" comes from a subtitle file/track; usually
+the author's words, but may be auto-generated: check names and numbers against the frame.
+"asr" is machine transcription: names, numbers and jargon are often wrong, so NEVER
 quote an ASR segment as the speaker's exact words, and never present it as a verbatim
 quotation. "visual" means there is no text at all — describe the picture, do not transcribe it.
 
@@ -1350,7 +1358,8 @@ TEXT SOURCE ORDER — subtitles first, ASR only as a fallback
 2. the subtitle track embedded in the container,
 3. a subtitle file with the same base name in the same directory (a.srt next to a.mp4),
 4. ASR, and only when none of the above exists.
-Every segment carries a source tag. "subtitle" is the author's own words — safe to quote.
+Every segment carries a source tag. "subtitle" comes from a subtitle file/track; usually the
+author's words, but may be auto-generated: check names and numbers against the frame.
 "asr" is machine transcription: names, numbers and jargon are often wrong, so NEVER quote an
 ASR segment as the speaker's exact words and never present it as a verbatim quotation.
 "ocr" is text read off a rendered page — check names and numbers against the page image.
@@ -1527,7 +1536,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | 21 | 无进度通知 | 长任务发 MCP progress notification | 上游靠 DSH 宿主；我们是标准 MCP，用标准机制 |
 | 22 | 缓存目录 `DSH_VIDEO_CACHE_DIR`，单条上限 50 MB；**缓存键 = 路径 + 大小 + mtime** | `MMGREP_CACHE_DIR` + `MMGREP_CACHE_MAX_BYTES`（默认 10 GiB）；**缓存主键 = 文件内容的 sha256**，另有一份指纹索引（路径+大小+mtime → 内容 hash）做快速路径 | 统一前缀；本项目要缓存的是**全文与页图**，量级远大于上游的切点缓存。内容哈希做主键是 epic 决策 9：「文件改了但缓存还命中」是这类工具最致命的 bug，而 path+mtime 只是权宜之计。指纹索引解决「每次都全文件哈希」的代价 |
 | 23 | 无 `media_probe` 的文档 / 音频形态 | `media_probe` 覆盖三种媒体 | 跨媒体统一 |
-| 24 | 返回值里**不标**每段文字的来源，只有一个总的 `transcript="asr"` 之类的标记 | 每段带 `source`（`subtitle`/`ocr`/`asr`/`visual`/`none`）+ `origin`（`file`/`embedded`/`asr`/`ocr`/`none`） | agent 必须能分辨「作者写的字幕」和「机器猜的转写」。上游自己就踩过这个坑（专门写 OCR 模块用硬字幕校正 ASR），但**没有把可信度暴露给模型** |
+| 24 | 返回值里**不标**每段文字的来源，只有一个总的 `transcript="asr"` 之类的标记 | 每段带 `source`（`subtitle`/`ocr`/`asr`/`visual`/`none`）+ `origin`（`file`/`embedded`/`asr`/`ocr`/`none`） | agent 必须能分辨「字幕文件里的文字」和「机器猜的转写」。上游自己就踩过这个坑（专门写 OCR 模块用硬字幕校正 ASR），但**没有把可信度暴露给模型** |
 | 25 | 上游的 `transcript: "auto"` 是「内嵌字幕轨优先，否则 ASR」，但显式字幕文件给了之后两者都跳过 | 明确的三级顺序：显式字幕选择 → 内嵌字幕轨 → ASR，并写进工具描述与 server instructions | 字幕优先是硬要求：**字幕准、免费、快**；ASR 会听错人名和数字。顺序必须写进 agent 看得到的文本里，不能只存在实现里 |
 | 26 | 上游不做音频体检，直接送 ASR | `media_probe` 对音频返回 `audioHealth`（音量 / 语音占比 / 静音占比 / 判定），太安静直接**不跑 ASR** | 太安静的录音送进 ASR 会得到一整段幻觉台词，比没有转写更糟。体检必须发生在 ASR 之前，且结论要出现在 agent 看得到的文本里 |
 | 27 | 上游 `video_zoom` 与 `video_storyboard` 都出图，没有「宫格只用来找位置」的约定 | 契约明确：**宫格图 = 找位置，裁切单帧 = 读文字** | 宫格一格只有几百像素，里面的字看不清；agent 常误以为「看过了图就知道上面写了什么」。这条必须写进用法指引，否则模型会拿宫格里的模糊笔画编内容 |

@@ -28,7 +28,8 @@ TEXT SOURCE ORDER — subtitles first, ASR only as a fallback
 2. the subtitle track embedded in the container,
 3. a subtitle file with the same base name in the same directory (a.srt next to a.mp4),
 4. ASR, and only when none of the above exists.
-Every segment carries a source tag. "subtitle" is the author's own words — safe to quote.
+Every segment carries a source tag. "subtitle" comes from a subtitle file/track; usually the
+author's words, but may be auto-generated: check names and numbers against the frame.
 "asr" is machine transcription: names, numbers and jargon are often wrong, so NEVER quote an
 ASR segment as the speaker's exact words and never present it as a verbatim quotation.
 "ocr" is text read off a rendered page — check names and numbers against the page image.

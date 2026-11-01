@@ -20,7 +20,7 @@
  "page":null,"speaker":null,"source":"subtitle","origin":"file","contentHash":"sha256:…"}
 ```
 
-- `source`：`subtitle`（作者字幕，可当原话引用）/ `ocr`（页面 OCR，专名数字需核对）/ `asr`（语音识别，**不可当原话引用**）/ `visual`（只有画面）/ `none`
+- `source`：`subtitle`（字幕文件或内嵌轨，通常是作者原话，但可能是自动生成的，专名数字需核对）/ `ocr`（页面 OCR，专名数字需核对）/ `asr`（语音识别，**不可当原话引用**）/ `visual`（只有画面）/ `none`
 - `origin`：`file`（外部字幕文件）/ `embedded`（容器内嵌字幕轨）/ `asr` / `ocr` / `none`
 - 文档段落 `startMs`/`endMs` 为 `null`，用 `page` 定位。
 
