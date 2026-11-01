@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -18,7 +19,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import { createLogger, loadConfig } from '../../src/server/config.js';
 import { createRuntime, createServer, logStartupBanner } from '../../src/server/index.js';
-import { startHttpServer } from '../../src/server/http.js';
+import { startHttpServer, isAuthorized } from '../../src/server/http.js';
 import { assertFfmpegAvailable, run } from '../../src/media/ffmpeg.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -95,6 +96,47 @@ async function rpc(endpoint, message, headers = {}) {
     // 不是 JSON 响应体的情况留给调用方自己断言
   }
   return { status: res.status, headers: res.headers, text, json };
+}
+
+/**
+ * 用裸 socket 发一条 HTTP/1.1 POST，Authorization 的值按**原始字节**写入。
+ *
+ * 为什么不用 fetch / http.request：它们的头值必须是 ByteString（码位 ≤ 0xFF），
+ * 多字节 UTF-8 令牌发不出去（fetch 抛 TypeError，http.request 抛 ERR_INVALID_CHAR）。
+ * 真实客户端（curl 等）是直接把 UTF-8 字节塞进头里的，这里模拟的就是这种请求。
+ */
+function rawRpc(endpoint, message, tokenBytes) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(endpoint.url);
+    const body = Buffer.from(JSON.stringify(message), 'utf8');
+    const head = Buffer.from(
+      [
+        `POST ${url.pathname} HTTP/1.1`,
+        `Host: ${url.host}`,
+        'Content-Type: application/json',
+        'Accept: application/json, text/event-stream',
+        `Content-Length: ${body.length}`,
+        'Connection: close',
+        'Authorization: Bearer ',
+      ].join('\r\n'),
+      'latin1',
+    );
+
+    const socket = net.connect({ host: url.hostname, port: Number(url.port) }, () => {
+      socket.write(Buffer.concat([head, tokenBytes, Buffer.from('\r\n\r\n'), body]));
+    });
+
+    const chunks = [];
+    socket.on('data', (chunk) => chunks.push(chunk));
+    socket.on('error', reject);
+    socket.on('end', () => {
+      // 响应头是 ASCII；正文是 UTF-8 字节，先按 latin1 还原字节再按 utf8 解码。
+      const raw = Buffer.concat(chunks).toString('latin1');
+      const split = raw.indexOf('\r\n\r\n');
+      const status = Number(/^HTTP\/1\.[01] (\d{3})/.exec(raw)?.[1] ?? 0);
+      resolve({ status, text: Buffer.from(raw.slice(split + 4), 'latin1').toString('utf8') });
+    });
+  });
 }
 
 /** 生成一段 2 秒的测试音频（lavfi 正弦波），跟 test/backend/audio.test.js 一个套路 */
@@ -251,6 +293,45 @@ test('http：配了令牌就必须带对 Authorization 头', async () => {
       body: JSON.stringify(message),
     });
     assert.equal(viaQuery.status, 401);
+  });
+});
+
+test('http：isAuthorized 按原始字节比较，非 ASCII 令牌才可能匹配', () => {
+  const token = '测试令牌-éà';
+  // node:http 把请求头的每个原始字节解码成一个 latin1 字符；这里还原服务端收到的样子。
+  const asReceived = (text) => Buffer.from(text, 'utf8').toString('latin1');
+  const reqWith = (authorization) => ({ headers: { authorization } });
+
+  // 非 ASCII：能匹配；错一个字符就不行
+  assert.equal(isAuthorized(reqWith(`Bearer ${asReceived(token)}`), token), true);
+  assert.equal(isAuthorized(reqWith(`Bearer ${asReceived('测试令牌-éá')}`), token), false);
+
+  // ASCII 行为不变
+  assert.equal(isAuthorized(reqWith('Bearer ascii-token'), 'ascii-token'), true);
+  assert.equal(isAuthorized(reqWith('Bearer ascii-token'), 'other-token'), false);
+
+  // 空头 / 缺头 / 没有 Bearer 前缀 / 超长头：一律判否，且绝不抛
+  // （timingSafeEqual 对不等长会抛异常，长度判断必须挡在它前面）
+  assert.equal(isAuthorized(reqWith(''), token), false);
+  assert.equal(isAuthorized(reqWith('Bearer '), token), false);
+  assert.equal(isAuthorized({ headers: {} }, token), false);
+  assert.equal(isAuthorized(reqWith(`Bearer ${'x'.repeat(65536)}`), token), false);
+
+  // 没配令牌：放行
+  assert.equal(isAuthorized(reqWith(''), ''), true);
+});
+
+test('http：非 ASCII 令牌经真实 HTTP 头（UTF-8 字节）端到端通过，错误令牌仍 401', async () => {
+  const token = '测试令牌-éà';
+  await withHttpServer({ MMGREP_HTTP_TOKEN: token }, async ({ endpoint }) => {
+    const message = { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} };
+
+    const right = await rawRpc(endpoint, message, Buffer.from(token, 'utf8'));
+    assert.equal(right.status, 200);
+    assert.equal(JSON.parse(right.text).result.tools.length, 5);
+
+    const wrong = await rawRpc(endpoint, message, Buffer.from('测试令牌-错误', 'utf8'));
+    assert.equal(wrong.status, 401);
   });
 });
 
@@ -528,6 +609,27 @@ test('http：逐请求凭据 —— 同一端点两个请求各用各的 provide
   } finally {
     await stub.close();
   }
+});
+
+test('http：日志只脱敏 key 值，凭据头名保持完整', async () => {
+  const sentinel = 'sentinel-log-redaction-must-vanish';
+  const genericSentinel = 'sentinel-generic-log-redaction-must-vanish';
+  await withHttpServer({}, async ({ endpoint, logs }) => {
+    const res = await rpc(endpoint, { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }, {
+      'x-mmgrep-asr-provider': 'elevenlabs',
+      'x-mmgrep-elevenlabs-api-key': sentinel,
+      'x-mmgrep-asr-api-key': genericSentinel,
+    });
+    assert.equal(res.status, 200);
+
+    const text = logs.join('\n');
+    // provider id（elevenlabs）是头名的一部分：脱敏只认 key 值，头名必须原样保留。
+    assert.match(text, /x-mmgrep-elevenlabs-api-key/, `凭据头名被脱敏破坏了：${text}`);
+    assert.match(text, /x-mmgrep-asr-api-key/, `通用凭据头名被脱敏破坏了：${text}`);
+    assert.ok(!text.includes('x-mmgrep-[redacted]-api-key'), `凭据头名被脱敏破坏了：${text}`);
+    assert.ok(!text.includes(sentinel), `日志泄漏了 provider 专属 key：${text}`);
+    assert.ok(!text.includes(genericSentinel), `日志泄漏了通用 key：${text}`);
+  });
 });
 
 test('http：没有凭据头的请求复用共享 runtime（不重建 provider）', async () => {
