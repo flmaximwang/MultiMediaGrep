@@ -19,6 +19,7 @@ import { formatTimestamp } from '../export/format.js';
 import { exportAnalysis } from '../export/index.js';
 import { detectMediaType } from '../media/detect.js';
 import { DOC_SNIPPET_RADIUS, buildSnippet, countHits } from '../media/match.js';
+import { ROLLING_SUBTITLE_WARNING } from '../media/subtitles.js';
 import {
   METHOD_MATRIX,
   ToolError,
@@ -87,7 +88,8 @@ TEXT SOURCE ORDER — subtitles first, ASR only as a fallback:
 2. the subtitle track embedded in the container,
 3. a subtitle file with the same base name in the same directory (a.srt next to a.mp4),
 4. ASR — only when none of the above exists and an ASR provider is configured.
-Every segment is tagged with its source. subtitle = the author's own words, safe to quote.
+Every segment is tagged with its source. subtitle = from a subtitle file/track; usually the
+author's words, but may be auto-generated: check names and numbers against the frame.
 asr = machine transcription: names, numbers and jargon are often wrong, so do NOT quote an ASR
 segment verbatim and do not present it as the speaker's exact words. visual = there is no text
 at all, only the picture.
@@ -1088,9 +1090,12 @@ function formatProbeText(result) {
   return lines.join('\n');
 }
 
+/** 字幕来源的措辞：字幕通常来自作者，但也可能是自动生成的（9z5.26：不作「可安全引用」的绝对承诺） */
+const SUBTITLE_SOURCE_NOTE = 'note: source is subtitle — from a subtitle file/track; usually the author\'s words, but may be auto-generated: check names and numbers against the frame.';
+
 function formatOverviewText({
   mediaType, base, window, pages, durationSec, segments, transcript, imageDescriptors, textOnly, budget, hasAudio,
-  fullTextNote = null, continuationNote = null,
+  fullTextNote = null, continuationNote = null, warnings = [],
 }) {
   const lines = [];
   const attrs = [`path="${base.path}"`, `type="${mediaType}"`];
@@ -1145,12 +1150,14 @@ function formatOverviewText({
     }
     if (transcript.source === 'asr') {
       bodyNotes.push('note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not quote these lines as the speaker\'s exact words.');
+    } else if (transcript.source === 'subtitle') {
+      bodyNotes.push(SUBTITLE_SOURCE_NOTE);
     }
   } else if (mediaType === 'audio') {
     if (transcript.source === 'asr') {
       bodyNotes.push('note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not quote these lines as the speaker\'s exact words.');
     } else if (transcript.source === 'subtitle') {
-      bodyNotes.push('note: source is subtitle — the author\'s own words, safe to quote.');
+      bodyNotes.push(SUBTITLE_SOURCE_NOTE);
     }
   } else if (mediaType === 'document') {
     if (textOnly) {
@@ -1158,6 +1165,7 @@ function formatOverviewText({
     }
     bodyNotes.push('note: page text comes from OCR of the rendered pages — verify names and numbers against the page image via media_zoom({ path, page }).');
   }
+  if (warnings.includes(ROLLING_SUBTITLE_WARNING)) bodyNotes.push(ROLLING_SUBTITLE_WARNING);
   if (budget.warning) bodyNotes.push(`budget: ${budget.warning}`);
 
   // 全文落盘路径 / 续读提示也进 text content（9z5.22），并计入内联上限。
@@ -1651,6 +1659,7 @@ async function handleOverview(args, call) {
     transcript,
     imageDescriptors: descriptors,
     textOnly,
+    warnings: Array.isArray(result.warnings) ? result.warnings : [],
     budget: {
       ...budget,
       maxInlineChars: call.config?.text?.maxInlineChars ?? DEFAULT_MAX_TEXT_INLINE_CHARS,

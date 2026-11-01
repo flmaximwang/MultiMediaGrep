@@ -15,7 +15,13 @@ import path from 'node:path';
 
 import { run } from './ffmpeg.js';
 import { ToolError } from './interface.js';
-import { parseSubtitles, readSubtitleFile, SUBTITLE_FORMATS } from './subtitles.js';
+import {
+  parseSubtitleDocument,
+  readSubtitleFile,
+  ROLLING_OVERLAP_RATIO_THRESHOLD,
+  ROLLING_SUBTITLE_WARNING,
+  SUBTITLE_FORMATS,
+} from './subtitles.js';
 
 /** 文本型字幕编码（位图字幕轨无法解析成文字，跳过） */
 const BITMAP_SUBTITLE_CODECS = new Set(['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub']);
@@ -308,8 +314,27 @@ async function readExplicitSubtitleFile(filePath) {
     sourcePath: filePath,
     language: null,
     segments: parsed.segments,
+    overlapRatio: parsed.overlapRatio,
     warnings: [],
   };
+}
+
+/**
+ * 滚动/自动样式字幕的警告（9z5.26）：cue 之间大面积时间重叠时，
+ * 字幕多半是机器自动生成或滚动显示的，可信度按 ASR 对待。
+ * 警告同时进 result.warnings 与调用方的 warnings，两边都拿得到。
+ */
+function applyRollingWarning(result, warnings) {
+  if (!result) return result;
+  const ratio = result.overlapRatio;
+  if (typeof ratio !== 'number' || !(ratio > ROLLING_OVERLAP_RATIO_THRESHOLD)) return result;
+  const target = Array.isArray(result.warnings) ? result.warnings : [];
+  if (!target.includes(ROLLING_SUBTITLE_WARNING)) target.push(ROLLING_SUBTITLE_WARNING);
+  result.warnings = target;
+  if (Array.isArray(warnings) && !warnings.includes(ROLLING_SUBTITLE_WARNING)) {
+    warnings.push(ROLLING_SUBTITLE_WARNING);
+  }
+  return result;
 }
 
 /**
@@ -434,7 +459,7 @@ export async function resolveSubtitleSource({
     if (selection.kind === 'file') {
       const explicit = await readExplicitSubtitleFile(selection.path);
       warnings.push(...explicit.warnings);
-      return explicit;
+      return applyRollingWarning(explicit, warnings);
     }
 
     const streamIndex = selection.stream?.index;
@@ -448,24 +473,25 @@ export async function resolveSubtitleSource({
     } catch (error) {
       throw new ToolError('INVALID_ARGUMENT', `subtitle track ${track} could not be read: ${error?.message ?? error}.`);
     }
-    let segments;
+    let parsed;
     try {
-      segments = parseSubtitles(text, { format: 'srt' });
+      parsed = parseSubtitleDocument(text, { format: 'srt' });
     } catch (error) {
       throw new ToolError('INVALID_ARGUMENT', `subtitle track ${track} could not be parsed: ${error?.message ?? error}.`);
     }
-    if (segments.length === 0) {
+    if (parsed.segments.length === 0) {
       throw new ToolError('INVALID_ARGUMENT', `subtitle track ${track} contains no subtitle cues.`);
     }
     warnings.push(...selection.warnings);
-    return {
+    return applyRollingWarning({
       origin: 'embedded',
       format: 'embedded',
       sourcePath: null,
       language: selection.language,
-      segments,
+      segments: parsed.segments,
+      overlapRatio: parsed.overlapRatio,
       warnings,
-    };
+    }, warnings);
   }
 
   if (embedded) {
@@ -475,16 +501,17 @@ export async function resolveSubtitleSource({
       const track = stream.index ?? '?';
       try {
         const text = await extractEmbeddedSubtitle(mediaPath, stream.index, { signal });
-        const segments = parseSubtitles(text, { format: 'srt' });
-        if (segments.length > 0) {
-          return {
+        const parsed = parseSubtitleDocument(text, { format: 'srt' });
+        if (parsed.segments.length > 0) {
+          return applyRollingWarning({
             origin: 'embedded',
             format: 'embedded',
             sourcePath: null,
             language: stream?.tags?.language ?? null,
-            segments,
+            segments: parsed.segments,
+            overlapRatio: parsed.overlapRatio,
             warnings,
-          };
+          }, warnings);
         }
         warnings.push(`embedded-subtitle-empty (track ${track})`);
       } catch (error) {
@@ -499,14 +526,15 @@ export async function resolveSubtitleSource({
     for (const candidate of await discoverSiblingSubtitles(mediaPath)) {
       try {
         const parsed = await readSubtitleFile(candidate.path);
-        return {
+        return applyRollingWarning({
           origin: 'file',
           format: parsed.format,
           sourcePath: candidate.path,
           language: candidate.language,
           segments: parsed.segments,
+          overlapRatio: parsed.overlapRatio,
           warnings,
-        };
+        }, warnings);
       } catch (error) {
         warnings.push(`sibling-subtitle-unreadable: ${candidate.path}: ${error?.message ?? error}`);
       }
