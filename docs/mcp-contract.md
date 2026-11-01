@@ -337,7 +337,7 @@ path, and it only prepares images and text for your own model to look at.
 |---|---|:---:|---|---|
 | `path` | string | ✅ | — | 本地文件绝对路径。拒绝 URL 与相对路径。 |
 | `transcriptFile` | string | ❌ | — | 本地字幕/转写文件路径（绝对路径）。给了就优先用它，跳过内嵌字幕轨与 ASR。 |
-| `transcript` | `"auto"` \| `"off"` | ❌ | `"auto"` | `"off"` 表示完全不要转写（只报轨道，不试 ASR）。 |
+| `transcript` | `"auto"` \| `"subtitle"` \| `"off"` | ❌ | `"auto"` | `"auto"` 字幕优先、ASR 兜底；`"subtitle"` 只读字幕、**绝不**调用 ASR，无字幕来源时 `segments = []` 并在 `transcript.reason` / `warnings` 说明；`"off"` 字幕与 ASR 都不做，`transcript.source = "none"`。 |
 
 ### 4.3 返回结构
 
@@ -497,7 +497,7 @@ through the rest.
 |---|---|:---:|---|---|---|
 | `path` | string | ✅ | — | 全部 | 本地绝对路径 |
 | `transcriptFile` | string | ❌ | — | video, audio | 本地字幕/转写文件（`.srt`/`.vtt`/`.ass`/`.ssa`） |
-| `transcript` | `"auto"` \| `"off"` | ❌ | `"auto"` | video, audio | `"off"` 跳过转写（只出画面） |
+| `transcript` | `"auto"` \| `"subtitle"` \| `"off"` | ❌ | `"auto"` | video, audio | `"auto"` 字幕优先、ASR 兜底；`"subtitle"` 只读字幕、绝不跑 ASR（无字幕来源时 `segments = []` 并说明原因）；`"off"` 字幕与 ASR 都不做（只出画面） |
 | `start` | number | ❌ | `0` | video, audio | 起点（秒，浮点） |
 | `end` | number | ❌ | 媒体末尾 | video, audio | 终点（秒，浮点） |
 | `segment` | integer | ❌ | `300` | video, audio | 只给 `start` 不给 `end` 时的窗口长度（秒，30–3600） |
@@ -541,6 +541,7 @@ through the rest.
 | `transcript.language` | string \| null | 语言 | — |
 | `transcript.segmentCount` | integer | 总段落数（全文，不是节选数） | 条 |
 | `transcript.provider` / `transcript.model` | string \| null | ASR provider 与模型 | — |
+| `transcript.reason` | string \| null | 没有转写时的人话原因（`source = "none"` 时给出） | — |
 | `pages[]` | array \| null | document 的每页文字（`{page, text, truncated}`） | — |
 | `fullText.dir` | string | 全文落盘目录 | — |
 | `fullText.contentMd` | string | `content.md` 绝对路径 | — |
@@ -742,7 +743,7 @@ speaker's exact words.
 | `query` | string | ✅ | — | 全部 | 要找的文本片段 / 关键词 |
 | `max` | integer | ❌ | `5` | 全部 | 最多返回几条匹配，1–20 |
 | `transcriptFile` | string | ❌ | — | video, audio | 本地字幕/转写文件 |
-| `transcript` | `"auto"` \| `"off"` | ❌ | `"auto"` | video, audio | — |
+| `transcript` | `"auto"` \| `"subtitle"` \| `"off"` | ❌ | `"auto"` | video, audio | `"subtitle"` 只查字幕、不跑 ASR；`"off"` 不接受任何转写来源 |
 | `start` / `end` | number | ❌ | 全媒体 | video, audio | 只在这个时间窗里找 |
 | `segment` | integer | ❌ | `300` | video, audio | 只给 `start` 不给 `end` 时的窗口长度 |
 | `pages` | string | ❌ | 全文 | document | 只在这些页里找 |
@@ -862,6 +863,15 @@ what is on screen.
 > `transcriptFile` → 内嵌字幕轨 → 同目录同名文件自动发现。
 > `media_overview` / `media_locate` 在这三步都没命中时**继续用 ASR 兜底**；
 > `video_subtitles` 因为是「非要有字幕不可」的工具，到第 3 步为止，仍无则报 `NO_TRANSCRIPT`。
+
+`media_overview` / `media_locate` 的 `transcript` 参数控制文字来源：
+
+- `"auto"`（默认）：走完第 1–3 步，没命中才进入第 4 步 ASR 兜底。
+- `"subtitle"`：只走第 1–3 步，**绝不**调用 ASR。没有字幕来源时 `segments = []`，`transcript.source = "none"`，
+  `transcript.reason` 写明原因，`warnings` 含 `"no-subtitle-source"`；`media_locate` 因为非要有文字，会报 `NO_TRANSCRIPT`。
+- `"off"`：第 1–4 步全部跳过，字幕也不读。`transcript.source = "none"`，`reason` 说明是调用方关闭，
+  `warnings` 含 `"transcript-disabled"`。`media_probe` 的 `capabilities.asr.available` 为 `false`，
+  `capabilities.transcriptSource` / `transcriptOrigin` 均为 `"none"`。
 
 1. **`transcriptFile` 显式给了** → 只用它。文件读不到或解析不出内容 → 报错 `TRANSCRIPT_UNREADABLE`，**不静默回退**。
 2. **容器内嵌字幕轨** → 取第一条文本型轨。多轨时按语言优先级 `zh-Hans` → `zh-CN` → `zh` → `en-US` → `en` → 轨道序号。

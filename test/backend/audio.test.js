@@ -176,6 +176,74 @@ test('后端 probe/overview/zoom/locate：字幕文件路径', { skip }, async (
   }
 });
 
+test('后端 transcript 三值：subtitle 只读字幕、off 不读字幕，且都不调用 ASR', { skip }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-audio-modes-'));
+  const prevCache = process.env.MMGREP_CACHE_DIR;
+  process.env.MMGREP_CACHE_DIR = path.join(dir, 'cache');
+  try {
+    const audio = await makeAudio(dir, 'toned.wav', '0.5*sin(2*PI*440*t)', 12);
+    await writeFile(path.join(dir, 'toned.srt'), `1
+00:00:00,000 --> 00:00:03,000
+有字幕的录音
+
+2
+00:00:03,000 --> 00:00:06,000
+第二句
+`);
+    const bare = await makeAudio(dir, 'bare.wav', '0.5*sin(2*PI*440*t)', 3);
+
+    const calls = [];
+    const asrProvider = {
+      id: 'stub',
+      describe: () => ({ id: 'stub', model: 'stub', baseUrl: null }),
+      transcribe: async ({ audioPath }) => {
+        calls.push(audioPath);
+        throw new Error('ASR MUST NOT BE CALLED');
+      },
+    };
+    const backend = createAudioBackend({ asrProvider, config: {} });
+
+    // subtitle + 有字幕：正常读到
+    const withSubs = await backend.overview({ path: audio, transcript: 'subtitle', envelope: false });
+    assert.equal(calls.length, 0);
+    assert.equal(withSubs.transcript.source, 'subtitle');
+    assert.ok(withSubs.segments.some((segment) => /有字幕的录音/.test(segment.text)));
+
+    // subtitle + 无字幕：空结果 + 原因
+    const noSubs = await backend.overview({ path: bare, transcript: 'subtitle', envelope: false });
+    assert.equal(calls.length, 0, 'subtitle mode must never call ASR');
+    assert.deepEqual(noSubs.segments, []);
+    assert.equal(noSubs.transcript.source, 'none');
+    assert.match(noSubs.transcript.reason, /no subtitle source/i);
+    assert.ok(noSubs.warnings.includes('no-subtitle-source'));
+
+    // off + 有字幕：字幕也不读
+    const off = await backend.overview({ path: audio, transcript: 'off', envelope: false });
+    assert.equal(calls.length, 0);
+    assert.deepEqual(off.segments, []);
+    assert.equal(off.transcript.source, 'none');
+    assert.match(off.transcript.reason, /disabled/i);
+    assert.ok(off.warnings.includes('transcript-disabled'));
+
+    // probe capabilities 随参数变化
+    const autoProbe = await backend.probe({ path: bare, transcript: 'auto' });
+    assert.equal(autoProbe.capabilities.asr.available, true);
+    const subProbe = await backend.probe({ path: bare, transcript: 'subtitle' });
+    assert.equal(subProbe.capabilities.asr.available, false);
+    assert.match(subProbe.capabilities.asr.reason, /subtitle/i);
+    const offProbe = await backend.probe({ path: audio, transcript: 'off' });
+    assert.equal(offProbe.capabilities.asr.available, false);
+    assert.match(offProbe.capabilities.asr.reason, /disabled/i);
+    assert.equal(offProbe.capabilities.transcriptSource, 'none');
+    assert.equal(offProbe.capabilities.transcriptOrigin, 'none');
+    assert.equal(calls.length, 0, 'probe never runs ASR');
+  } finally {
+    if (prevCache === undefined) delete process.env.MMGREP_CACHE_DIR;
+    else process.env.MMGREP_CACHE_DIR = prevCache;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('后端 overview：静音录音不调用 ASR', { skip }, async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-audio-quiet-'));
   const prevCache = process.env.MMGREP_CACHE_DIR;

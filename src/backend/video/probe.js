@@ -230,12 +230,16 @@ export async function shapeProbe({ media, audioHealth, input, ctx }) {
     }
   }
 
+  const transcriptMode = input?.transcript ?? 'auto';
   const provider = ctx.asrProvider ?? null;
   let asrAvailable = Boolean(provider) && audioHealth.effective;
   let asrReason = null;
-  if (input?.transcript === 'off') {
+  if (transcriptMode === 'off') {
     asrAvailable = false;
     asrReason = 'Transcription was disabled for this call (transcript: "off").';
+  } else if (transcriptMode === 'subtitle') {
+    asrAvailable = false;
+    asrReason = 'transcript is "subtitle": only subtitle sources are read and ASR is never called.';
   } else if (!media.hasAudio) {
     asrAvailable = false;
     asrReason = 'This file has no audio track.';
@@ -248,7 +252,7 @@ export async function shapeProbe({ media, audioHealth, input, ctx }) {
 
   let transcriptSource = 'none';
   let transcriptOrigin = 'none';
-  if (subtitleOrigin) {
+  if (transcriptMode !== 'off' && subtitleOrigin) {
     transcriptSource = 'subtitle';
     transcriptOrigin = subtitleOrigin;
   } else if (asrAvailable) {
