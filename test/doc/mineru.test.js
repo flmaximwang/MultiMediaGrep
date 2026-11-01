@@ -9,7 +9,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { deflateRawSync } from 'node:zlib';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -238,6 +238,11 @@ function contentListZip(items, name = 'content_list.json') {
   return makeZip([{ name, data: JSON.stringify(items) }]);
 }
 
+/** 读取 test/doc/fixtures/ 下的 JSON fixture。 */
+async function loadFixture(name) {
+  return JSON.parse(await readFile(new URL(`./fixtures/${name}`, import.meta.url), 'utf8'));
+}
+
 const SAMPLE_ITEMS = [
   { type: 'text', text: '第一页标题', text_level: 1, page_idx: 0 },
   { type: 'text', text: '第一页正文', page_idx: 0 },
@@ -296,15 +301,14 @@ test('runs the upload → poll → download flow and maps pages correctly', asyn
     assert.equal(result.pages[1].text, '第二页正文\n\n表 1\nA | B\n1 | 2');
     assert.equal(result.pages[2].text, '第三页正文');
 
-    // 契约 v2：每页都有 blocks + textOrigin；9z5.28 只做最简 paragraph 映射。
+    // 契约 v2：每页都有 blocks + textOrigin；text_level 标题映射成 heading。
     for (const page of result.pages) {
       assert.ok(Array.isArray(page.blocks), 'page.blocks must be an array');
       assert.ok(page.blocks.length > 0, 'page.blocks must not be empty');
-      assert.ok(page.blocks.every((block) => block.type === 'paragraph'));
-      assert.equal(page.textOrigin, 'unknown', 'pipeline auto is conservative until 9z5.29 verifies it');
+      assert.equal(page.textOrigin, 'unknown', 'role both without per-page text-layer info is conservative');
     }
     assert.deepEqual(result.pages[0].blocks, [
-      { type: 'paragraph', text: '第一页标题' },
+      { type: 'heading', level: 1, text: '第一页标题' },
       { type: 'paragraph', text: '第一页正文' },
     ]);
 
@@ -322,7 +326,7 @@ test('runs the upload → poll → download flow and maps pages correctly', asyn
     assert.equal(postedBody.files[0].name, 'doc.pdf');
     // 契约 v2：auto 不再强制 is_ocr；默认请求体里没有这个字段。
     assert.equal(postedBody.files[0].is_ocr, undefined);
-    assert.equal(postedBody.model_version, undefined); // 默认留空，用服务端默认模型
+    assert.equal(postedBody.model_version, 'pipeline'); // typeset / both 角色显式钉在 pipeline
 
     // 预签名 PUT 不能带 Authorization / Content-Type
     const put = stub.calls[1];
@@ -636,6 +640,26 @@ test('re-bases page indices if the server renumbers a sliced range from zero', a
   }
 });
 
+test('maps a relative page_idx list onto a discrete requested page list', async () => {
+  const stub = await startStub({
+    zipFor: () => contentListZip([
+      { type: 'text', text: 'page 4 text', page_idx: 0 },
+      { type: 'text', text: 'page 28 text', page_idx: 1 },
+    ]),
+  });
+  try {
+    const provider = createMineruDocProvider({ apiKey: 'k', baseUrl: stub.baseUrl, timeoutMs: 10_000, pollIntervalMs: 1 });
+    const result = await withTempFile('doc.pdf', 'x', (filePath) =>
+      provider.parse({ filePath, pages: { list: [4, 28] } }),
+    );
+    assert.equal(JSON.parse(stub.calls[0].body).files[0].page_ranges, '4,28');
+    assert.deepEqual(result.pages.map((page) => page.page), [4, 28]);
+    assert.deepEqual(result.pages.map((page) => page.text), ['page 4 text', 'page 28 text']);
+  } finally {
+    await stub.close();
+  }
+});
+
 test('finds content_list.json inside a subdirectory of the result package', async () => {
   const stub = await startStub({
     zipFor: () =>
@@ -689,26 +713,237 @@ test('ocrMode：auto 不发 is_ocr，force 才发 is_ocr: true（契约 v2）', 
   }
 });
 
-test('textOrigin：ocr 角色 → ocr；typeset 角色 → unknown；vlm → ocr', async () => {
+test('textOrigin：typeset 钉 pipeline 并返回 textlayer；ocr 角色返回 ocr', async () => {
   const stub = await startStub({
     zipFor: () => contentListZip([{ type: 'text', text: 'text', page_idx: 0 }]),
   });
   try {
     const base = { apiKey: 'k', baseUrl: stub.baseUrl, timeoutMs: 10_000, pollIntervalMs: 1 };
+
+    const typeset = await withTempFile('doc.pdf', 'x', (filePath) =>
+      createMineruDocProvider({ ...base, role: 'typeset' }).parse({
+        filePath,
+        role: 'typeset',
+        textLayers: { 1: 'text from the PDF text layer' },
+      }),
+    );
+    assert.equal(typeset.pages[0].textOrigin, 'textlayer');
+    const typesetBody = JSON.parse(stub.calls[0].body);
+    // typeset 角色显式钉在 pipeline（即便 MMGREP_MINERU_MODEL 留空）。
+    assert.equal(typesetBody.model_version, 'pipeline');
+    assert.equal(typesetBody.files[0].is_ocr, undefined);
+
+    stub.calls.length = 0;
     const ocr = await withTempFile('doc.pdf', 'x', (filePath) =>
       createMineruDocProvider({ ...base, role: 'ocr' }).parse({ filePath, role: 'ocr' }),
     );
     assert.equal(ocr.pages[0].textOrigin, 'ocr');
+    // OCR 角色 + 空 model：不发送 model_version，由服务端默认（pipeline）。
+    assert.equal(JSON.parse(stub.calls[0].body).model_version, undefined);
+  } finally {
+    await stub.close();
+  }
+});
 
-    const typeset = await withTempFile('doc.pdf', 'x', (filePath) =>
-      createMineruDocProvider({ ...base, role: 'typeset' }).parse({ filePath, role: 'typeset' }),
+test('textOrigin：role both 用 textLayers 逐页区分 textlayer / ocr', async () => {
+  const stub = await startStub({
+    zipFor: () => contentListZip([
+      { type: 'text', text: 'page one', page_idx: 0 },
+      { type: 'text', text: 'page two', page_idx: 1 },
+    ]),
+  });
+  try {
+    const provider = createMineruDocProvider({
+      apiKey: 'k',
+      baseUrl: stub.baseUrl,
+      timeoutMs: 10_000,
+      pollIntervalMs: 1,
+    });
+    const result = await withTempFile('doc.pdf', 'x', (filePath) =>
+      provider.parse({ filePath, role: 'both', textLayers: { 1: 'page one' } }),
     );
-    assert.equal(typeset.pages[0].textOrigin, 'unknown');
+    assert.deepEqual(
+      result.pages.map((page) => page.textOrigin),
+      ['textlayer', 'ocr'],
+      'page 1 has a text layer, page 2 was routed to OCR',
+    );
 
-    const vlm = await withTempFile('doc.pdf', 'x', (filePath) =>
-      createMineruDocProvider({ ...base, model: 'vlm', role: 'typeset' }).parse({ filePath, role: 'typeset' }),
+    // 没有逐页文字层信息时保持保守值 unknown。
+    stub.calls.length = 0;
+    const unknown = await withTempFile('doc.pdf', 'x', (filePath) =>
+      provider.parse({ filePath, role: 'both' }),
     );
-    assert.equal(vlm.pages[0].textOrigin, 'ocr', 'VLM 读页图 = 实质 OCR');
+    assert.deepEqual(
+      unknown.pages.map((page) => page.textOrigin),
+      ['unknown', 'unknown'],
+    );
+  } finally {
+    await stub.close();
+  }
+});
+
+test('textOrigin：vlm 的 OCR 角色 → ocr；vlm + typeset 是清晰错误', async () => {
+  const stub = await startStub({
+    zipFor: () => contentListZip([{ type: 'text', text: 'text', page_idx: 0 }]),
+  });
+  try {
+    const base = { apiKey: 'k', baseUrl: stub.baseUrl, timeoutMs: 10_000, pollIntervalMs: 1 };
+
+    const vlmOcr = await withTempFile('doc.pdf', 'x', (filePath) =>
+      createMineruDocProvider({ ...base, model: 'vlm', role: 'ocr' }).parse({ filePath, role: 'ocr' }),
+    );
+    assert.equal(vlmOcr.pages[0].textOrigin, 'ocr', 'VLM 读页图 = 实质 OCR');
+    assert.equal(JSON.parse(stub.calls[0].body).model_version, 'vlm');
+
+    stub.calls.length = 0;
+    const provider = createMineruDocProvider({ ...base, model: 'vlm', role: 'typeset' });
+    await withTempFile('doc.pdf', 'x', async (filePath) => {
+      await assert.rejects(
+        () => provider.parse({ filePath, role: 'typeset' }),
+        (err) => {
+          assert.match(err.message, /typeset role/i);
+          assert.match(err.message, /vlm/i);
+          assert.match(err.message, /MMGREP_MINERU_MODEL/);
+          assert.match(err.message, /MMGREP_TYPESET_PROVIDER/);
+          return true;
+        },
+      );
+      await assert.rejects(() => provider.parse({ filePath, role: 'both' }), /typeset role/i);
+    });
+    assert.equal(stub.calls.length, 0, '冲突必须在发请求前报错');
+  } finally {
+    await stub.close();
+  }
+});
+
+test('typeset + ocrMode force 是冲突：明确报错，不发送 is_ocr', async () => {
+  const stub = await startStub({
+    zipFor: () => contentListZip([{ type: 'text', text: 'text', page_idx: 0 }]),
+  });
+  try {
+    const provider = createMineruDocProvider({
+      apiKey: 'k',
+      baseUrl: stub.baseUrl,
+      timeoutMs: 10_000,
+      pollIntervalMs: 1,
+      role: 'typeset',
+    });
+    await withTempFile('doc.pdf', 'x', (filePath) =>
+      assert.rejects(
+        () => provider.parse({ filePath, role: 'typeset', ocrMode: 'force' }),
+        (err) => {
+          assert.match(err.message, /typeset role/i);
+          assert.match(err.message, /force/i);
+          assert.match(err.message, /role "ocr"/i);
+          return true;
+        },
+      ),
+    );
+    assert.equal(stub.calls.length, 0);
+  } finally {
+    await stub.close();
+  }
+});
+
+test('maps content_list items to blocks：heading levels、list、table、caption、equation、footnote', async () => {
+  const items = await loadFixture('mineru-content-list-blocks.json');
+  const stub = await startStub({ zipFor: () => contentListZip(items) });
+  try {
+    const provider = createMineruDocProvider({
+      apiKey: 'k',
+      baseUrl: stub.baseUrl,
+      timeoutMs: 10_000,
+      pollIntervalMs: 1,
+    });
+    const result = await withTempFile('doc.pdf', 'x', (filePath) =>
+      provider.parse({ filePath, role: 'typeset' }),
+    );
+
+    assert.equal(result.pages.length, 2);
+    const page = result.pages[0];
+    assert.equal(page.textOrigin, 'textlayer');
+    assert.deepEqual(
+      page.blocks.map((block) => block.type),
+      ['heading', 'heading', 'heading', 'paragraph', 'list', 'table', 'caption', 'footnote', 'caption', 'paragraph', 'equation', 'footnote'],
+    );
+    assert.deepEqual(page.blocks[0], { type: 'heading', level: 1, text: 'Document title' });
+    assert.deepEqual(page.blocks[1], { type: 'heading', level: 1, text: '1 Introduction' });
+    assert.deepEqual(page.blocks[2], { type: 'heading', level: 2, text: '1.1 Scope' });
+    assert.deepEqual(page.blocks[3], { type: 'paragraph', text: 'Body paragraph with AGO2F470V.' });
+    assert.deepEqual(page.blocks[4], { type: 'list', text: 'First item\nSecond item' });
+    assert.deepEqual(page.blocks[5], {
+      type: 'table',
+      text: 'Table 1 | Results\nA | B\n1 | 2\n* p < 0.05',
+    });
+    assert.deepEqual(page.blocks[6], { type: 'caption', text: 'Figure 1 | A caption' });
+    assert.deepEqual(page.blocks[7], { type: 'footnote', text: 'Image footnote' });
+    assert.deepEqual(page.blocks[8], { type: 'caption', text: 'Chart 1 | Trend' });
+    assert.deepEqual(page.blocks[9], { type: 'paragraph', text: 'chart body' });
+    assert.deepEqual(page.blocks[10], { type: 'equation', text: 'E = mc^2' });
+    assert.deepEqual(page.blocks[11], { type: 'footnote', text: '1 Corresponding author.' });
+
+    // text 由 blocks 派生（表格块内部保留换行，块之间空行）。
+    assert.equal(page.text, page.blocks.map((block) => block.text).join('\n\n'));
+
+    // 表格结构仍然保留在 tables 里。
+    assert.deepEqual(page.tables, [{
+      rows: [['A', 'B'], ['1', '2']],
+      html: '<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>',
+      caption: 'Table 1 | Results',
+      footnote: '* p < 0.05',
+    }]);
+
+    assert.deepEqual(result.pages[1].blocks, [{ type: 'paragraph', text: 'Page two paragraph' }]);
+  } finally {
+    await stub.close();
+  }
+});
+
+test('结果包里的 parse_mode / _parse_type 优先于角色推断', async () => {
+  const layout = await loadFixture('mineru-layout-parse-types.json');
+  const stub = await startStub({
+    zipFor: () => makeZip([
+      { name: 'content_list.json', data: JSON.stringify([
+        { type: 'text', text: 'p5', page_idx: 0 },
+        { type: 'text', text: 'p6', page_idx: 1 },
+      ]) },
+      { name: 'layout.json', data: JSON.stringify(layout) },
+    ]),
+  });
+  try {
+    const provider = createMineruDocProvider({
+      apiKey: 'k',
+      baseUrl: stub.baseUrl,
+      timeoutMs: 10_000,
+      pollIntervalMs: 1,
+    });
+    const perPage = await withTempFile('doc.pdf', 'x', (filePath) =>
+      provider.parse({ filePath, pages: { from: 5, to: 6 } }),
+    );
+    assert.deepEqual(perPage.pages.map((page) => page.page), [5, 6]);
+    assert.deepEqual(
+      perPage.pages.map((page) => page.textOrigin),
+      ['textlayer', 'ocr'],
+      'layout.json 的逐页 _parse_type 要按相对页码对齐到 5/6',
+    );
+
+    // middle.json 的文档级 extensions.mineru.parse_mode 也要生效（4.x 输出契约）。
+    const middle = await loadFixture('mineru-middle-parse-mode.json');
+    stub.state.zipFor = () => makeZip([
+      { name: 'content_list.json', data: JSON.stringify([{ type: 'text', text: 'p1', page_idx: 0 }]) },
+      { name: 'middle.json', data: JSON.stringify(middle) },
+    ]);
+    stub.calls.length = 0;
+    const documentMode = await withTempFile('doc.pdf', 'x', (filePath) =>
+      createMineruDocProvider({
+        apiKey: 'k',
+        baseUrl: stub.baseUrl,
+        timeoutMs: 10_000,
+        pollIntervalMs: 1,
+        role: 'typeset',
+      }).parse({ filePath, role: 'typeset' }),
+    );
+    assert.equal(documentMode.pages[0].textOrigin, 'ocr', 'parse_mode=ocr 必须覆盖 typeset 的默认 textlayer');
   } finally {
     await stub.close();
   }
