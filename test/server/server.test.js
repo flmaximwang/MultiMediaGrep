@@ -115,7 +115,7 @@ test('stdio：listTools / instructions / 路径错误 / 占位后端', { timeout
     }
 
     // 5) 日志只走 stderr：启动横幅应该在那里
-    assert.match(stderr(), /multimediagrep@0\.1\.0 ready on stdio/);
+    assert.match(stderr(), /multimediagrep@0\.2\.0 ready on stdio/);
     assert.match(stderr(), /\[mmgrep\] info:/);
   });
 });

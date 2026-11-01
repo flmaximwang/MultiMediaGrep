@@ -42,6 +42,10 @@ winget install Gyan.FFmpeg
 > **工具放在 `PATH` 之外怎么办**：用 `MMGREP_FFMPEG_PATH` / `MMGREP_FFPROBE_PATH` 给绝对路径。
 > PDF 工具没有对应的环境变量——它们按 `PATH` 找。
 
+**PDF 书签（内置目录）另需 `qpdf`**：`pdftotext` / `pdfinfo` 读不了 outline。没装 qpdf 时
+`media_probe` 仍能正常返回，只会在 `outline:` 行说明「PDF bookmarks cannot be read: qpdf is not installed」，
+overview / zoom / locate 不受影响。
+
 **可执行文件不在 PATH 里时的表现**：server 仍然能启动，但每个要抽帧/转码的调用都会返回
 `TOOL_NOT_FOUND`（见 §6）。启动横幅里不会报错——**错误是调用时才给的**，不是启动时给的。
 
@@ -168,7 +172,7 @@ npx -y github:flmaximwang/MultiMediaGrep
 npm i -g github:flmaximwang/MultiMediaGrep
 
 # C) 只装 release 里的运行时包（不含 test/ 与 fixtures/，体积最小）
-npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.1.0/multimediagrep-mcp-0.1.0.tgz
+npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.2.0/multimediagrep-mcp-0.2.0.tgz
 ```
 
 三种装法在宿主配置里的写法一样，只是 `command` / `args` 不同：
@@ -298,7 +302,8 @@ MMGREP_ASR_LANGUAGE=auto
 
 server 打的是 `POST {baseUrl}/speech-to-text`，认证头是 `xi-api-key`（不是 `Authorization`）。
 
-**说话人分离**（可选，ElevenLabs 专有）：`MMGREP_ASR_DIARIZE=true`。
+**说话人分离**（可选，ElevenLabs 专有）：`MMGREP_ASR_DIARIZE=true`。注意本版只把该选项透传给服务，
+`segments[].speaker` 还没有回填（恒为 `null`），不要据此宣称做了说话人标注。
 
 ### 3.2 ASR：任何 OpenAI `/audio/transcriptions` 兼容服务
 
@@ -349,6 +354,10 @@ MMGREP_TYPESET_PROVIDER=mineru
 两个角色共用 `MMGREP_MINERU_*` 凭据与 `MMGREP_DOC_TIMEOUT_MS`。两个角色都是 `mineru`
 且配置相同时，server 只发一次解析请求（按逐页 `textOrigin` 分配结果）。
 
+provider 的解析结果**按页缓存**（键含源文件内容 sha256 + provider + model + `ocrMode` + role），
+同一范围再次调用（overview / locate 共享）不再请求 provider，只补缺失页；`ocr:"force"` 单独成键，
+不会覆盖 auto / 文字层的结果。缓存读坏当 miss、写失败只记 debug——缓存永远不是功能前提。
+
 1. 到 <https://mineru.net/apiManage/token> 取 token。
 2. 按上面的变量配置。
 
@@ -382,6 +391,61 @@ MMGREP_TYPESET_PROVIDER=mineru
 
 ---
 
+### 3.5 环境变量总表
+
+全部前缀 `MMGREP_`。**key 只回答「配没配」，永不打印值**；写错的值按「用默认值 + 记 warning」处理，不会让 server 崩。
+
+| 变量 | 默认值 | 作用 |
+|---|---|---|
+| `MMGREP_TRANSPORT` | `stdio` | 传输方式：`stdio` / `http`；写错回落 `stdio` |
+| `MMGREP_HTTP_HOST` | `127.0.0.1` | HTTP 监听地址；非回环且无令牌 → 启动 warning |
+| `MMGREP_HTTP_PORT` | `3927` | HTTP 监听端口（1–65535） |
+| `MMGREP_HTTP_TOKEN` | 空 | Bearer 令牌；空 = 不鉴权 |
+| `MMGREP_CACHE_DIR` | `~/.cache/multimediagrep` | 缓存根目录（`~` 展开，相对路径按 cwd） |
+| `MMGREP_CACHE_MAX_BYTES` | `10737418240`（10 GiB） | 缓存上限，支持 `512MB` / `10GB` / 字节数；LRU 淘汰 |
+| `MMGREP_ASR_PROVIDER` | `none` | `none` / `elevenlabs` / `openai-compatible` |
+| `MMGREP_ELEVENLABS_API_KEY` | 空 | ElevenLabs key（回环 baseUrl 可免） |
+| `MMGREP_ELEVENLABS_BASE_URL` | `https://api.elevenlabs.io/v1` | ElevenLabs 基址 |
+| `MMGREP_ELEVENLABS_MODEL` | `scribe_v1` | ElevenLabs 转写模型 |
+| `MMGREP_OPENAI_COMPATIBLE_API_KEY` | 空 | OpenAI 兼容服务 key（自建服务也要非空占位值） |
+| `MMGREP_OPENAI_COMPATIBLE_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容服务基址 |
+| `MMGREP_OPENAI_COMPATIBLE_MODEL` | `whisper-1` | OpenAI 兼容服务模型 |
+| `MMGREP_ASR_LANGUAGE` | `auto` | 强制语言（BCP-47）；`auto` = 服务自己判断 |
+| `MMGREP_ASR_TIMEOUT_MS` | `120000` | ASR 单次请求超时 |
+| `MMGREP_ASR_MAX_BYTES` | `104857600`（100 MiB） | 单次上传音频上限（provider 层读取） |
+| `MMGREP_ASR_DIARIZE` | `false` | 仅 ElevenLabs：请求说话人分离（本版只透传，`speaker` 未回填） |
+| `MMGREP_ASR_RESPONSE_FORMAT` | `verbose_json` | 仅 OpenAI 兼容：响应格式（要时间戳就用它） |
+| `MMGREP_ASR_TIMESTAMP_GRANULARITIES` | 空 | 仅 OpenAI 兼容：`word` / `segment` 时间戳粒度 |
+| `MMGREP_OCR_PROVIDER` | `none` | OCR 角色：`mineru` / `none`，只处理无文字层页与 `ocr:"force"` 页 |
+| `MMGREP_TYPESET_PROVIDER` | `builtin` | typeset 角色：`builtin` / `mineru` / `none`，只处理有文字层页 |
+| `MMGREP_TYPESET_SKIP_SIMPLE` | `true` | 外部 typeset 只收双栏 / 复杂页，简单页交给 builtin |
+| `MMGREP_MINERU_API_KEY` | 空 | MinerU token（两个角色共用） |
+| `MMGREP_MINERU_BASE_URL` | `https://mineru.net/api/v4` | MinerU 基址（两个角色共用） |
+| `MMGREP_MINERU_MODEL` | 空 | MinerU 模型；空 = 服务端默认（`pipeline` / `vlm` / `MinerU-HTML`） |
+| `MMGREP_DOC_TIMEOUT_MS` | `180000` | 文档解析单次请求超时（OCR 与 typeset 共用） |
+| `MMGREP_MAX_IMAGE_TOKENS` | `4000` | 单次调用图片 token 软预算 |
+| `MMGREP_MAX_IMAGE_EDGE` | `1600` | 单图最长边硬上限（px） |
+| `MMGREP_MAX_TEXT_INLINE_CHARS` | `24000` | 内联文本预览上限；HTTP 模式可被 `x-mmgrep-max-text-inline-chars` 覆盖，硬上限 `200000` |
+| `MMGREP_MAX_CONCURRENCY` | `2` | 单次调用的并行任务数 |
+| `MMGREP_AUDIO_MIN_DBFS` | `-35` | 音频体检：平均音量下限（低于 → `too-quiet`，不跑 ASR） |
+| `MMGREP_AUDIO_MIN_SPEECH_RATIO` | `0.05` | 音频体检：非静音时长占比下限（与上一条是「或」） |
+| `MMGREP_FFMPEG_PATH` | 空（按 PATH） | ffmpeg 可执行文件绝对路径 |
+| `MMGREP_FFPROBE_PATH` | 空（按 PATH） | ffprobe 可执行文件绝对路径 |
+| `MMGREP_LOG_LEVEL` | `info` | `error` / `warn` / `info` / `debug`（只写 stderr） |
+| `MMGREP_PROGRESS_NOTIFICATIONS` | `true` | 是否发 MCP 进度通知（运维扩展，非工具契约） |
+
+**0.2.0 删除的变量**（设置了也不生效，启动时 stderr 会 warn 并指出替代项）：
+
+| 已删除 | 替代 |
+|---|---|
+| `MMGREP_DOC_PROVIDER` | `MMGREP_OCR_PROVIDER`（无文字层页）+ `MMGREP_TYPESET_PROVIDER`（有文字层页，默认 `builtin`） |
+| `MMGREP_DOC_API_KEY` | `MMGREP_MINERU_API_KEY` |
+| `MMGREP_DOC_BASE_URL` | `MMGREP_MINERU_BASE_URL` |
+| `MMGREP_DOC_MODEL` | `MMGREP_MINERU_MODEL` |
+
+**仍保留但已弃用的 ASR 兜底**：`MMGREP_ASR_API_KEY` / `MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL`
+在对应 provider 专属变量未设置时生效，并记一条弃用 warning（0.2.0 未删除）。
+
 ## 4. 缓存：位置、结构与清理
 
 ### 4.1 放在哪
@@ -399,7 +463,9 @@ MMGREP_TYPESET_PROVIDER=mineru
 │   ├── content.md                全文（人读）
 │   ├── segments.jsonl            全文（一行一个 segment）
 │   ├── manifest.json             这次产出了什么
-│   └── images/                   宫格图 / 特写图
+│   ├── document.json             可选件（cangjie SourceDocument Contract v1）
+│   ├── images/                   宫格图 / 特写图
+│   └── doc-provider/...          文档 provider 的逐页结果（page-0001.json …，见 §3.3）
 └── <2 位分片>/.meta-<摘要>.json  条目记录（大小、创建与最后使用时间）
 ```
 
@@ -426,7 +492,7 @@ rm -rf ~/.cache/multimediagrep/ab/abcdef.../
 ```
 
 `media_overview` 返回的 `fullText.dir` 就是这次落盘的目录，可以直接去读那三个文件。
-`document.json` 是可选件（cangjie `SourceDocument Contract v1`），不一定每次都有。
+`document.json`（cangjie `SourceDocument Contract v1`）默认也会写在同一目录；下游不需要 cangjie 时完全可以不读它。
 
 ---
 
@@ -446,6 +512,13 @@ rm -rf ~/.cache/multimediagrep/ab/abcdef.../
 **长素材先收窄**：超过 30 分钟的视频、超过 30 页的文档，先用 `start`/`end` 或 `pages` 取一小段，
 再跟着结果里的 `continuation.nextStartMs` / `continuation.nextPage` 一段段往下走。
 
+**内联的只是预览，全文永远落盘。** `media_overview` 的 text content 末尾有
+`full text: <content.md 绝对路径> (segments.jsonl, manifest.json in the same directory)` 一行；
+内联文字分三档：whole（请求范围整体放得下）、skim（文档有 blocks 时：全部 heading + 段首句）、
+sampled（完整单元等距抽样，并写明未覆盖页）；`view:"outline"` 时只出目录。
+`view:"auto"` 在放不下且有目录（PDF 书签 / 视频章节 / 文档 ≥5 个 heading）时先出目录；
+视频/录音没有章节时 `view:"outline"` 只给「no chapters」，不生成内容。
+
 单次调用的硬上限（超了报 `BUDGET_EXCEEDED`，**不会静默截断**）：
 4 张图 / 每张 16 格 / 单次共 64 格 / 单图最长边 1600 px / 单图 ≤ 2,000,000 像素；
 软预算 `MMGREP_MAX_IMAGE_TOKENS`（默认 4000）超出时自动模式会降形并在结果里说明改了什么。
@@ -460,15 +533,15 @@ rm -rf ~/.cache/multimediagrep/ab/abcdef.../
 | `TOOL_NOT_FOUND: ffmpeg is not installed or not on PATH.` | 同上 | 同上 |
 | `TOOL_NOT_FOUND: no PDF page rasterizer is available on this machine (pdftoppm, mutool, and gs were all missing).` | 没装 PDF 栅格化工具 | 装 `poppler-utils` / `mupdf-tools` / `ghostscript` 任意一个 |
 | `TOOL_NOT_FOUND: cannot read PDF metadata: no PDF tool is installed (pdfinfo, mutool, or qpdf).` | 同上（缺的是元信息工具） | 同上 |
-| probe 说 `asr: unavailable — No ASR provider is configured (set MMGREP_ASR_PROVIDER and the matching provider key: MMGREP_ELEVENLABS_API_KEY or MMGREP_OPENAI_COMPATIBLE_API_KEY).` | 没配 ASR | 配 `MMGREP_ASR_PROVIDER` + 对应 provider 的 key（§3.1 / §3.2），或传一个本地字幕文件 |
-| probe 说 `ocr: unavailable — No OCR provider is configured (MMGREP_OCR_PROVIDER is "none"). Pages without a text layer are returned as page images only.` | 没配 OCR | 配 `MMGREP_OCR_PROVIDER=mineru` + `MMGREP_MINERU_API_KEY`（§3.3）；扫描件没 OCR 就只能看页图 |
+| probe 说 `asr: unavailable — …` | 没配 ASR / 缺 key / 体检判定无声（`too-quiet` / `silent`） | 配 `MMGREP_ASR_PROVIDER` + 对应 provider 的 key（§3.1 / §3.2），或传一个本地字幕文件；体检无声时换一份清楚的录音 |
+| probe 说 `ocr provider: none — No OCR provider is configured (MMGREP_OCR_PROVIDER is "none"). Pages without a text layer are returned as page images only.` | 没配 OCR | 配 `MMGREP_OCR_PROVIDER=mineru` + `MMGREP_MINERU_API_KEY`（§3.3）；扫描件没 OCR 就只能看页图 |
 | `PROVIDER_NOT_CONFIGURED`（文档，含 `ocr: "force"`） | 选了 provider 但缺 key；或 force 时根本没配 OCR provider | `MMGREP_MINERU_API_KEY` 填上，或把对应角色设成 `none`（`MMGREP_OCR_PROVIDER=none` / `MMGREP_TYPESET_PROVIDER=none`）退回「只有页图」/「原生文字层」 |
 | `PROVIDER_FAILED: … HTTP 401/403 …` | key 不对 / token 过期 | 换 key；MinerU 常见业务码 `A0202`（token 错）、`A0211`（token 过期） |
 | `PROVIDER_FAILED`，但我明明用的是自己的服务 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_MODEL` 没改 | 这两个的默认值是 OpenAI 官方的 `https://api.openai.com/v1` + `whisper-1`；用自己的服务时显式写上（见 §3.2） |
 | `PROVIDER_FAILED: … HTTP 404 …` | 基址写错 | 检查 `MMGREP_ELEVENLABS_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_MINERU_BASE_URL` |
 | `PROVIDER_FAILED: ASR request timed out after 120000 ms.` | ASR 超时 | 调大 `MMGREP_ASR_TIMEOUT_MS`；或换更快的模型 |
 | `PROVIDER_FAILED` + 排队很久 | MinerU 排队 | 调大 `MMGREP_DOC_TIMEOUT_MS`（默认 180000） |
-| `NO_TRANSCRIPT: no transcript available for this file and no ASR provider is configured (MMGREP_ASR_PROVIDER="none"). …` | `media_locate` / `media_overview`（`transcript: "auto"`）要文字但没有 | 配 ASR，或给 `subtitle` 传一个本地 `.srt`/`.vtt` 文件、字幕轨 index 或语言码；也可以改用 `media_overview({ images: 0, transcript: "subtitle", subtitle })` 只读字幕 |
+| `NO_TRANSCRIPT: no transcript available for this file and no ASR provider is configured (MMGREP_ASR_PROVIDER="none"). …` | `media_locate` 要文字但没有（**overview 不报这个错**：它返回空转写 + 原因） | 配 ASR，或给 `subtitle` 传一个本地 `.srt`/`.vtt` 文件、字幕轨 index 或语言码；也可以改用 `media_overview({ images: 0, transcript: "subtitle", subtitle })` 只读字幕 |
 | `NO_TRANSCRIPT: cannot search this document: no text layer and no OCR provider is configured. There is nothing to search.` | 扫描件没 OCR，又要定位文字 | 配文档 provider，或先把 PDF 转成带文字层的版本 |
 | 录音转写永远是空的 | 音频体检判定 `too-quiet` / `silent`（**故意的**） | 换一份清楚的录音；或调低 `MMGREP_AUDIO_MIN_DBFS` / `MMGREP_AUDIO_MIN_SPEECH_RATIO` |
 | `BUDGET_EXCEEDED: requested 5 images but the per-call limit is 4. …` | 一次要太多图 | 减 `images`/`cells`，或用 `start`/`end` / `pages` 分段 |

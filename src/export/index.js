@@ -23,7 +23,7 @@ import {
 } from './format.js';
 
 export const EXPORT_VERSION = 1;
-export const GENERATOR = Object.freeze({ name: 'multimediagrep', version: '0.1.0' });
+export const GENERATOR = Object.freeze({ name: 'multimediagrep', version: '0.2.0' });
 
 /** content.md 的段标题：时间区间用「mm:ss.mmm – mm:ss.mmm」，文档用「Page N」 */
 function segmentHeading(segment) {

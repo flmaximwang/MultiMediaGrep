@@ -23,12 +23,32 @@
 
 | 工具 | 干什么 |
 |---|---|
-| `media_probe` | 探媒体：时长/分辨率/页数/编码、可用轨道、能否做 ASR/OCR |
-| `media_overview` | 总览：视频出分镜宫格图，录音出带时间轴转写，文档出页面图 + 每页文本；**额外返回全文落盘路径**。`images: 0` + `transcript: "subtitle"` 可只读字幕 |
-| `media_zoom` | 特写：取指定时间点/区间的单帧或文档某页，可裁切放大，用于读字 |
-| `media_locate` | 定位：给一句文本/关键词，返回它在视频/录音里的时间戳、在文档里的页码 |
+| `media_probe` | 探媒体：时长/分辨率/页数/编码、可用轨道、文字层可靠不可靠、能否做 ASR/OCR、文件自带的目录（PDF 书签 / 章节）。不花图片 token |
+| `media_overview` | 总览：视频出分镜宫格图，录音出带时间轴转写，文档出页面图 + 每页文本；**额外返回全文落盘路径**。内联文字是预览（whole / skim / sampled 三档，另有 outline 目录视图），`view` 可控目录，`ocr: "force"` 可对坏文字层重新识别；`images: 0` + `transcript: "subtitle"` 可只读字幕 |
+| `media_zoom` | 特写：取指定时间点/区间的单帧或文档某页，可裁切放大，用于读字（约 1900 token/张，最贵） |
+| `media_locate` | 定位：给一句文本/关键词，返回它在视频/录音里的时间戳；文档返回页码 + 命中次数 + 命中附近的片段（不倾倒整页） |
 
 用法指引（先 probe → 再 overview → 只 zoom 重要部分 → 长素材先收窄范围）写在工具描述与 server instructions 里。
+
+## 0.2.0 有什么新东西（有破坏性变更）
+
+- **文档 provider 拆成两个角色**：`MMGREP_OCR_PROVIDER`（只处理无文字层页，默认 `none`）与
+  `MMGREP_TYPESET_PROVIDER`（只处理有文字层页、恢复结构不重识别字符，默认 `builtin`）。
+  `MMGREP_DOC_PROVIDER` / `MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL`
+  **已删除**，启动时会 warn 并指出替代变量。
+- **来源新增 `text`（原生文字层 / 纯文本，字符精确、可原样引用）与 `mixed`（逐页来源不一致）**；
+  文档逐页按 `textOrigin` 映射来源，`segments[]` / `matches[]` 里能看到 `textOrigin`。
+- **内置目录**：`media_probe` 展示 PDF 书签（物理页 + 打印标签）与视频/录音章节；
+  `media_overview` 的 `view` 参数支持 `auto` / `outline` / `text`（视频没有章节时不生成目录）。
+- **内联预览分层**：文本三档 whole → skim（文档：全部 heading + 段首句）→ sampled（等距抽样 + 写明未覆盖页），另有 outline 目录视图；
+  全文路径固定出现在 text content 末尾，读全文去读 `content.md`。
+- **坏文字层可强制重识别**：probe 报 `text layer: looks unreliable (...)` 时用 `ocr: "force"`；
+  provider 结果按页缓存，force 单独成键、不覆盖 auto。
+- **文档定位不再倾倒整页**：返回页码 + 命中次数 + 命中附近的片段（`hits` / `snippet` / `fuzzy`），
+  视频 / 录音仍是 `score`。
+- **HTTP 客户端可覆盖内联上限**：请求头 `x-mmgrep-max-text-inline-chars`（硬上限 `200000`）。
+
+完整的破坏性变更与迁移方法见 [`docs/RELEASE-NOTES-v0.2.0.md`](docs/RELEASE-NOTES-v0.2.0.md)。
 
 ---
 
@@ -55,8 +75,11 @@ winget install Gyan.FFmpeg          # PDF 另装 poppler（无官方 winget 包�
 
 可选：把可执行文件放在 `PATH` 之外时，用 `MMGREP_FFMPEG_PATH` / `MMGREP_FFPROBE_PATH` 指定绝对路径。
 
+读 **PDF 书签**（probe 的内置目录）另需 `qpdf`；缺了只是读不到目录，正文与页图不受影响。
+
 **外部服务（可选）**：ASR（ElevenLabs 或任何 OpenAI `/audio/transcriptions` 兼容服务）与文档解析（MinerU）
-由你用环境变量配置；**不配也能用**，只是拿不到文字层（详见下面「环境变量」）。
+由你用环境变量配置。文档解析拆成 OCR / typeset 两个角色：OCR 默认 `none`，typeset 默认本地 `builtin`（不联网）——
+**不配也能用**，只是扫描页拿不到文字（详见下面「环境变量」）。
 
 ---
 
@@ -71,9 +94,9 @@ npx -y multimediagrep-mcp
 > 通常由 MCP client 自动拉起。想确认它起没起得来，就手动跑一次，看 stderr 有没有启动横幅：
 >
 > ```
-> [mmgrep] info: multimediagrep@0.1.0 ready on stdio
+> [mmgrep] info: multimediagrep@0.2.0 ready on stdio
 > [mmgrep] info: cache: /Users/you/.cache/multimediagrep (max 10737418240 bytes)
-> [mmgrep] info: asr: none (no API key) · doc: none · ocr: none
+> [mmgrep] info: asr: none (no API key) · ocr: none · typeset: builtin
 > [mmgrep] info: backends: video=ready audio=ready document=ready
 > [mmgrep] info: image budget: 4000 tokens/call, maxEdge 1600px
 > ```
@@ -89,7 +112,7 @@ node src/index.js
 # 3) 从 GitHub 装（npm 还没发布时）
 npx -y github:flmaximwang/MultiMediaGrep            # 临时拉取并启动
 npm i -g github:flmaximwang/MultiMediaGrep           # 装成本地命令 multimediagrep-mcp
-npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.1.0/multimediagrep-mcp-0.1.0.tgz   # 只装 release 里的运行时包
+npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.2.0/multimediagrep-mcp-0.2.0.tgz   # 只装 release 里的运行时包
 ```
 
 > 从 GitHub 源码装会把整个仓库拉下来（源码与文档），首次安装比 npm 慢；
@@ -231,6 +254,7 @@ HTTP 端点常被多个调用方共用，provider 的 key 不必都写死在 ser
 | `x-mmgrep-mineru-api-key` | MinerU token（两个角色共用） | `MMGREP_MINERU_API_KEY` |
 | `x-mmgrep-mineru-base-url` | MinerU 基址（两个角色共用） | `MMGREP_MINERU_BASE_URL` |
 | `x-mmgrep-mineru-model` | MinerU 模型（两个角色共用） | `MMGREP_MINERU_MODEL` |
+| `x-mmgrep-max-text-inline-chars` | 本次请求的内联文本上限（设置头，不是凭据）：正整数，硬上限 `200000` | `MMGREP_MAX_TEXT_INLINE_CHARS` |
 
 优先级（逐字段）：该 provider 的专属请求头 > 该 provider 的环境变量 >
 服务器启动配置（仅当 provider 相同）> provider 内置默认值。ASR 仍保留通用
@@ -297,6 +321,7 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 | `MMGREP_ASR_TIMEOUT_MS` | `120000` | ASR 单次请求超时 |
 | `MMGREP_OCR_PROVIDER` | `none` | OCR 角色：只处理没有文字层的页，以及工具参数 `ocr: "force"` 指定的页。`none` / `mineru` |
 | `MMGREP_TYPESET_PROVIDER` | `builtin` | typeset 角色：只处理有文字层的页，恢复结构、不重识别字符。`builtin` / `mineru` / `none` |
+| `MMGREP_TYPESET_SKIP_SIMPLE` | `true` | 外部 typeset provider 只收双栏 / 复杂页，简单页交给本地 builtin |
 | `MMGREP_MINERU_API_KEY` | 空 | MinerU 的 token（两个角色共用；<https://mineru.net/apiManage/token>） |
 | `MMGREP_MINERU_BASE_URL` | `https://mineru.net/api/v4` | MinerU 的 API 基址（两个角色共用） |
 | `MMGREP_MINERU_MODEL` | 空 | 解析模型名；留空 = 用服务端默认（MinerU 可选 `pipeline` / `vlm` / `MinerU-HTML`） |
@@ -304,6 +329,8 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 | `MMGREP_MAX_IMAGE_TOKENS` | `4000` | 单次调用的图片 token **软预算**。超了自动模式会降形，显式模式只警告 |
 | `MMGREP_MAX_IMAGE_EDGE` | `1600` | 单张图最长边的全局上限（px）。请求超过 → `BUDGET_EXCEEDED` |
 | `MMGREP_LOG_LEVEL` | `info` | 日志级别：`error` / `warn` / `info` / `debug`。日志**一律走 stderr**（stdout 是协议通道） |
+| `MMGREP_MAX_TEXT_INLINE_CHARS` | `24000` | 内联文本预览上限；HTTP 模式可被 `x-mmgrep-max-text-inline-chars` 按客户端覆盖（硬上限 `200000`），全文始终落盘、不受限制 |
+| `MMGREP_MAX_CONCURRENCY` | `2` | 单次调用的并行任务数 |
 
 传输相关的命令行开关（`--http` / `--host` / `--port` / `--token`）优先于上表的环境变量。
 
@@ -314,8 +341,9 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 > 同一进程里可以同时存在多家 provider 的 key，server 只读当前选中 provider 的那一组。
 
 另有 `MMGREP_FFMPEG_PATH` / `MMGREP_FFPROBE_PATH`（默认按 `PATH` 查找）、
-`MMGREP_MAX_TEXT_INLINE_CHARS`（默认 24000）、`MMGREP_MAX_CONCURRENCY`（默认 2）等，
-完整清单见 [`docs/mcp-contract.md` §12](docs/mcp-contract.md)。
+`MMGREP_AUDIO_MIN_DBFS` / `MMGREP_AUDIO_MIN_SPEECH_RATIO`（音频体检阈值）、
+`MMGREP_PROGRESS_NOTIFICATIONS`（默认 `true`）等，完整清单见
+[`docs/install.md` §3.5](docs/install.md) 与 [`docs/mcp-contract.md` §12](docs/mcp-contract.md)。
 
 ---
 
@@ -329,7 +357,7 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 { "path": "/abs/path/demo.mp4" }
 ```
 
-返回里看四件事：媒体类型、时长、有没有字幕轨、`capabilities.asr.available`。
+返回里看五件事：媒体类型、时长、有没有字幕轨、`capabilities.asr.available` / `capabilities.ocr.available`，以及文件自带的目录（PDF 书签 / 章节）。
 录音还会给一段 `audioHealth` 体检——如果结论是 `too-quiet` / `silent`，
 **转写会故意是空的**（避免 ASR 编出一整段幻觉台词），这时该做的是换一份清楚的录音，而不是继续追问。
 
@@ -339,8 +367,8 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 { "path": "/abs/path/demo.mp4", "cells": 9, "images": 2 }
 ```
 
-出 2 张 3×3 的分镜宫格图 + 一份按格对齐的文本清单（每行末尾标了来源：`subtitle` / `asr` / `ocr` / `none`）。
-**全文不内联**，而是落盘成三个文件并把路径返回给你：
+出 2 张 3×3 的分镜宫格图 + 一份按格对齐的文本清单（每行末尾标了来源：`subtitle` / `text` / `ocr` / `asr` / `none`；整份文档来源不一致时 header 是 `mixed`）。
+**全文不内联**，而是落盘成三个主文件（另加可选的 `document.json`）并把路径返回给你：
 
 | 文件 | 内容 |
 |---|---|
@@ -365,7 +393,7 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 { "path": "/abs/path/demo.mp4", "query": "那句话是在哪说的" }
 ```
 
-返回它在视频里的时间戳（毫秒 + 秒两种表示）、在文档里的页码。
+返回它在视频 / 录音里的时间戳（毫秒 + 秒两种表示）；文档返回页码、命中次数与命中附近的片段——不会把整页正文倒出来。
 
 > **长素材先收窄。** 超过 30 分钟的视频、超过 30 页的文档，先用 `start`/`end`（视频、录音）或
 > `pages`（文档，如 `"3-10,15"`）取一小段，再跟着结果里的 `continuation` 提示一页页往下走。
