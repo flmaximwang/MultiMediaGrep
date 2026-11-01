@@ -17,7 +17,7 @@ import { z } from 'zod';
 
 import { formatTimestamp } from '../export/format.js';
 import { exportAnalysis } from '../export/index.js';
-import { detectMediaType, isSubtitlePath } from '../media/detect.js';
+import { detectMediaType } from '../media/detect.js';
 import {
   METHOD_MATRIX,
   ToolError,
@@ -82,7 +82,7 @@ decoded (a video costs no ffmpeg work at all), so you get only the transcript �
 text for a document — and the reported budget is all zeros. Use it when you only need the words.
 
 TEXT SOURCE ORDER — subtitles first, ASR only as a fallback:
-1. a transcriptFile you pass in (external subtitle file),
+1. a subtitle you select explicitly (external subtitle file, track index or language code),
 2. the subtitle track embedded in the container,
 3. a subtitle file with the same base name in the same directory (a.srt next to a.mp4),
 4. ASR — only when none of the above exists and an ASR provider is configured.
@@ -137,7 +137,7 @@ and works for both Chinese and English. Long phrases match better than single ch
 Text only by default — no image, no pixels spent. Add includeFrame: true to also get the
 picture at the best match (one image, roughly 1,900 vision tokens).
 
-A transcript is required: the embedded subtitle track, a transcriptFile you pass in, or ASR
+A transcript is required: the embedded subtitle track, a subtitle you select explicitly, or ASR
 configured via MMGREP_ASR_PROVIDER. Subtitles win over ASR. If none is available this tool
 says so instead of guessing. Use media_overview if you only need the visuals.
 
@@ -148,10 +148,11 @@ speaker's exact words.`;
 export const SUBTITLES_DESCRIPTION = `Read subtitles for a local media file and return them as timestamped segments.
 (读取本地字幕文件或视频内嵌字幕轨，解析成带时间轴的段落列表。)
 
-Two sources, in this order: an explicit transcriptFile (a local .srt, .vtt, .ass or .ssa file),
-or the subtitle track embedded in the container. Auto-discovery also picks up a sibling file
-with the same base name in the same directory (a.srt next to a.mp4) when neither of the above
-is available — the source and the exact path are always reported back, never silently.
+Two sources, in this order: an explicit subtitle selection (a local .srt, .vtt, .ass or .ssa file,
+a track index, or a language code), or the subtitle track embedded in the container. Auto-discovery
+also picks up a sibling file with the same base name in the same directory (a.srt next to a.mp4)
+when neither of the above is available — the source and the exact path are always reported back,
+never silently.
 
 No image and no pixels spent: the result is text with millisecond and second timestamps.
 Use media_locate to search inside the subtitles. Use media_overview if you also want to see
@@ -169,12 +170,18 @@ const PATH_PARAM = z.string().describe(
   'Absolute path to a LOCAL file: video, audio recording, or document. URLs and relative paths are rejected — this server never downloads anything. (本地文件绝对路径)',
 );
 
-const TRANSCRIPT_FILE_PARAM = z.string().optional().describe(
-  'Absolute path to a local subtitle/transcript file (.srt, .vtt, .ass, .ssa). Applicable to video and audio only. (本地字幕/转写文件)',
+const SUBTITLE_PARAM = z.union([z.string(), z.number()]).optional().describe(
+  'Choose the subtitle source explicitly (video and audio only, one parameter for all forms). '
+  + 'An absolute path to a local subtitle file (.srt, .vtt, .ass, .ssa); '
+  + 'a non-negative integer = the ffprobe stream index of a text subtitle track; '
+  + 'any other string = a language code matched against track tags.language (case-insensitive; "zh" also matches '
+  + '"chi"/"zho", "en" matches "eng"). An explicit choice never falls back: if it cannot be used, media_probe '
+  + 'only reports the reason and the other tools fail with INVALID_ARGUMENT. Omit it for the automatic order '
+  + '(embedded text track, then a sibling subtitle file, then ASR). (显式选择字幕来源：文件路径 / 字幕轨序号 / 语言码)',
 );
 
 const TRANSCRIPT_PARAM = z.enum(['auto', 'subtitle', 'off']).optional().describe(
-  '"auto" (default): use subtitles first (transcriptFile, embedded track, sibling file), ASR only as a fallback. '
+  '"auto" (default): use subtitles first (explicit subtitle selection, embedded track, sibling file), ASR only as a fallback. '
   + '"subtitle": read subtitles only and never call ASR; if there is no subtitle source the result is empty and says why. '
   + '"off": no transcription at all, neither subtitles nor ASR; visuals only. Applicable to video and audio only.',
 );
@@ -246,12 +253,12 @@ const INCLUDE_FRAME_PARAM = z.boolean().optional().describe(
 export const TOOL_SHAPES = Object.freeze({
   media_probe: {
     path: PATH_PARAM,
-    transcriptFile: TRANSCRIPT_FILE_PARAM,
+    subtitle: SUBTITLE_PARAM,
     transcript: TRANSCRIPT_PARAM,
   },
   media_overview: {
     path: PATH_PARAM,
-    transcriptFile: TRANSCRIPT_FILE_PARAM,
+    subtitle: SUBTITLE_PARAM,
     transcript: TRANSCRIPT_PARAM,
     start: START_PARAM,
     end: END_PARAM,
@@ -275,7 +282,7 @@ export const TOOL_SHAPES = Object.freeze({
     path: PATH_PARAM,
     query: QUERY_PARAM,
     max: MAX_MATCHES_PARAM,
-    transcriptFile: TRANSCRIPT_FILE_PARAM,
+    subtitle: SUBTITLE_PARAM,
     transcript: TRANSCRIPT_PARAM,
     start: START_PARAM,
     end: END_PARAM,
@@ -285,7 +292,7 @@ export const TOOL_SHAPES = Object.freeze({
   },
   video_subtitles: {
     path: PATH_PARAM,
-    transcriptFile: TRANSCRIPT_FILE_PARAM,
+    subtitle: SUBTITLE_PARAM,
     start: START_PARAM,
     end: END_PARAM,
     pages: PAGES_PARAM,
@@ -306,11 +313,11 @@ export const PARAM_APPLICABILITY = Object.freeze({
   path: { media: ALL_MEDIA },
   query: { media: ALL_MEDIA },
   max: { media: ALL_MEDIA },
-  transcriptFile: {
+  subtitle: {
     media: ['video', 'audio'],
     message: (t) => (t === 'document'
-      ? 'transcriptFile is not applicable to document media. Documents have a page text layer, not a transcript.'
-      : `transcriptFile is not applicable to ${t} media.`),
+      ? 'subtitle is not applicable to document media. Documents have a page text layer, not a transcript.'
+      : `subtitle is not applicable to ${t} media.`),
   },
   transcript: {
     media: ['video', 'audio'],
@@ -473,33 +480,9 @@ function baseInput(base) {
 
 /** 内部 probe：overview / zoom / locate / subtitles 需要 durationSec / pageCount 做范围校验 */
 async function internalProbe(base, extraInput, call) {
-  const input = { ...baseInput(base), transcriptFile: null, transcript: 'auto', ...extraInput };
+  const input = { ...baseInput(base), subtitle: null, transcript: 'auto', ...extraInput };
   const result = await call.dispatcher.call(base.mediaType, 'probe', input, call.backendCtx);
   return result ?? {};
-}
-
-/**
- * transcriptFile 的校验（契约 §8.6）。
- * probe 除外（§4.5：probe 只报告、不报错），所以 probe 不走这里。
- */
-async function resolveTranscriptFile(value, { logger = null } = {}) {
-  if (value === undefined || value === null) return null;
-  const raw = String(value);
-  if (!isSubtitlePath(raw)) {
-    throw new ToolError(
-      'INVALID_ARGUMENT',
-      `transcriptFile must be one of .srt, .vtt, .ass, .ssa (got "${path.extname(raw) || raw}").`,
-      'Pass a local subtitle file path, e.g. "/abs/a.zh.srt".',
-    );
-  }
-  try {
-    return await validatePath(raw);
-  } catch (error) {
-    if (error instanceof ToolError && error.code === 'PATH_NOT_FOUND') {
-      throw new ToolError('PATH_NOT_FOUND', `transcriptFile does not exist: "${raw}".`);
-    }
-    throw error;
-  }
 }
 
 /** 时间窗参数 → 闭区间 [startMs, endMs]（契约 §2.3） */
@@ -955,7 +938,7 @@ async function handleProbe(args, call) {
 
   const input = {
     ...baseInput(base),
-    transcriptFile: args.transcriptFile ?? null,
+    subtitle: args.subtitle ?? null,
     transcript: args.transcript ?? 'auto',
   };
   const result = (await call.dispatcher.call(base.mediaType, 'probe', input, call.backendCtx)) ?? {};
@@ -1120,7 +1103,7 @@ async function handleOverview(args, call) {
   await call.onProgress({ stage: 'scanning', used: describeWindowForProgress(args) });
 
   const probe = await internalProbe(base, {
-    transcriptFile: args.transcriptFile ?? null,
+    subtitle: args.subtitle ?? null,
     transcript: args.transcript ?? 'auto',
   }, call);
   const mediaType = refineMediaType(probe, base.mediaType);
@@ -1133,14 +1116,13 @@ async function handleOverview(args, call) {
   const pageCount = integerOrNull(probe.pageCount);
   const window = mediaType === 'document' ? null : computeTimeWindow(args, durationSec);
   const pages = mediaType === 'document' ? computePages(args, pageCount) : null;
-  const transcriptFile = mediaType === 'document' ? null : await resolveTranscriptFile(args.transcriptFile, { logger: call.logger });
 
   const plan = planOverviewImages(args, mediaType, call.config);
   // images: 0 → 零像素纯文本模式：后端不出图，段落直接来自转写/页文字。
   const textOnly = Boolean(plan && plan.requested.images === 0);
   const input = {
     ...baseInput({ ...base, mediaType }),
-    transcriptFile,
+    subtitle: args.subtitle ?? null,
     transcript: mediaType === 'document' ? undefined : (args.transcript ?? 'auto'),
     startMs: window?.startMs ?? null,
     endMs: window?.endMs ?? null,
@@ -1154,7 +1136,7 @@ async function handleOverview(args, call) {
     ...(plan ? { cells: plan.produced.cells, images: plan.produced.images, maxEdge: plan.produced.maxEdge } : {}),
   };
 
-  await call.onProgress({ stage: 'transcribing', used: transcriptFile ? path.basename(transcriptFile) : (args.transcript ?? 'auto') });
+  await call.onProgress({ stage: 'transcribing', used: args.subtitle !== undefined ? String(args.subtitle) : (args.transcript ?? 'auto') });
   const result = (await call.dispatcher.call(mediaType, 'overview', input, call.backendCtx)) ?? {};
   await call.onProgress({ stage: 'rendering', used: `${Array.isArray(result.images) ? result.images.length : 0} image(s)` });
 
@@ -1539,7 +1521,7 @@ async function handleLocate(args, call) {
   }
 
   const probe = await internalProbe(base, {
-    transcriptFile: args.transcriptFile ?? null,
+    subtitle: args.subtitle ?? null,
     transcript: args.transcript ?? 'auto',
   }, call);
   const mediaType = refineMediaType(probe, base.mediaType);
@@ -1552,13 +1534,12 @@ async function handleLocate(args, call) {
   const pageCount = integerOrNull(probe.pageCount);
   const window = mediaType === 'document' ? null : computeTimeWindow(args, durationSec);
   const pages = mediaType === 'document' ? computePages(args, pageCount) : null;
-  const transcriptFile = mediaType === 'document' ? null : await resolveTranscriptFile(args.transcriptFile, { logger: call.logger });
 
   const input = {
     ...baseInput({ ...base, mediaType }),
     query: args.query,
     max,
-    transcriptFile,
+    subtitle: args.subtitle ?? null,
     transcript: mediaType === 'document' ? undefined : (args.transcript ?? 'auto'),
     startMs: window?.startMs ?? null,
     endMs: window?.endMs ?? null,
@@ -1672,11 +1653,10 @@ async function handleSubtitles(args, call) {
     durationSec = numberOrNull(probe.durationSec);
   }
   const window = computeTimeWindow(args, durationSec);
-  const transcriptFile = await resolveTranscriptFile(args.transcriptFile, { logger: call.logger });
 
   const input = {
     ...baseInput(base),
-    transcriptFile,
+    subtitle: args.subtitle ?? null,
     startMs: window.startMs,
     endMs: window.endMs,
     startSec: window.startSec,

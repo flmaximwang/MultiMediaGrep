@@ -229,13 +229,13 @@ test('listTools：5 个工具、描述带中文触发词、schema 完整', async
       }
 
       assert.deepEqual(Object.keys(byName.media_overview.inputSchema.properties).sort(), [
-        'cells', 'end', 'envelope', 'images', 'maxEdge', 'pages', 'path', 'segment', 'start', 'transcript', 'transcriptFile',
+        'cells', 'end', 'envelope', 'images', 'maxEdge', 'pages', 'path', 'segment', 'start', 'subtitle', 'transcript',
       ]);
       assert.deepEqual(Object.keys(byName.media_zoom.inputSchema.properties).sort(), [
         'at', 'crop', 'end', 'maxEdge', 'page', 'path', 'start',
       ]);
       assert.deepEqual(Object.keys(byName.media_locate.inputSchema.properties).sort(), [
-        'end', 'includeFrame', 'max', 'pages', 'path', 'query', 'segment', 'start', 'transcript', 'transcriptFile',
+        'end', 'includeFrame', 'max', 'pages', 'path', 'query', 'segment', 'start', 'subtitle', 'transcript',
       ]);
 
       // 参数 describe 里标注了适用媒体类型
@@ -382,8 +382,8 @@ test('不适用参数必须报契约原文案，不能静默忽略', async () =>
         ['media_overview', workspace.files.audio, { maxEdge: 1280 }, 'maxEdge is not applicable to audio media.'],
         ['media_overview', workspace.files.video, { envelope: true },
           'envelope is not applicable to video media. It only applies to audio recordings.'],
-        ['media_overview', workspace.files.document, { transcriptFile: '/abs/a.srt' },
-          'transcriptFile is not applicable to document media. Documents have a page text layer, not a transcript.'],
+        ['media_overview', workspace.files.document, { subtitle: '/abs/a.srt' },
+          'subtitle is not applicable to document media. Documents have a page text layer, not a transcript.'],
         ['media_overview', workspace.files.document, { transcript: 'off' },
           'transcript is not applicable to document media.'],
         ['media_locate', workspace.files.audio, { query: 'x', includeFrame: true },
@@ -1037,17 +1037,15 @@ test('video_subtitles：字幕段落、时间窗、document 不适用', async ()
       assert.equal(errorCode(document), 'INVALID_ARGUMENT');
       assert.match(document.content[0].text, /video_subtitles is not applicable to document media/);
 
-      const missingFile = await client.callTool({
-        name: 'video_subtitles', arguments: { path: workspace.files.video, transcriptFile: '/definitely/not/here.srt' },
+      const withSubtitle = await client.callTool({
+        name: 'video_subtitles', arguments: { path: workspace.files.video, subtitle: '/abs/a.zh.srt' },
       });
-      assert.equal(errorCode(missingFile), 'PATH_NOT_FOUND');
-      assert.equal(missingFile.structuredContent.error.message, 'transcriptFile does not exist: "/definitely/not/here.srt".');
+      assert.notEqual(withSubtitle.isError, true, 'subtitle is forwarded to the backend');
 
-      const badExt = await client.callTool({
-        name: 'video_subtitles', arguments: { path: workspace.files.video, transcriptFile: '/abs/a.txt' },
+      const numeric = await client.callTool({
+        name: 'video_subtitles', arguments: { path: workspace.files.video, subtitle: 2 },
       });
-      assert.equal(errorCode(badExt), 'INVALID_ARGUMENT');
-      assert.match(badExt.content[0].text, /transcriptFile must be one of \.srt, \.vtt, \.ass, \.ssa \(got "\.txt"\)\./);
+      assert.notEqual(numeric.isError, true);
     });
   } finally {
     await workspace.cleanup();

@@ -21,6 +21,7 @@ import { matchSegments, splitIntoSentences } from '../../media/match.js';
 import {
   analyzeSubtitleStreams,
   bitmapSkippedWarnings,
+  describeSubtitleSelection,
   discoverSiblingSubtitles,
   resolveSubtitleSource,
 } from '../../media/transcript.js';
@@ -29,7 +30,7 @@ import { audioConfig, computeAudioHealth } from '../../media/audio-health.js';
 export { computeAudioHealth };
 import { mergeTranscripts, planChunks } from './chunks.js';
 
-function shapeProbe({ info, audioHealth, input, ctx, stats, durationSec, subtitleHints }) {
+async function shapeProbe({ info, audioHealth, input, ctx, stats, durationSec, subtitleHints }) {
   const streams = info?.streams ?? [];
   const audioStreams = streams.filter((s) => s.codec_type === 'audio');
   const audioTracks = audioStreams.map((s, i) => ({
@@ -54,16 +55,21 @@ function shapeProbe({ info, audioHealth, input, ctx, stats, durationSec, subtitl
     asrReason = audioHealth.note;
   }
 
-  // 字幕优先于 ASR（契约 §8.5）：显式文件 → 内嵌轨 → 同目录同名 → ASR
-  const explicitPath = input?.transcriptFile ?? null;
+  // 字幕优先于 ASR（契约 §8.5）：显式选择 → 内嵌轨 → 同目录同名 → ASR。
+  // probe 对显式选择只报告：不可用时不报错，也不拿自动来源冒充（契约 §4.5）。
+  const explicit = await describeSubtitleSelection({ subtitle: input?.subtitle, streams });
+  const explicitError = explicit?.error ?? null;
+  const explicitNote = explicit?.warnings?.length ? explicit.warnings.join('; ') : null;
   const siblingPath = subtitleHints?.siblingPath ?? null;
   let transcriptSource = 'none';
   let transcriptOrigin = 'none';
   let transcriptPath = null;
-  if (transcriptMode !== 'off' && explicitPath) {
+  if (explicitError) {
+    // 显式选择不可用：只报告原因
+  } else if (transcriptMode !== 'off' && explicit) {
     transcriptSource = 'subtitle';
-    transcriptOrigin = 'file';
-    transcriptPath = explicitPath;
+    transcriptOrigin = explicit.origin;
+    transcriptPath = explicit.sourcePath;
   } else if (transcriptMode !== 'off' && subtitleHints?.hasEmbeddedSubtitle) {
     transcriptSource = 'subtitle';
     transcriptOrigin = 'embedded';
@@ -75,10 +81,11 @@ function shapeProbe({ info, audioHealth, input, ctx, stats, durationSec, subtitl
     transcriptSource = 'asr';
     transcriptOrigin = 'asr';
   }
-  // 有字幕轨却没用上（如只有图形字幕）时，probe 也要说明原因
-  const transcriptReason = transcriptSource === 'subtitle'
-    ? null
-    : ((subtitleHints?.warnings ?? []).join('; ') || null);
+  // 有字幕轨却没用上（如只有图形字幕）时，probe 也要说明原因；
+  // 显式选择多条命中时，把「其余命中」一并交代出来。
+  const bitmapReason = (subtitleHints?.warnings ?? []).join('; ');
+  const transcriptReason = explicitError
+    ?? (transcriptSource === 'subtitle' ? explicitNote : (bitmapReason || null));
 
   return {
     mediaType: 'audio',
@@ -205,7 +212,7 @@ async function getTranscript(input, ctx, { info, durationSec, audioHealth }) {
   // 1–3：字幕来源（契约 §8.5）
   const subtitle = await resolveSubtitleSource({
     mediaPath: input.path,
-    transcriptFile: input.transcriptFile,
+    subtitle: input.subtitle,
     streams: info?.streams ?? [],
     signal: ctx.signal,
     warnings,
@@ -409,14 +416,14 @@ export function createAudioBackend(ctx = {}) {
         throw new ToolError(
           'NO_TRANSCRIPT',
           'no transcript available for this file and no ASR provider is configured (MMGREP_ASR_PROVIDER="none"). '
-            + 'Pass transcriptFile with a local .srt/.vtt file, or configure an ASR provider. '
+            + 'Pass subtitle with a local .srt/.vtt file, a track index, or a language code, or configure an ASR provider. '
             + 'For visuals only, use media_overview instead.',
         );
       }
       throw new ToolError(
         'NO_TRANSCRIPT',
         `no transcript available for this file: ${probed.audioHealth?.note ?? 'ASR produced no usable text.'} `
-          + 'Pass transcriptFile with a local .srt/.vtt file, or use media_overview instead.',
+          + 'Pass subtitle with a local .srt/.vtt file, a track index, or a language code, or use media_overview instead.',
       );
     }
 
@@ -442,7 +449,7 @@ export function createAudioBackend(ctx = {}) {
     const warnings = [];
     const subtitle = await resolveSubtitleSource({
       mediaPath: input.path,
-      transcriptFile: input.transcriptFile,
+      subtitle: input.subtitle,
       streams: info?.streams ?? [],
       signal: c.signal,
       warnings,
@@ -451,7 +458,7 @@ export function createAudioBackend(ctx = {}) {
       throw new ToolError(
         'NO_TRANSCRIPT',
         `no subtitle source for "${input.path}": no embedded subtitle track, no sibling .srt/.vtt/.ass/.ssa file, `
-          + 'and no ASR provider configured. Pass transcriptFile with a local subtitle file.',
+          + 'and no ASR provider configured. Pass subtitle with a local subtitle file, a track index, or a language code.',
       );
     }
     let segments = subtitle.segments.map((s) => ({ ...s, source: 'subtitle', origin: subtitle.origin }));

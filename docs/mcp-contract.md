@@ -96,7 +96,7 @@ flowchart TD
 | 参数 | video | audio | document | 不适用时的错误文案（节选） |
 |---|:---:|:---:|:---:|---|
 | `path` | ✅ 必填 | ✅ 必填 | ✅ 必填 | — |
-| `transcriptFile` | ✅ | ✅ | ❌ | `transcriptFile is not applicable to document media. Documents have a page text layer, not a transcript.` |
+| `subtitle` | ✅ | ✅ | ❌ | `subtitle is not applicable to document media. Documents have a page text layer, not a transcript.` |
 | `transcript` | ✅ | ✅ | ❌ | `transcript is not applicable to document media.` |
 | `start`（秒） | ✅ | ✅ | ❌ | `start is not applicable to document media. Use "pages" instead (e.g. pages: "3-10,15").` |
 | `end`（秒） | ✅ | ✅ | ❌ | `end is not applicable to document media. Use "pages" instead (e.g. pages: "3-10,15").` |
@@ -180,7 +180,7 @@ flowchart TD
 | `NO_TRANSCRIPT` | 需要转写但没有任何可用来源（且不允许降级为纯画面） |
 | `PROVIDER_NOT_CONFIGURED` | 需要 ASR / OCR / 文档解析，但对应 provider 未配置 |
 | `PROVIDER_FAILED` | provider 已配置但调用失败（HTTP 错误 / 超时 / 坏响应） |
-| `TRANSCRIPT_UNREADABLE` | `transcriptFile` 存在但解析不出内容 |
+| `TRANSCRIPT_UNREADABLE` | 字幕文件存在但解析不出内容（显式 `subtitle` 统一转成 `INVALID_ARGUMENT`；自动发现路径只记 warning） |
 | `BUDGET_EXCEEDED` | 请求超出图片预算硬上限 |
 | `TOOL_NOT_FOUND` | `ffmpeg` / `ffprobe` / 页面栅格化器缺失 |
 | `INTERNAL` | 其它未分类异常（必须带上原始 stack 摘要） |
@@ -338,7 +338,7 @@ path, and it only prepares images and text for your own model to look at.
 | 参数 | 类型 | 必填 | 默认 | 说明 |
 |---|---|:---:|---|---|
 | `path` | string | ✅ | — | 本地文件绝对路径。拒绝 URL 与相对路径。 |
-| `transcriptFile` | string | ❌ | — | 本地字幕/转写文件路径（绝对路径）。给了就优先用它，跳过内嵌字幕轨与 ASR。 |
+| `subtitle` | string \| integer | ❌ | — | 显式选择字幕来源（一个参数三种形态）。**绝对路径** → 本地字幕文件（`.srt`/`.vtt`/`.ass`/`.ssa`）；**非负整数** → ffprobe 流 index，必须是文本型字幕轨；**其他字符串** → 语言码，匹配轨的 `tags.language`（大小写不敏感，`zh` 也匹配 `chi`/`zho`，`en` 匹配 `eng`）。显式选择是排他的：不可用就报错，不回退。 |
 | `transcript` | `"auto"` \| `"subtitle"` \| `"off"` | ❌ | `"auto"` | `"auto"` 字幕优先、ASR 兜底；`"subtitle"` 只读字幕、**绝不**调用 ASR，无字幕来源时 `segments = []` 并在 `transcript.reason` / `warnings` 说明；`"off"` 字幕与 ASR 都不做，`transcript.source = "none"`。 |
 
 ### 4.3 返回结构
@@ -445,7 +445,7 @@ How to read 30 min: one overview is enough. media_overview({ path })
 ### 4.5 错误行为
 
 - `path` 校验见 §2.4。
-- `transcriptFile` 指向不存在的文件 → **不报错**（probe 只报告，不使用）：`capabilities.transcriptSource` 会说明它不可用；真正的报错发生在 `media_overview` / `media_locate`。
+- `subtitle` 显式选择但不可用（文件不存在 / 不可读 / 不是字幕文件；轨道不存在 / 不是字幕轨 / 是图形字幕轨 / 没有段落；语言码无命中）→ **不报错**（probe 只报告，不使用）：`capabilities.transcriptSource = "none"`，`capabilities.transcriptReason` 给出具体原因；真正的报错发生在 `media_overview` / `media_locate` / `video_subtitles`。probe 也不会拿自动发现的来源冒充这次显式选择。
 - 媒体类型无法判定 → `UNSUPPORTED_MEDIA_TYPE`。
 - 音频体检结论为 `too-quiet` / `silent` → **不报错**，但 `capabilities.asr.available = false`，且后续转写类工具会返回空转写 + 原因（见 §4.3.1）。
 
@@ -469,7 +469,7 @@ What you get depends on the media:
              configured
 
 TEXT SOURCE ORDER — subtitles first, ASR only as a fallback:
-1. a transcriptFile you pass in (external subtitle file),
+1. a subtitle you select explicitly (external subtitle file, track index or language code),
 2. the subtitle track embedded in the container,
 3. a subtitle file with the same base name in the same directory (a.srt next to a.mp4),
 4. ASR — only when none of the above exists and an ASR provider is configured.
@@ -499,7 +499,7 @@ through the rest.
 | 参数 | 类型 | 必填 | 默认 | 适用 | 说明 |
 |---|---|:---:|---|---|---|
 | `path` | string | ✅ | — | 全部 | 本地绝对路径 |
-| `transcriptFile` | string | ❌ | — | video, audio | 本地字幕/转写文件（`.srt`/`.vtt`/`.ass`/`.ssa`） |
+| `subtitle` | string \| integer | ❌ | — | video, audio | 显式选择字幕来源：本地字幕文件绝对路径 / 字幕轨 index / 语言码（规则见 §8.5） |
 | `transcript` | `"auto"` \| `"subtitle"` \| `"off"` | ❌ | `"auto"` | video, audio | `"auto"` 字幕优先、ASR 兜底；`"subtitle"` 只读字幕、绝不跑 ASR（无字幕来源时 `segments = []` 并说明原因）；`"off"` 字幕与 ASR 都不做（只出画面） |
 | `start` | number | ❌ | `0` | video, audio | 起点（秒，浮点） |
 | `end` | number | ❌ | 媒体末尾 | video, audio | 终点（秒，浮点） |
@@ -742,7 +742,7 @@ and works for both Chinese and English. Long phrases match better than single ch
 Text only by default — no image, no pixels spent. Add includeFrame: true to also get the
 picture at the best match (one image, roughly 1,900 vision tokens).
 
-A transcript is required: the embedded subtitle track, a transcriptFile you pass in, or ASR
+A transcript is required: the embedded subtitle track, a subtitle you select explicitly, or ASR
 configured via MMGREP_ASR_PROVIDER. Subtitles win over ASR. If none is available this tool
 says so instead of guessing. Use media_overview if you only need the visuals.
 
@@ -758,7 +758,7 @@ speaker's exact words.
 | `path` | string | ✅ | — | 全部 | 本地绝对路径 |
 | `query` | string | ✅ | — | 全部 | 要找的文本片段 / 关键词 |
 | `max` | integer | ❌ | `5` | 全部 | 最多返回几条匹配，1–20 |
-| `transcriptFile` | string | ❌ | — | video, audio | 本地字幕/转写文件 |
+| `subtitle` | string \| integer | ❌ | — | video, audio | 显式选择字幕来源：文件绝对路径 / 字幕轨 index / 语言码（规则见 §8.5） |
 | `transcript` | `"auto"` \| `"subtitle"` \| `"off"` | ❌ | `"auto"` | video, audio | `"subtitle"` 只查字幕、不跑 ASR；`"off"` 不接受任何转写来源 |
 | `start` / `end` | number | ❌ | 全媒体 | video, audio | 只在这个时间窗里找 |
 | `segment` | integer | ❌ | `300` | video, audio | 只给 `start` 不给 `end` 时的窗口长度 |
@@ -805,7 +805,7 @@ Feed any of these windows to media_zoom({ path, start, end }) — no need to re-
 
 - 无 `query` → `INVALID_ARGUMENT: query is required.`
 - **无任何转写来源** → `NO_TRANSCRIPT`，文案：
-  `no transcript available for this file and no ASR provider is configured (MMGREP_ASR_PROVIDER="none"). Pass transcriptFile with a local .srt/.vtt file, or configure an ASR provider. For visuals only, use media_overview instead.`
+  `no transcript available for this file and no ASR provider is configured (MMGREP_ASR_PROVIDER="none"). Pass subtitle with a local .srt/.vtt file, a track index, or a language code, or configure an ASR provider. For visuals only, use media_overview instead.`
 - `includeFrame: true` 但媒体是 audio → `includeFrame is not applicable to audio media. There are no frames to show.`
 - 一条都没匹配上 → **不是错误**：`matches` 为空数组，文本里写 `no line matched "xxx" among 128 transcript segments. Try shorter keywords, or a phrase that appears verbatim.`
 
@@ -821,10 +821,11 @@ Feed any of these windows to media_zoom({ path, start, end }) — no need to re-
 Read subtitles for a local media file and return them as timestamped segments.
 (读取本地字幕文件或视频内嵌字幕轨，解析成带时间轴的段落列表。)
 
-Two sources, in this order: an explicit transcriptFile (a local .srt, .vtt, .ass or .ssa file),
-or the subtitle track embedded in the container. Auto-discovery also picks up a sibling file
-with the same base name in the same directory (a.srt next to a.mp4) when neither of the above
-is available — the source and the exact path are always reported back, never silently.
+Two sources, in this order: an explicit subtitle selection (a local .srt, .vtt, .ass or .ssa file,
+a track index, or a language code), or the subtitle track embedded in the container. Auto-discovery
+also picks up a sibling file with the same base name in the same directory (a.srt next to a.mp4)
+when neither of the above is available — the source and the exact path are always reported back,
+never silently.
 
 No image and no pixels spent: the result is text with millisecond and second timestamps.
 Use media_locate to search inside the subtitles. Use media_overview if you also want to see
@@ -836,7 +837,7 @@ what is on screen.
 | 参数 | 类型 | 必填 | 默认 | 适用 | 说明 |
 |---|---|:---:|---|---|---|
 | `path` | string | ✅ | — | video, audio | 本地绝对路径（媒体本体） |
-| `transcriptFile` | string | ❌ | — | video, audio | 本地字幕文件绝对路径。给了就只用它 |
+| `subtitle` | string \| integer | ❌ | — | video, audio | 显式选择字幕来源：本地字幕文件绝对路径 / 字幕轨 index / 语言码。给了就只用它 |
 | `start` / `end` | number | ❌ | 全媒体 | video, audio | 只保留落在这个时间窗内的段落 |
 
 > `video_subtitles` **不接受 `pages`**（document 无字幕概念）：`pages is not applicable to video media. Use "start" and "end" (seconds) instead.` / 对 audio：`pages is not applicable to audio media. …`
@@ -876,7 +877,7 @@ what is on screen.
 ### 8.5 字幕来源的判定顺序（写死）
 
 > **通用规则**（`media_overview` / `media_locate` / `video_subtitles` 共用前 3 步）：
-> `transcriptFile` → 内嵌字幕轨 → 同目录同名文件自动发现。
+> 显式 `subtitle` 选择 → 内嵌字幕轨 → 同目录同名文件自动发现。
 > `media_overview` / `media_locate` 在这三步都没命中时**继续用 ASR 兜底**；
 > `video_subtitles` 因为是「非要有字幕不可」的工具，到第 3 步为止，仍无则报 `NO_TRANSCRIPT`。
 
@@ -889,7 +890,10 @@ what is on screen.
   `warnings` 含 `"transcript-disabled"`。`media_probe` 的 `capabilities.asr.available` 为 `false`，
   `capabilities.transcriptSource` / `transcriptOrigin` 均为 `"none"`。
 
-1. **`transcriptFile` 显式给了** → 只用它。文件读不到或解析不出内容 → 报错 `TRANSCRIPT_UNREADABLE`，**不静默回退**。
+1. **显式 `subtitle` 给了** → 按形态解释，且只用它，**不静默回退**：
+   - **绝对路径**（含路径分隔符或字幕扩展名的字符串）→ 本地字幕文件。文件不存在 / 不是普通文件 / 不可读 / 解析不出段落 → `INVALID_ARGUMENT`。
+   - **非负整数**（也接受纯数字字符串）→ ffprobe 流 index。该 index 必须存在、是字幕轨、且不是图形字幕轨；否则 `INVALID_ARGUMENT`（图形轨的错误文案内嵌 `embedded-subtitle-bitmap-skipped (...)` 形态）。
+   - **其他字符串** → 语言码，匹配轨的 `tags.language`（大小写不敏感；`zh` 也匹配 `chi`/`zho`，`en` 匹配 `eng`）。多条命中取文件中靠前的一条，其余命中的轨写进 `warnings`；无命中 → `INVALID_ARGUMENT`。
 2. **容器内嵌字幕轨** → 取第一条文本型轨。多轨时按语言优先级 `zh-Hans` → `zh-CN` → `zh` → `en-US` → `en` → 轨道序号。
 3. **同目录同名文件自动发现**（见下）。
 4. （仅 `media_overview` / `media_locate`）**ASR 兜底** → provider 已配置且音频体检通过时跑 ASR。
@@ -904,6 +908,7 @@ what is on screen.
 | `embedded-subtitle-bitmap-skipped (<codec>, track <index>)` | 内嵌字幕轨是图形字幕（如 `hdmv_pgs_subtitle` / `dvd_subtitle` / `dvb_subtitle` / `xsub`），无法解析成文字 |
 | `embedded-subtitle-empty (track <index>)` | 选中的文本型字幕轨抽出来后没有任何段落 |
 | `embedded-subtitle-unreadable (track <index>): <message>` | 抽取内嵌字幕轨失败（ffmpeg 报错原文附在冒号后） |
+| `subtitle-language-multiple-matches (language "<code>": tracks <a>, <b>; using track <a>)` | 显式 `subtitle` 语言码命中多条文本型字幕轨；按轨序取第一条，其余列在这里 |
 
 轨道存在但上述原因让内嵌字幕没被采用时，仍会继续尝试同目录同名文件与 ASR；警告只解释「为什么没用内嵌轨」，不中断后续来源。
 
@@ -919,10 +924,18 @@ what is on screen.
 
 ### 8.6 错误行为
 
-- `transcriptFile` 路径不存在 → `PATH_NOT_FOUND: transcriptFile does not exist: "/abs/a.srt".`
-- `transcriptFile` 扩展名不在支持列表 → `INVALID_ARGUMENT: transcriptFile must be one of .srt, .vtt, .ass, .ssa (got ".txt").`
-- 解析不出任何段落 → `TRANSCRIPT_UNREADABLE: no subtitle cue could be parsed from "/abs/a.srt".`
-- 完全没有字幕来源 → `NO_TRANSCRIPT: no subtitle source for "/abs/a.mp4": no embedded subtitle track, no sibling .srt/.vtt/.ass/.ssa file, and no ASR provider configured. Pass transcriptFile with a local subtitle file.`
+- 显式 `subtitle` 不可用时，`media_overview` / `media_locate` / `video_subtitles` 一律报 `INVALID_ARGUMENT`，**不静默回退**：
+  - 文件不存在 → `subtitle file does not exist: "/abs/a.srt".`
+  - 不是绝对路径 / URL → `subtitle file must be an absolute local path; got "a.srt". …` / `subtitle file must be a local absolute file path; URLs are not accepted ("https://…"). …`
+  - 扩展名不在支持列表 → `subtitle file must be one of .srt, .vtt, .ass, .ssa (got ".txt").`
+  - 解析不出段落 → `no subtitle cue could be parsed from "/abs/a.srt".`
+  - 轨道 index 不存在 → `subtitle track index 9 does not exist in this file (subtitle tracks: zho (track 1), eng (track 2)).`
+  - 轨道不是字幕轨 → `subtitle track index 0 is not a subtitle track (it is a video track).`
+  - 图形字幕轨 → `subtitle track index 2 is a bitmap subtitle track and cannot be read as text: embedded-subtitle-bitmap-skipped (hdmv_pgs_subtitle, track 2).`
+  - 语言码无命中 → `no subtitle track matches language "ja" (subtitle tracks: zho (track 1), eng (track 2)).`
+  - 选中的字幕轨没有段落 → `subtitle track index 3 contains no subtitle cues.`
+- `media_probe` 例外：同样的不可用情形**不报错**，只写进 `capabilities.transcriptSource = "none"` 与 `capabilities.transcriptReason`。
+- 完全没有字幕来源 → `NO_TRANSCRIPT: no subtitle source for "/abs/a.mp4": no embedded subtitle track, no sibling .srt/.vtt/.ass/.ssa file, and no ASR provider configured. Pass subtitle with a local subtitle file, a track index, or a language code.`
 
 ---
 
@@ -1332,7 +1345,7 @@ READING ORDER
    timestamped segments.
 
 TEXT SOURCE ORDER — subtitles first, ASR only as a fallback
-1. a subtitle file you pass in (transcriptFile),
+1. a subtitle you select explicitly (subtitle: a file path, a track index, or a language code),
 2. the subtitle track embedded in the container,
 3. a subtitle file with the same base name in the same directory (a.srt next to a.mp4),
 4. ASR, and only when none of the above exists.
@@ -1506,7 +1519,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | 14 | `cellId`（zoom 引用上次分镜的格号） | 取消 | `media_overview` 的每格都带 `startMs`/`endMs`，agent 直接传时间戳即可，不需要服务端维护 cell 映射表 |
 | 15 | 返回 `{ images: [attachment], text }`，图片走 DSH `attachments` 服务 | 返回标准 MCP content blocks：`{type:"image", data: base64, mimeType}` + `structuredContent` | 我们是标准 MCP server，不依赖 DSH 宿主。附带收益：任何 MCP client 都能直接看到图 |
 | 16 | `video_subtitles` = 把**硬字幕**裁成一条竖长图（`subtitle-strip.js` / `buildSubtitleStrip`） | `video_subtitles` = 读字幕文件 / 内嵌字幕轨，解析成**带时间轴的文本段落**，不出图 | 需求定位不同。我们先做「读已有字幕」这件高频事；裁硬字幕带的能力可以由 `media_zoom` 的 `crop` 部分覆盖，属于可后置项 |
-| 17 | `transcriptFile` 只吃 SRT 与 JSON（`[{start,end,text}]` / `[{from,to,text}]` / B 站 `{body:[…]}`） | 吃 `.srt` / `.vtt` / `.ass` / `.ssa` | 字幕文件更通用。**注意**：VTT/ASS 的解析是**新代码**，上游没有现成实现（上游 `transcript-file.js` 只有 SRT + JSON） |
+| 17 | 上游的字幕文件参数只吃 SRT 与 JSON（`[{start,end,text}]` / `[{from,to,text}]` / B 站 `{body:[…]}`） | 吃 `.srt` / `.vtt` / `.ass` / `.ssa` | 字幕文件更通用。**注意**：VTT/ASS 的解析是**新代码**，上游没有现成实现（上游 `transcript-file.js` 只有 SRT + JSON） |
 | 18 | `video_locate` 用 LCS 归一化匹配（上游 `locate.js` 的 `matchSegments`，中英文同构、忽略标点空白） | 沿用同一套打分（由本项目 `src/media/match.js` 独立实现，思路来自上游） | 上游行为已验证（阈值 `minScore=0.34`、同分短句优先），不重写 |
 | 19 | `video_locate` 纯文本、永不出图 | 默认纯文本，`includeFrame: true` 时附一张最佳匹配处的画面 | 保持上游的「定位不花像素」哲学，同时给需要看图的 agent 一个出口 |
 | 20 | 无文档形态的 locate | `media_locate` 支持文档（返回页码 + 可选页图） | 跨媒体统一 |
@@ -1514,7 +1527,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | 22 | 缓存目录 `DSH_VIDEO_CACHE_DIR`，单条上限 50 MB；**缓存键 = 路径 + 大小 + mtime** | `MMGREP_CACHE_DIR` + `MMGREP_CACHE_MAX_BYTES`（默认 10 GiB）；**缓存主键 = 文件内容的 sha256**，另有一份指纹索引（路径+大小+mtime → 内容 hash）做快速路径 | 统一前缀；本项目要缓存的是**全文与页图**，量级远大于上游的切点缓存。内容哈希做主键是 epic 决策 9：「文件改了但缓存还命中」是这类工具最致命的 bug，而 path+mtime 只是权宜之计。指纹索引解决「每次都全文件哈希」的代价 |
 | 23 | 无 `media_probe` 的文档 / 音频形态 | `media_probe` 覆盖三种媒体 | 跨媒体统一 |
 | 24 | 返回值里**不标**每段文字的来源，只有一个总的 `transcript="asr"` 之类的标记 | 每段带 `source`（`subtitle`/`ocr`/`asr`/`visual`/`none`）+ `origin`（`file`/`embedded`/`asr`/`ocr`/`none`） | agent 必须能分辨「作者写的字幕」和「机器猜的转写」。上游自己就踩过这个坑（专门写 OCR 模块用硬字幕校正 ASR），但**没有把可信度暴露给模型** |
-| 25 | 上游的 `transcript: "auto"` 是「内嵌字幕轨优先，否则 ASR」，但 `transcriptFile` 给了之后两者都跳过 | 明确的三级顺序：`transcriptFile` → 内嵌字幕轨 → ASR，并写进工具描述与 server instructions | 字幕优先是硬要求：**字幕准、免费、快**；ASR 会听错人名和数字。顺序必须写进 agent 看得到的文本里，不能只存在实现里 |
+| 25 | 上游的 `transcript: "auto"` 是「内嵌字幕轨优先，否则 ASR」，但显式字幕文件给了之后两者都跳过 | 明确的三级顺序：显式字幕选择 → 内嵌字幕轨 → ASR，并写进工具描述与 server instructions | 字幕优先是硬要求：**字幕准、免费、快**；ASR 会听错人名和数字。顺序必须写进 agent 看得到的文本里，不能只存在实现里 |
 | 26 | 上游不做音频体检，直接送 ASR | `media_probe` 对音频返回 `audioHealth`（音量 / 语音占比 / 静音占比 / 判定），太安静直接**不跑 ASR** | 太安静的录音送进 ASR 会得到一整段幻觉台词，比没有转写更糟。体检必须发生在 ASR 之前，且结论要出现在 agent 看得到的文本里 |
 | 27 | 上游 `video_zoom` 与 `video_storyboard` 都出图，没有「宫格只用来找位置」的约定 | 契约明确：**宫格图 = 找位置，裁切单帧 = 读文字** | 宫格一格只有几百像素，里面的字看不清；agent 常误以为「看过了图就知道上面写了什么」。这条必须写进用法指引，否则模型会拿宫格里的模糊笔画编内容 |
 
@@ -1544,7 +1557,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | 上游 5 个工具名 | `video_storyboard` / `video_zoom` / `video_probe` / `video_locate` / `video_subtitles` | `src/storyboard/tool-spec.js` 的 `TOOL_NAME` / `ZOOM_TOOL_NAME` / `PROBE_TOOL_NAME` / `LOCATE_TOOL_NAME` 与 `subtitlesToolSpec()` |
 | 上游 `video_probe` 返回 | 只有 text，无图 | `probeToolSpec().output` |
 | 上游 `video_locate` 返回 | 只有 text，无图 | `locateToolSpec().output` |
-| 上游 `video_zoom` 参数 | `from` / `to` / `cells` / `cellId` / `crop` **没有** / `transcriptFile` 等 | `zoomToolSpec().parameters` |
+| 上游 `video_zoom` 参数 | `from` / `to` / `cells` / `cellId` / `crop` **没有** / 字幕文件参数等 | `zoomToolSpec().parameters` |
 | 上游 `video_zoom` 必填 | 无 `cellId` 时必须给 `from` 与 `to` | `validateZoomArgs()` |
 | 上游 `cells` 取值域 | storyboard 1–16，zoom 1–9 | `validateToolArgs()` / `validateZoomArgs()` |
 | 上游 `budget` 取值域 | 320000–4000000 像素 | `validateToolArgs()` |
@@ -1555,7 +1568,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | 上游默认预算 | 1,200,000 像素/图（≈700 DSH token） | 上游 tool-spec 的 `budget` 描述 |
 | 上游内联文本上限 | 24,000 字符，超出在 cell 边界截断 | `src/storyboard/format.js` 的 `formatManifest()` |
 | 上游 locate 匹配 | LCS 归一化，`minScore=0.34`，同分短句优先 | `src/storyboard/locate.js` 的 `matchSegments()` |
-| 上游 transcriptFile 支持格式 | SRT / JSON 数组 / B 站 JSON | `src/storyboard/transcript-file.js` 头部注释 |
+| 上游字幕文件参数支持格式 | SRT / JSON 数组 / B 站 JSON | `src/storyboard/transcript-file.js` 头部注释 |
 | 缓存目录 | `DSH_VIDEO_CACHE_DIR`，默认 `~/.cache/dsh-video-storyboard` | `src/storyboard/cache.js` 的 `cacheDir()` |
 | 上游缓存键 | 路径 + 文件大小 + mtime 的哈希，**不含内容哈希** | `src/storyboard/cache.js` 的 key 构造；本项目改用**内容哈希**做主键（见 §9.0） |
 | 上游 ASR 配置 | `asr.json` + `DSH_ASR_*`，OpenAI `/audio/transcriptions` 方言 | `docs/asr-contract.md` |
@@ -1569,7 +1582,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | 1 | **图片预算的四个数**（4 张 / 16 格 / 1600 px / 4000 token）是推导值，不是实测值 | 等 beads `9z5.3`（Claude Code / Hermes 实测）出来后按实测收紧 | §10 全部；实现必须先复核 |
 | 2 | **`MMGREP_ELEVENLABS_BASE_URL` / `MMGREP_ELEVENLABS_MODEL` / `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_MODEL` 的默认值** | ElevenLabs 保留 `https://api.elevenlabs.io/v1` + `scribe_v1`，OpenAI 兼容保留 `https://api.openai.com/v1` + `whisper-1`；但**本仓库未联网验证**各家当前的转写 endpoint 与模型名，落地前需人工核对 | §12.2；配错会直接 `PROVIDER_FAILED` |
 | 3 | **`MMGREP_MINERU_BASE_URL` / `MMGREP_MINERU_MODEL` 的默认值** | 基址默认 `https://mineru.net/api/v4`、模型默认留空；MinerU 的接入方式与模型名**未在本仓库确认**（上游无文档后端，无从参照） | §12.3 |
-| 4 | **同目录字幕自动发现是否默认开启** | 我选了**默认开启**（§8.5），因为它命中率高，且命中的文件路径一定会在返回值里报出来，不是静默行为 | §8.5；若嫌意外，可改为默认关闭、需显式 `transcriptFile` |
+| 4 | **同目录字幕自动发现是否默认开启** | 我选了**默认开启**（§8.5），因为它命中率高，且命中的文件路径一定会在返回值里报出来，不是静默行为 | §8.5；若嫌意外，可改为默认关闭、需显式指定字幕文件 |
 | 5 | **`media_locate` 默认是否出图** | 我选了**默认不出图**（`includeFrame` 默认 `false`），沿用上游「定位不花像素」的定位 | §7.2 |
 | 6 | **文档 `cells` 的默认 6** | 视频默认 9、文档默认 6。文档格是页缩略图，6 页一张比 9 页一张更容易看清页内排版 | §10.3；可调 |
 | 7 | **`media_zoom` 的选帧规则** | 时间窗内选「最清晰的一帧」（上游 `pick: sharp` 的 Laplacian 方差口径）。也可改成「取中点帧」——更可预测但可能落在转场上 | §6.3 `target.selection` |

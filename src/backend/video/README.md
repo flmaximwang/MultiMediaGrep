@@ -10,7 +10,7 @@
 | --- | --- |
 | `index.js` | 五个工具入口、窗口校验、NO_TRANSCRIPT 文案 |
 | `probe.js` | ffprobe 读流信息；只解码音频流做 audioHealth（带进程内缓存） |
-| `transcript.js` | 转写来源解析：显式文件 → 内嵌轨 → 同名字幕 → ASR 兜底 |
+| `transcript.js` | 转写来源解析：显式字幕选择 → 内嵌轨 → 同名字幕 → ASR 兜底 |
 | `storyboard.js` | 镜头切点、格范围、宫格拼图 |
 | `shots.js` | 扫描镜头切点（HSV 加权，失败降级为「均分」） |
 | `frames.js` | 取帧、锐度选帧、PNG 编码（走 `media/ffmpeg.js`，认 `MMGREP_FFMPEG_PATH`） |

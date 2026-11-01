@@ -144,7 +144,7 @@ test('audio：probe / overview（字幕优先 + 包络图）/ locate', { skip, t
     assert.equal(probe.structuredContent.capabilities.transcriptSource, 'none');
 
     const overview = await call(client, 'media_overview', {
-      path: ASSETS.tone, transcriptFile: ASSETS.subsFile, envelope: true,
+      path: ASSETS.tone, subtitle: ASSETS.subsFile, envelope: true,
     });
     assert.notEqual(overview.isError, true);
     const ov = overview.structuredContent;
@@ -155,7 +155,7 @@ test('audio：probe / overview（字幕优先 + 包络图）/ locate', { skip, t
     assert.ok(overview.content.some((block) => block.type === 'image'));
 
     const locate = await call(client, 'media_locate', {
-      path: ASSETS.tone, transcriptFile: ASSETS.subsFile, query: 'THIRD SUBTITLE',
+      path: ASSETS.tone, subtitle: ASSETS.subsFile, query: 'THIRD SUBTITLE',
     });
     assert.notEqual(locate.isError, true);
     assert.equal(locate.structuredContent.matches[0].startMs, 6000);
