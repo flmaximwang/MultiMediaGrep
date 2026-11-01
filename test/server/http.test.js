@@ -17,7 +17,12 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
-import { createLogger, loadConfig } from '../../src/server/config.js';
+import {
+  DEFAULT_MAX_TEXT_INLINE_CHARS,
+  MAX_TEXT_INLINE_CHARS_HARD_CAP,
+  createLogger,
+  loadConfig,
+} from '../../src/server/config.js';
 import { createRuntime, createServer, logStartupBanner } from '../../src/server/index.js';
 import { startHttpServer, isAuthorized } from '../../src/server/http.js';
 import { assertFfmpegAvailable, run } from '../../src/media/ffmpeg.js';
@@ -701,4 +706,80 @@ test('http：请求头里的 key 不会落进缓存目录', async () => {
       assert.ok(!content.includes(sentinel), `${file} 的落盘内容里出现了请求头的 key`);
     }
   });
+});
+
+/* ------------------------------------------------------------------ *
+ * 非凭据的请求级设置（x-mmgrep-max-text-inline-chars）
+ * ------------------------------------------------------------------ */
+
+test('http：内联上限请求头 —— 无头基线 / 头优先于 env / 200000 截断 / 非法回落 env', async () => {
+  const seen = [];
+  const serverFactory = (runtimeForRequest) => {
+    seen.push(runtimeForRequest);
+    return createServer(runtimeForRequest);
+  };
+  const list = { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} };
+  const headersFor = (value) => ({ 'x-mmgrep-max-text-inline-chars': value });
+
+  await withHttpServer({ MMGREP_MAX_TEXT_INLINE_CHARS: '32000' }, async ({ endpoint, runtime, logs }) => {
+    assert.equal(runtime.config.text.maxInlineChars, 32000, 'env 基线没有生效');
+
+    // 1) 无头基线：复用共享 runtime，客户端不覆盖
+    assert.equal((await rpc(endpoint, list)).status, 200);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0], runtime, '没带头时必须原样复用共享 runtime');
+    assert.equal(seen[0].config.text.maxInlineChars, 32000);
+
+    // 2) 带头：本请求按头值生效；共享 runtime 保持不变
+    assert.equal((await rpc(endpoint, { ...list, id: 2 }, headersFor('5000'))).status, 200);
+    assert.equal(seen.length, 2);
+    assert.notEqual(seen[1], runtime);
+    assert.equal(seen[1].config.text.maxInlineChars, 5000);
+    assert.equal(runtime.config.text.maxInlineChars, 32000, '共享 runtime 被请求头改动了');
+    assert.match(logs.join('\n'), /applying per-request config \(x-mmgrep-max-text-inline-chars\)/);
+
+    // 3) 超过硬上限：按 200000 截断并 warn；日志不回显头值
+    assert.equal((await rpc(endpoint, { ...list, id: 3 }, headersFor('250000'))).status, 200);
+    assert.equal(seen[2].config.text.maxInlineChars, MAX_TEXT_INLINE_CHARS_HARD_CAP);
+    const clampedLogs = logs.join('\n');
+    assert.match(clampedLogs, /x-mmgrep-max-text-inline-chars exceeds the hard cap 200000/);
+    assert.ok(!clampedLogs.includes('250000'), `日志回显了请求头的值：${clampedLogs}`);
+
+    // 4) 非法值：warn + 回落 env（32000），不是默认 24000
+    assert.equal((await rpc(endpoint, { ...list, id: 4 }, headersFor('not-a-number'))).status, 200);
+    assert.equal(seen[3].config.text.maxInlineChars, 32000);
+    const invalidLogs = logs.join('\n');
+    assert.match(invalidLogs, /x-mmgrep-max-text-inline-chars is invalid; using the configured value 32000/);
+    assert.ok(!invalidLogs.includes('not-a-number'), `日志回显了请求头的值：${invalidLogs}`);
+
+    // 5) 空头等于没带：仍复用共享 runtime
+    assert.equal((await rpc(endpoint, { ...list, id: 5 }, headersFor('   '))).status, 200);
+    assert.equal(seen.length, 5);
+    assert.equal(seen[4], runtime, '空头不该触发请求级覆盖');
+  }, { serverFactory });
+});
+
+test('http：内联上限请求头 —— 没配 env 时缺省回落到 24000', async () => {
+  const seen = [];
+  const serverFactory = (runtimeForRequest) => {
+    seen.push(runtimeForRequest);
+    return createServer(runtimeForRequest);
+  };
+  const list = { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} };
+
+  await withHttpServer({}, async ({ endpoint, runtime }) => {
+    assert.equal(runtime.config.text.maxInlineChars, DEFAULT_MAX_TEXT_INLINE_CHARS);
+
+    // 无头：默认值，且复用共享 runtime
+    assert.equal((await rpc(endpoint, list)).status, 200);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0], runtime);
+
+    // 带头：按头值覆盖默认值
+    assert.equal(
+      (await rpc(endpoint, { ...list, id: 2 }, { 'x-mmgrep-max-text-inline-chars': '36000' })).status,
+      200,
+    );
+    assert.equal(seen[1].config.text.maxInlineChars, 36000);
+  }, { serverFactory });
 });

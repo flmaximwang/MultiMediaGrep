@@ -11,8 +11,11 @@
 //   1. 令牌只从 Authorization 头读，**绝不**从 query string 读——query 会进访问日志、
 //      进浏览器历史、进代理日志，是泄漏令牌最常见的姿势；
 //   2. **任何请求头的值都不打日志**（只记头名）：后续请求头里会带 provider 的 API key，
-//      一行日志就能泄底；key 值另有一层脱敏兜底；
+//      一行日志就能泄底；key 值另有一层脱敏兜底；配置类头的 warning 也只说头名；
 //   3. 令牌值本身永远不出现在日志里，只说 set / unset。
+//
+// 请求级覆盖头（src/server/credentials.js）：凭据头会重建 provider；非凭据设置头
+// （目前只有 x-mmgrep-max-text-inline-chars）只改写本次请求的 config，provider 复用。
 
 import crypto from 'node:crypto';
 import http from 'node:http';
@@ -21,6 +24,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 
 import {
   REQUEST_HEADERS,
+  presentConfigHeaders,
   presentCredentialHeaders,
   resolveConfigForRequest,
 } from './credentials.js';
@@ -217,28 +221,42 @@ function createRequestLogger(logger, secrets) {
 }
 
 /**
- * 为「带了凭据头」的请求造一份独立 runtime。
+ * 为「带了请求级覆盖头」的请求造一份独立 runtime。
  *
  * 共享的东西：cache、logger（外面套脱敏）、backends、dispatcher；它们不含凭据状态，
  * 重建反而会丢掉缓存。
  * 重建的东西：config 与 asr / doc provider——provider 持有 apiKey 闭包，必须逐请求新建，
  * **绝不按 key / 头做缓存**，否则明文密钥会在内存里活过这次请求。
+ * 只有非凭据设置头（例如 x-mmgrep-max-text-inline-chars）时，provider 不重建：
+ * 那份配置没有改动 provider 字段，复用共享实例即可。
  */
 async function createRequestRuntime(runtime, config, headers, env, logger = runtime?.logger) {
   const requestLogger = createRequestLogger(logger, secretHeaderValues(headers));
-  const names = presentCredentialHeaders(headers);
-  requestLogger?.info?.(
-    `http: applying per-request credentials (${names.join(', ')}); providers are built for this request only.`,
-  );
-  const providers = await loadProviders(config, env, requestLogger, { pinCredentials: true });
-  return {
-    ...runtime,
-    config,
-    logger: requestLogger,
-    asrProvider: providers.asrProvider,
-    docProvider: providers.docProvider,
-    providerErrors: providers.providerErrors,
-  };
+  const credentialNames = presentCredentialHeaders(headers);
+  const configNames = presentConfigHeaders(headers);
+
+  if (configNames.length > 0) {
+    requestLogger?.info?.(
+      `http: applying per-request config (${configNames.join(', ')}); providers are shared with the server runtime.`,
+    );
+  }
+
+  if (credentialNames.length > 0) {
+    requestLogger?.info?.(
+      `http: applying per-request credentials (${credentialNames.join(', ')}); providers are built for this request only.`,
+    );
+    const providers = await loadProviders(config, env, requestLogger, { pinCredentials: true });
+    return {
+      ...runtime,
+      config,
+      logger: requestLogger,
+      asrProvider: providers.asrProvider,
+      docProvider: providers.docProvider,
+      providerErrors: providers.providerErrors,
+    };
+  }
+
+  return { ...runtime, config, logger: requestLogger };
 }
 
 /**
@@ -249,15 +267,17 @@ async function createRequestRuntime(runtime, config, headers, env, logger = runt
 async function handleMcpPost(req, res, ctx) {
   const { runtime, logger, serverFactory, parsed, timeoutMs } = ctx;
 
-  // 先算「本请求的凭据覆盖」，再碰任何 provider：provider id 写错是客户端的参数问题，
+  // 先算「本请求的请求级覆盖」，再碰任何 provider：provider id 写错是客户端的参数问题，
   // 必须在建 server / 构造 provider 之前就回 400。
+  // 覆盖头有两类：凭据头（要重建 provider）与普通设置头（只改 config，例如内联上限）。
   let requestRuntime = runtime;
   const headers = req.headers ?? {};
   const present = presentCredentialHeaders(headers);
-  if (present.length > 0) {
+  const presentConfig = presentConfigHeaders(headers);
+  if (present.length > 0 || presentConfig.length > 0) {
     try {
       const env = runtime?.env ?? process.env;
-      const config = resolveConfigForRequest(runtime?.config ?? {}, headers, env);
+      const config = resolveConfigForRequest(runtime?.config ?? {}, headers, env, { logger });
       requestRuntime = await createRequestRuntime(runtime, config, headers, env, logger);
     } catch (error) {
       if (error?.code === 'INVALID_ARGUMENT') {

@@ -5,6 +5,7 @@
       "url": "http://127.0.0.1:3927/mcp",
       "headers": {
         "Authorization": "Bearer <token>",
+        "x-mmgrep-max-text-inline-chars": "32000",
         "x-mmgrep-asr-provider": "elevenlabs",
         "x-mmgrep-elevenlabs-api-key": "sk-你的key",
         "x-mmgrep-doc-provider": "mineru",

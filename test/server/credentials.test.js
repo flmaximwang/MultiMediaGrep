@@ -7,12 +7,16 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  DEFAULT_MAX_TEXT_INLINE_CHARS,
   DEFAULT_OPENAI_COMPATIBLE_BASE_URL,
   DEFAULT_OPENAI_COMPATIBLE_MODEL,
+  MAX_TEXT_INLINE_CHARS_HARD_CAP,
   loadConfig,
 } from '../../src/server/config.js';
 import {
+  HEADER_CONFIG_HEADERS,
   REQUEST_HEADERS,
+  presentConfigHeaders,
   presentCredentialHeaders,
   resolveConfigForRequest,
 } from '../../src/server/credentials.js';
@@ -77,6 +81,28 @@ test('presentCredentialHeaders：只认非空的已知凭据头', () => {
     }),
     ['x-mmgrep-asr-provider', 'x-mmgrep-elevenlabs-model'],
   );
+});
+
+test('HEADER_CONFIG_HEADERS：非凭据设置沿用同一套 env → 头名映射', () => {
+  assert.deepEqual(HEADER_CONFIG_HEADERS, {
+    maxTextInlineChars: 'x-mmgrep-max-text-inline-chars',
+  });
+});
+
+test('presentConfigHeaders：只认非空的已知设置头，凭据头不算', () => {
+  assert.deepEqual(presentConfigHeaders({}), []);
+  assert.deepEqual(presentConfigHeaders({ authorization: 'Bearer x' }), []);
+  assert.deepEqual(presentConfigHeaders({ 'x-mmgrep-asr-provider': 'elevenlabs' }), []);
+  // 非凭据设置头也不能反过来被当成凭据头（否则会触发不必要的 provider 重建）
+  assert.deepEqual(presentCredentialHeaders({ 'x-mmgrep-max-text-inline-chars': '5000' }), []);
+  assert.deepEqual(
+    presentConfigHeaders({ 'X-MMGREP-MAX-TEXT-INLINE-CHARS': '  5000  ' }),
+    ['x-mmgrep-max-text-inline-chars'],
+  );
+  // 空头等于没带（与凭据头同口径）
+  for (const empty of ['', '   ', '\t\n']) {
+    assert.deepEqual(presentConfigHeaders({ 'x-mmgrep-max-text-inline-chars': empty }), []);
+  }
 });
 
 test('请求头优先于环境变量（apiKey / baseUrl / model 三个字段）', () => {
@@ -250,6 +276,98 @@ test('doc 分组同理：专属头 / 通用头 / env / 切 provider', () => {
   assert.equal(fromEnv.doc.apiKeySource, 'MMGREP_MINERU_API_KEY');
 });
 
+test('内联上限请求头：头 > env > 默认 24000，超过 200000 按上限截断', () => {
+  const env = { MMGREP_MAX_TEXT_INLINE_CHARS: '12000' };
+  const base = baseConfig(env);
+  const warnings = [];
+  const logger = { warn: (message) => warnings.push(message) };
+  const resolve = (header) => resolveConfigForRequest(
+    base,
+    header === undefined ? {} : { 'x-mmgrep-max-text-inline-chars': header },
+    env,
+    { logger },
+  );
+
+  // 请求头优先于 env
+  const fromHeader = resolve('5000');
+  assert.equal(fromHeader.text.maxInlineChars, 5000);
+  assert.deepEqual(fromHeader.requestOverrides.text, {
+    maxInlineChars: 'x-mmgrep-max-text-inline-chars',
+  });
+  assert.ok(Object.isFrozen(fromHeader.text));
+  assert.deepEqual(warnings, []);
+
+  // 没带头 → env
+  const fromEnv = resolve(undefined);
+  assert.equal(fromEnv.text.maxInlineChars, 12000);
+  assert.deepEqual(fromEnv.requestOverrides.text, { maxInlineChars: null });
+
+  // 边界：正好 200000 不截断；200001 截断并 warn
+  const atCap = resolve(String(MAX_TEXT_INLINE_CHARS_HARD_CAP));
+  assert.equal(atCap.text.maxInlineChars, MAX_TEXT_INLINE_CHARS_HARD_CAP);
+  assert.deepEqual(warnings, []);
+
+  const overCap = resolve(String(MAX_TEXT_INLINE_CHARS_HARD_CAP + 1));
+  assert.equal(overCap.text.maxInlineChars, MAX_TEXT_INLINE_CHARS_HARD_CAP);
+  assert.equal(overCap.requestOverrides.text.maxInlineChars, 'x-mmgrep-max-text-inline-chars');
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /x-mmgrep-max-text-inline-chars/);
+  assert.match(warnings[0], new RegExp(String(MAX_TEXT_INLINE_CHARS_HARD_CAP)));
+  assert.ok(
+    !warnings[0].includes(String(MAX_TEXT_INLINE_CHARS_HARD_CAP + 1)),
+    `warning 回显了头值：${warnings[0]}`,
+  );
+
+  // 非法值 → warn + 回落 env（不是回落默认）
+  for (const invalid of ['abc', '-5', '1.5', '10kb']) {
+    warnings.length = 0;
+    const result = resolve(invalid);
+    assert.equal(result.text.maxInlineChars, 12000, `非法值 ${JSON.stringify(invalid)} 没有回落 env`);
+    assert.deepEqual(result.requestOverrides.text, { maxInlineChars: null });
+    assert.equal(warnings.length, 1, `非法值 ${JSON.stringify(invalid)} 没有 warn`);
+    assert.match(warnings[0], /is invalid/);
+    assert.ok(!warnings[0].includes(invalid), `warning 回显了头值：${warnings[0]}`);
+  }
+
+  // 0 也是非法值（上限至少 1 个字符）
+  warnings.length = 0;
+  assert.equal(resolve('0').text.maxInlineChars, 12000);
+  assert.equal(warnings.length, 1);
+
+  // 空头 / 纯空白头等于没带：静默回落 env
+  for (const empty of ['', '   ', '\t\n']) {
+    warnings.length = 0;
+    const result = resolve(empty);
+    assert.equal(result.text.maxInlineChars, 12000);
+    assert.deepEqual(result.requestOverrides.text, { maxInlineChars: null });
+    assert.deepEqual(warnings, []);
+  }
+});
+
+test('内联上限请求头：env 也没配时回落到默认 24000', () => {
+  const base = loadConfig({});
+  const warnings = [];
+  const logger = { warn: (message) => warnings.push(message) };
+
+  const invalid = resolveConfigForRequest(
+    base,
+    { 'x-mmgrep-max-text-inline-chars': 'nope' },
+    {},
+    { logger },
+  );
+  assert.equal(invalid.text.maxInlineChars, DEFAULT_MAX_TEXT_INLINE_CHARS);
+  assert.equal(warnings.length, 1);
+
+  const header = resolveConfigForRequest(
+    base,
+    { 'x-mmgrep-max-text-inline-chars': '60000' },
+    {},
+    { logger },
+  );
+  assert.equal(header.text.maxInlineChars, 60000);
+  assert.equal(warnings.length, 1, '合法头不该加 warning');
+});
+
 test('requestOverrides 只记录头名，绝不出现任何头的值', () => {
   const asrKey = 'sentinel-asr-key-never-serialised';
   const asrBase = 'https://sentinel-base.example/v1';
@@ -262,10 +380,12 @@ test('requestOverrides 只记录头名，绝不出现任何头的值', () => {
       'x-mmgrep-openai-compatible-base-url': asrBase,
       'x-mmgrep-doc-provider': 'mineru',
       'x-mmgrep-mineru-api-key': docKey,
+      'x-mmgrep-max-text-inline-chars': '5000',
     },
     SERVER_ENV,
   );
 
+  assert.equal(config.text.maxInlineChars, 5000, '凭据头与设置头应该能同时生效');
   assert.deepEqual(config.requestOverrides, {
     present: [
       'x-mmgrep-asr-provider',
@@ -286,14 +406,17 @@ test('requestOverrides 只记录头名，绝不出现任何头的值', () => {
       baseUrl: null,
       model: null,
     },
+    text: { maxInlineChars: 'x-mmgrep-max-text-inline-chars' },
   });
 
   const serialized = JSON.stringify(config.requestOverrides);
   for (const secret of [asrKey, asrBase, docKey]) {
     assert.ok(!serialized.includes(secret), `requestOverrides 泄漏了请求头的值：${serialized}`);
   }
+  assert.ok(!serialized.includes('5000'), `requestOverrides 泄漏了设置头的值：${serialized}`);
   assert.ok(Object.isFrozen(config.requestOverrides));
   assert.ok(Object.isFrozen(config.requestOverrides.asr));
+  assert.ok(Object.isFrozen(config.requestOverrides.text));
 });
 
 test('返回新配置：冻结、不改 baseConfig、非 provider 字段原样继承', () => {
@@ -313,6 +436,7 @@ test('返回新配置：冻结、不改 baseConfig、非 provider 字段原样�
 
   assert.deepEqual(config.cache, base.cache);
   assert.deepEqual(config.images, base.images);
+  assert.deepEqual(config.text, base.text, '没有内联上限头时 text 段不该变');
   assert.deepEqual(config.audio, base.audio);
   assert.deepEqual(config.transport, base.transport);
   assert.deepEqual(config.warnings, base.warnings);
@@ -326,10 +450,12 @@ test('没有任何头时：整份配置与 baseConfig 等价（provider / key �
 
   assert.deepEqual(config.asr, base.asr);
   assert.deepEqual(config.doc, base.doc);
+  assert.deepEqual(config.text, base.text);
   assert.deepEqual(config.requestOverrides.present, []);
   assert.deepEqual(config.requestOverrides.asr, {
     provider: null, apiKey: null, baseUrl: null, model: null,
   });
+  assert.deepEqual(config.requestOverrides.text, { maxInlineChars: null });
 });
 
 test('没有头但 env 与 baseConfig 不同：所选 provider 的 env 值优先（baseConfig 只是最后兜底）', () => {

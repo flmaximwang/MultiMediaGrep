@@ -22,6 +22,8 @@ export const DEFAULT_MAX_IMAGE_TOKENS = 4000;
 export const DEFAULT_MAX_IMAGE_EDGE = 1600;
 /** 契约 §12.5：内联文本字符上限 */
 export const DEFAULT_MAX_TEXT_INLINE_CHARS = 24000;
+/** 契约 §12.5：HTTP 请求头覆盖内联上限时的硬上限（防客户端把响应撑爆） */
+export const MAX_TEXT_INLINE_CHARS_HARD_CAP = 200000;
 /** 契约 §12.5：并行任务数 */
 export const DEFAULT_MAX_CONCURRENCY = 2;
 /** 契约 §4.3.1 / §12.5：音频体检阈值 */
