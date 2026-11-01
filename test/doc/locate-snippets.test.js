@@ -142,8 +142,8 @@ test('文档 locate：返回页码 + hits + 片段，不回吐整页，也没有
 
     const text = result.content[0].text;
     assert.match(text, /^matches for "needle" \(2 of 7 pages\):/);
-    assert.match(text, /  page 3 {2}hits=2 {2}「/);
-    assert.match(text, /  page 7 {2}hits=1 {2}「/);
+    assert.match(text, /  page 3 {2}hits=2 \(ocr\) {2}「/);
+    assert.match(text, /  page 7 {2}hits=1 \(ocr\) {2}「/);
     // 片段里有命中，不是页首
     assert.ok(text.includes('NEEDLE'));
     assert.ok(!text.includes('page 3 head'), '片段不是页首');
@@ -251,7 +251,7 @@ test('文档 locate：精确命中排在 token 覆盖（fuzzy）之前', async (
     for (const match of matches.slice(1)) {
       assert.equal(match.fuzzy, true, '只命中通用词的页标 fuzzy');
     }
-    assert.match(result.content[0].text, /hits=1 \(fuzzy\)/);
+    assert.match(result.content[0].text, /hits=1 \(fuzzy, ocr\)/);
   });
 });
 

@@ -115,7 +115,7 @@ test('pages:"4"：单页正文 > 24k 字符时返回非空摘录 + 抽样说明'
     const data = result.structuredContent;
 
     assert.ok(text.length <= 24000, `text is ${text.length} chars`);
-    assert.match(text, /^\[page 4\s*\] \(ocr\)/m, 'page 4 must not vanish');
+    assert.match(text, /^\[page 4\s*\] \(text\)/m, 'page 4 must not vanish');
     assert.match(text, /preview: sampled \d+ of \d+ sentences across page 4/);
     assert.match(text, /every requested page is represented/);
     assert.equal(data.preview.mode, 'sampled');
@@ -141,9 +141,9 @@ test('pages:"4-6"：长页被抽样时 4/5/6 三页都出现，超长单元带 �
     const data = result.structuredContent;
 
     assert.ok(text.length <= 24000, `text is ${text.length} chars`);
-    assert.match(text, /^\[page 4\s*\] \(ocr\)/m);
-    assert.match(text, /^\[page 5\s*\] \(ocr\)/m);
-    assert.match(text, /^\[page 6\s*\] \(ocr\)/m);
+    assert.match(text, /^\[page 4\s*\] \(text\)/m);
+    assert.match(text, /^\[page 5\s*\] \(text\)/m);
+    assert.match(text, /^\[page 6\s*\] \(text\)/m);
     assert.match(text, /…\[\+\d+ chars\]/, 'page 6 is one unpunctuated unit and must be hard-truncated');
     assert.ok(data.preview.notRepresented.length === 0);
     assert.equal(data.preview.mode, 'sampled');

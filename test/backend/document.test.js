@@ -257,8 +257,8 @@ test('probe：文本 PDF 的契约字段、文字层与 OCR 能力', { skip: ski
     assert.equal(probe.capabilities.ocr.provider, null);
     assert.match(probe.capabilities.ocr.reason, /No OCR provider is configured/);
     assert.equal(probe.capabilities.typeset.available, false);
-    assert.equal(probe.capabilities.transcriptSource, 'ocr');
-    assert.equal(probe.capabilities.transcriptOrigin, 'ocr');
+    assert.equal(probe.capabilities.transcriptSource, 'text');
+    assert.equal(probe.capabilities.transcriptOrigin, 'textlayer');
     assert.equal(probe.capabilities.transcriptPath, null);
     assert.equal(probe.recommended.mode, 'single');
     assert.ok(probe.recommended.note);
@@ -307,7 +307,7 @@ test('probe：txt / md 是一页有文字层，没有像素尺寸', async () => 
     assert.equal(probe.width, null);
     assert.equal(probe.height, null);
     assert.equal(probe.container, 'markdown');
-    assert.equal(probe.capabilities.transcriptSource, 'ocr');
+    assert.equal(probe.capabilities.transcriptSource, 'text');
     assert.equal(probe.capabilities.ocr.available, false);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -340,8 +340,8 @@ test('overview：页子集、格数 / 图数 / maxEdge 与每页文字严格对�
     for (const segment of result.segments) {
       assert.equal(segment.startMs, null);
       assert.equal(segment.endMs, null);
-      assert.equal(segment.source, 'ocr');
-      assert.equal(segment.origin, 'ocr');
+      assert.equal(segment.source, 'text');
+      assert.equal(segment.origin, 'textlayer');
       for (const line of groundTruthLines(TEXT_GT, segment.page)) {
         assert.ok(segment.text.includes(line), `page ${segment.page} must contain "${line}"`);
       }
@@ -350,8 +350,8 @@ test('overview：页子集、格数 / 图数 / maxEdge 与每页文字严格对�
     assert.ok(result.segments[1].text.includes('PAGE THREE HEADING'));
     assert.ok(!result.segments[0].text.includes('PAGE 1 OF 6'));
     assert.ok(!result.segments[1].text.includes('PAGE TWO HEADING'));
-    assert.equal(result.transcript.source, 'ocr');
-    assert.equal(result.transcript.origin, 'ocr');
+    assert.equal(result.transcript.source, 'text');
+    assert.equal(result.transcript.origin, 'textlayer');
     assert.equal(result.transcript.provider, null);
     assert.deepEqual(result.warnings, []);
   });
@@ -376,8 +376,8 @@ test('overview：images: 0 是零像素纯文本模式——不出页图，只�
     for (const segment of result.segments) {
       assert.equal(segment.startMs, null);
       assert.equal(segment.endMs, null);
-      assert.equal(segment.source, 'ocr');
-      assert.equal(segment.origin, 'ocr');
+      assert.equal(segment.source, 'text');
+      assert.equal(segment.origin, 'textlayer');
       for (const line of groundTruthLines(TEXT_GT, segment.page)) {
         assert.ok(segment.text.includes(line), `page ${segment.page} must contain "${line}"`);
       }
@@ -386,7 +386,7 @@ test('overview：images: 0 是零像素纯文本模式——不出页图，只�
     assert.ok(result.segments[1].text.includes('PAGE THREE HEADING'));
     // 没出图就不该有「图片预算只覆盖了 N 页」的告警
     assert.ok(!result.warnings.some((warning) => /image budget covers/.test(warning)));
-    assert.equal(result.transcript.source, 'ocr');
+    assert.equal(result.transcript.source, 'text');
   });
 });
 
@@ -544,8 +544,11 @@ test('overview：纯文本没有页面图，文字放在第 1 页 segment', asyn
     assert.equal(result.images.length, 0);
     assert.equal(result.segments.length, 1);
     assert.equal(result.segments[0].page, 1);
+    assert.equal(result.segments[0].source, 'text');
+    assert.equal(result.segments[0].origin, 'file');
     assert.match(result.segments[0].text, /Alpha Bravo Charlie/);
-    assert.equal(result.transcript.source, 'ocr');
+    assert.equal(result.transcript.source, 'text');
+    assert.equal(result.transcript.origin, 'file');
     assert.ok(result.warnings.some((warning) => /no page images/.test(warning)));
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -627,15 +630,15 @@ test('locate：文本 PDF 页码匹配 + includeFrame 返回最佳匹配页', {
     assert.equal(best.rank, 1);
     assert.equal(best.page, 3);
     assert.equal(best.score, 1);
-    assert.equal(best.source, 'ocr');
-    assert.equal(best.origin, 'ocr');
+    assert.equal(best.source, 'text');
+    assert.equal(best.origin, 'textlayer');
     assert.equal(best.startMs, null);
     assert.equal(best.endMs, null);
     assert.equal(best.startSec, null);
     assert.equal(best.endSec, null);
     assert.match(best.text, /SIX SEVEN EIGHT NINE TEN/);
-    assert.equal(result.transcript.source, 'ocr');
-    assert.equal(result.transcript.origin, 'ocr');
+    assert.equal(result.transcript.source, 'text');
+    assert.equal(result.transcript.origin, 'textlayer');
 
     assert.ok(result.frame, 'includeFrame must return a frame');
     assert.equal(result.frame.page, 3);
@@ -671,8 +674,8 @@ test('locate：纯文本可搜，includeFrame 降级为 warning', async () => {
     });
     assert.equal(result.matches.length, 1);
     assert.equal(result.matches[0].page, 1);
-    assert.equal(result.matches[0].source, 'ocr');
-    assert.equal(result.matches[0].origin, 'ocr');
+    assert.equal(result.matches[0].source, 'text');
+    assert.equal(result.matches[0].origin, 'file');
     assert.equal(result.totalSegments, 1);
     assert.equal(result.frame, null);
     assert.ok(result.warnings.some((warning) => /no page image/.test(warning)));
