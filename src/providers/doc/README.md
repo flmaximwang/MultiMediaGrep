@@ -122,17 +122,18 @@ warning，指出替代变量（`MMGREP_OCR_PROVIDER` / `MMGREP_TYPESET_PROVIDER`
 - `parse()` 失败时抛出的 `Error` 必须可诊断（见 §5），且**不能包含 token**。
 - `textLayers` 是给**本地 typeset provider** 的可选输入：文档后端已经把逐页文字层抽好
   （`pdfSupport.extractTextLayers`），以 `{ [page]: text }` 传入，builtin 直接据此产出
-  blocks，避免重复跑 `pdftotext`。外部 provider 可以忽略它。
+  blocks，避免重复跑 `pdftotext`。外部 provider 可忽略内容，但 `role: 'both'` 时可用它
+  逐页区分 textlayer / ocr（MinerU 就是这么做的）。
 
 ### role / ocrMode 的语义
 
 | 输入 | 含义 |
 | --- | --- |
 | `role: 'ocr'` | 这些页需要从像素识别字符；结果 `textOrigin` 应为 `'ocr'`（或 `'unknown'`）。 |
-| `role: 'typeset'` | 这些页有文字层，只恢复结构；**不得重新识别字符**。 |
-| `role: 'both'` | 同一次调用里同时承担两个角色（两个角色是同一 provider 时由后端合并请求）。按页返回各自的 `textOrigin`。 |
-| `ocrMode: 'auto'` | 默认。provider 自行决定是否 OCR（MinerU 不再强制 `is_ocr: true`）。 |
-| `ocrMode: 'force'` | 调用方要求重新识别（9z5.31）。MinerU 发送 `is_ocr: true`，结果 `textOrigin = 'ocr'`。 |
+| `role: 'typeset'` | 这些页有文字层，只恢复结构；**不得重新识别字符**。MinerU 会显式钉在 `model_version: "pipeline"`；`MMGREP_MINERU_MODEL=vlm` 与其冲突，直接报清晰错误（见 §4）。 |
+| `role: 'both'` | 同一次调用里同时承担两个角色（两个角色是同一 provider 时由后端合并请求）。按页返回各自的 `textOrigin`；后端会把有文字层的页通过 `textLayers` 传进来，用于逐页区分。因为包含 typeset，`both` 也会显式钉 `pipeline`。 |
+| `ocrMode: 'auto'` | 默认。provider 自行决定是否 OCR（MinerU 不发送 `is_ocr`，即 `false`）：有文字层的页保留原字符，扫描页由 MinerU 自行 OCR。 |
+| `ocrMode: 'force'` | 调用方要求重新识别（9z5.31）。MinerU 发送 `is_ocr: true`，结果 `textOrigin = 'ocr'`。typeset 角色 + force 是冲突，会报错（typeset 不得重识别）。 |
 
 ### `pages` 参数支持的写法
 
@@ -187,7 +188,7 @@ export function createMineruDocProvider({
    ```json
    {
      "files": [{ "name": "doc.pdf", "page_ranges": "1-200" }],
-     "model_version": "vlm"
+     "model_version": "pipeline"
    }
    ```
 
@@ -198,9 +199,11 @@ export function createMineruDocProvider({
    ```
 
    - `files[].is_ocr` 是**文件级**参数（不是顶层），只在 `ocrMode: 'force'` 时发送
-     `true`；`auto` 不发送，让 MinerU 自行选择。
+     `true`；`auto` 不发送（服务端默认 `false`），让 MinerU 自行选择。
    - `page_ranges` 也是文件级。
-   - `model_version` 只在显式配置 `MMGREP_MINERU_MODEL` 时发送。
+   - `model_version`：**typeset / both 角色始终显式发送 `pipeline`**（硬性钉住，不依赖
+     服务端默认值）；OCR 角色发送 `MMGREP_MINERU_MODEL` 的值，未设置则省略（服务端默认
+     `pipeline`）。typeset / both 角色与 `vlm` 等非 pipeline 模型冲突时直接报错。
    - 链接有效期 24 小时；单次最多 50 个文件（我们一次只传一个）。
 
 2. **PUT 上传**
@@ -231,22 +234,102 @@ export function createMineruDocProvider({
 
 4. **下载结果包**
    `GET full_zip_url`（预签名 CDN 地址，**同样不带 Authorization**）。
-   zip 内含 `full.md`、`layout.json`、`*_model.json`、`*_content_list.json`、`images/`。
+   zip 内含 `full.md`、`layout.json`、`*_model.json`、`*_content_list.json`、
+   `*_content_list_v2.json`、`images/`。云端 API v4（2026-11-02 实测 MinerU 3.4.4）
+   **没有** `middle.json`，也没有逐页 / 逐文档解析模式字段；详见下面「blocks / textOrigin」。
 
-### 契约 v2 的 blocks / textOrigin（本票的最小实现）
+### 契约 v2 的 blocks / textOrigin
 
-- `content_list.json` 的每条有文字的条目 → 一个 `paragraph` block；`text` 由 blocks
-  派生（段落之间空行）。完整的类型映射（`text_level` → heading、图注 → caption、
-  公式 → equation、表格 → table 等）属于 **9z5.29**。
-- `textOrigin` 当前是保守值：
-  - `ocrMode: 'force'` → `'ocr'`；
-  - `model_version = vlm` → `'ocr'`（VLM 读页图，实质 OCR）；
-  - `role: 'ocr'` → `'ocr'`；
-  - `role: 'typeset'` / `'both'` 且未强制 OCR → `'unknown'`（pipeline 是否保留文字层
-    尚未核实）。
-- **TODO(9z5.29)**：核实 pipeline + `is_ocr=false` 对有文字层 PDF 的行为、结果包里是否
-  有逐页解析模式字段；核实后再决定能否把 `'unknown'` 收窄成 `'textlayer'`，并补齐
-  完整 blocks 映射与 typeset + vlm 的冲突处理。
+#### blocks 映射（content_list.json）
+
+| content_list 条目 | 产出 block |
+| --- | --- |
+| `text` 且 `text_level` 为正整数 | `heading`，`level = text_level` |
+| `title` | `heading`（`level = text_level`，缺省 1） |
+| `text` | `paragraph` |
+| `list` / `index` | `list`（`list_items` 按行拼接） |
+| `table` | `table`；`rows` / `html` / `caption` / `footnote` 仍保留在页面的 `tables[]` 里 |
+| `image` / `chart` 的 caption | `caption`；对应 footnote → `footnote`；chart 的 `content` → `paragraph` |
+| `equation` | `equation` |
+| `page_footnote` | `footnote` |
+| `code` / `header` / `footer` / `page_number` 等 | `paragraph`（契约里没有对应类型，保留文字） |
+
+页面的 `text` 由 blocks 派生（`blocksToText`，块之间空行）；`tables` 仍保留结构化数据。
+映射实现在 `itemsToPages()` / `itemToBlocks()`。
+
+#### textOrigin 判定（按优先级）
+
+| 条件 | textOrigin |
+| --- | --- |
+| 该页没有文本 | `unknown` |
+| `ocrMode: 'force'` | `ocr` |
+| OCR 角色且 `model_version = vlm` | `ocr` |
+| 结果包显式 `parse_mode` / `_parse_type = ocr` | `ocr` |
+| 结果包显式 `parse_mode` / `_parse_type = txt` | `textlayer` |
+| `role: 'typeset'`（已钉 pipeline + 不强制 OCR） | `textlayer` |
+| 该页在 `textLayers` 里（后端路由为「有文字层页」） | `textlayer` |
+| `role: 'ocr'`（这些页本来就没有文字层） | `ocr` |
+| `role: 'both'` 且后端给了 `textLayers`，但该页不在集合里 | `ocr` |
+| 其余（`role: 'both'` 且拿不到逐页文字层信息） | `unknown` |
+
+实现：`resolveTextOrigin()`。`unknown` 是保守值，下游按 OCR 处理（.21）。
+
+#### typeset + vlm 冲突：硬错误
+
+typeset 角色必须保留 PDF 文字层字符；`model_version=vlm` 读页图重新识别，实质是 OCR。
+因此当 `role` 是 `typeset` 或 `both` 且 `MMGREP_MINERU_MODEL` 是 `vlm`（或其它非
+`pipeline` 值）时，`parse()` 在发请求前抛错：
+
+```
+MinerU cannot serve the typeset role with MMGREP_MINERU_MODEL="vlm": ...
+Set MMGREP_MINERU_MODEL=pipeline (or the x-mmgrep-mineru-model header) ...,
+or set MMGREP_TYPESET_PROVIDER=builtin / none ...
+```
+
+选硬错误而不是 warning 的原因：文档后端捕获 provider 失败后会回退到原生文字层
+（`textOrigin: 'textlayer'`）并给 warning；如果只 warning 却继续返回 VLM 结果，
+OCR 文本可能被当成可原话引用的文字层。OCR 角色仍可单独用 vlm。
+
+#### 结果包里的解析模式（核实记录）
+
+官方 4.x 的 middle.json 在 `extensions.mineru.parse_mode` 记录最终模式（只接受
+`txt` / `ocr`，不存 `auto`）；历史 / 本地构建也可能在逐页对象上留 `_parse_type`。
+`readPackageParseModes()` 会读这些字段并优先于角色推断。
+
+但**云端 API v4 的结果包不带这些字段**（2026-11-02 实测 MinerU 3.4.4）：zip 里没有
+middle.json，layout.json 只有 `_backend` / `_version_name`；递归检查所有 JSON 的
+`parse_mode` / `_parse_type` / `is_ocr` 字段数均为 0。因此云端结果主要靠角色 + 配置
+推断；`role: 'both'` 拿不到逐页文字层信息时保持 `unknown`。
+
+#### 核实结论与来源（9z5.29，2026-11-02）
+
+1. **pipeline + `is_ocr=false` 对有文字层的页保留原始字符（不 OCR）。**
+   - 官方 API 参数表：`is_ocr` 默认 `false`，仅对 PDF 生效；`model_version` 默认
+     `pipeline`：<https://mineru.net/apiManage/docs>
+   - 官方 WebUI 文档对「强制 OCR」的定义是「忽略 PDF 文本层并进行 OCR」，即默认模式
+     使用文本层：<https://opendatalab.github.io/MinerU/next/cli/mineru-kit-webui/>
+   - 真实 API 实测（`real-nbt-ago2.pdf` 第 4 页，有文字层，pipeline + `is_ocr=false`）：
+     去掉空白与 MathJax 标记后，返回文本与 `pdftotext -layout -f 4 -l 4` 的字符一致，
+     最长连续精确匹配 68 字符，≥20 字符的精确匹配 21 段、共 1090 字符，包含
+     `AGO2F470V;F505V;Q633R`、`∆PAZ`、上标引用等 OCR 容易改写的字符，未发现 OCR 替换。
+2. **VLM（`model_version=vlm`）读页图 = 实质 OCR，typeset 必须钉 pipeline。**
+   - 官方 2.0 发布说明：VLM 是端到端多模态文档模型，单模型覆盖「多语言识别、手写识别、
+     版面分析、表格解析、公式识别、阅读顺序排序」：
+     <https://opendatalab.github.io/MinerU/reference/changelog/#200-20250613>
+   - 4.x 迁移文档：Basic 用小模型，Standard / Advanced 用 VLM：
+     <https://opendatalab.github.io/MinerU/reference/migration_4/>
+   - 因此 typeset / both 角色与 vlm 冲突时硬错误；OCR 角色可单独用 vlm，结果标 `ocr`。
+3. **结果包里是否有解析模式字段：官方 4.x 有（文档级 `extensions.mineru.parse_mode`），
+   云端 API v4 实测没有。**
+   - 官方输出契约：<https://opendatalab.github.io/MinerU/reference/output_files/>
+     与 <https://opendatalab.github.io/MinerU/next/middle-json/envelope/>
+   - 实测 2026-11-02：请求第 4、28 页（pipeline，第 28 页 `is_ocr` 分别为 false / true），
+     结果 zip 无 middle.json，所有 JSON 无 `parse_mode` / `_parse_type` / `is_ocr`；
+     第 28 页无文字层，auto 与 force 都 OCR，文本仅两处句末句点差异（OCR 随机性）。
+   - 因此：能从结果包读到模式就采信；读不到时按角色 / 配置推断，无法确定则 `unknown`。
+
+> 配额消耗：2026-11-02 实测一次小批次共 3 页（第 4 页 + 第 28 页 auto/force），
+> 约 25 秒完成；token 未写入仓库 / 日志 / 测试。
 
 ### 字段兼容
 
@@ -260,8 +343,9 @@ export function createMineruDocProvider({
 - 没有 `content_list.json` 时退回 `full.md`（无法确定分页，整篇算作一页，页码取请求范围的
   第一页）。
 - **页码基准**：官方说明 `page_idx` 是 0 基的**原始页索引**（抽页后保留原始页索引），
-  所以页码 = `page_idx + 1`。如果某个副本/网关把切片重新从 0 编号（`page_idx` 全部落在
-  `[0, 范围长度-1]` 内、且落在绝对区间之外），就按相对页码重算（偏移 = 起始页 - 1）。
+  所以页码 = `page_idx + 1`。如果服务端把本批切片重新从 0 编号（`page_idx` 全部落在
+  `[0, 请求页数-1]` 内、且不在绝对区间内），`page_idx` 就是请求页列表的下标，页码
+  = `range[page_idx]`；离散页列表也成立（实测请求 `4,28` 返回 `page_idx` 0,1 → 4,28）。
   两种情况都有测试覆盖。
 
 ### 页数与大小限制
@@ -349,7 +433,7 @@ Node 22 没有内置的 zip 读取 API（`node:zlib` 只有 `inflateRaw`）。`m
 | `MMGREP_TYPESET_PROVIDER` | `builtin` | typeset 角色：`builtin` \| `mineru` \| `none` |
 | `MMGREP_MINERU_API_KEY` | — | MinerU token（两个角色共用；https://mineru.net/apiManage/token ） |
 | `MMGREP_MINERU_BASE_URL` | `https://mineru.net/api/v4` | 接口地址（两个角色共用） |
-| `MMGREP_MINERU_MODEL` | 空 | 留空 = 用服务端默认模型；MinerU 可选 `pipeline` / `vlm` / `MinerU-HTML` |
+| `MMGREP_MINERU_MODEL` | 空 | 留空 = 用服务端默认模型；MinerU 可选 `pipeline` / `vlm` / `MinerU-HTML`。typeset 角色会强制 `pipeline`；设为 `vlm` 时 typeset / both 会报清晰错误 |
 | `MMGREP_DOC_TIMEOUT_MS` | `180000`（server）/ `300000`（provider 默认） | 整体超时（包括上传、排队、解析、下载） |
 
 `MMGREP_DOC_PROVIDER` / `MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` /

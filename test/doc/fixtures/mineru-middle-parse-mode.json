@@ -1,0 +1,13 @@
+{
+  "extensions": {
+    "mineru": {
+      "parse_mode": "ocr"
+    }
+  },
+  "pages": [
+    {
+      "page_idx": 0,
+      "blocks": []
+    }
+  ]
+}
