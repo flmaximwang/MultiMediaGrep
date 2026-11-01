@@ -13,6 +13,10 @@ READING ORDER
    whether transcription (ASR), OCR and a native text layer are available for this file. For
    audio it also gives a health check (level, speech ratio): a recording with no effective
    speech yields an EMPTY transcript by design.
+   If the probe says "text layer: looks unreliable", the PDF's text layer is probably the
+   output of a bad OCR pass: call media_overview({ path, ocr: "force" }) to re-recognize the
+   requested pages with the OCR provider (this needs MMGREP_OCR_PROVIDER configured). Forced
+   pages are tagged "ocr" and cached separately from the default "auto".
 2. media_overview — the main read. Video: numbered storyboard grids plus a time-aligned text
    index. Audio: a timestamped transcript. Document: page thumbnails plus page text.
    The full text of the requested range is written to disk, and the result text ends with a

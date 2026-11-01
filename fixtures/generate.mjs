@@ -1499,6 +1499,114 @@ function generateSampleMixedPdf(outDir) {
 }
 
 // ---------------------------------------------------------------------------
+// sample-garbled-text.pdf  (text layer written by a bad OCR tool: 9z5.31)
+//
+// 有文字层，但字符是垃圾：逐页路由会把它当「有文字层」直接使用并标成
+// source=text（可原话引用）。probe 的启发式（U+FFFD / 私用区 / 孤立单字母 /
+// 非词 token）应当把它标成 unreliable，并提示 ocr: "force"。
+// 这里用 WinAnsi 可直接编码的「孤立单字母 + 符号噪声」复现劣质 OCR 的形态
+// （U+FFFD / 私用区无法写进 base-14 Type1 字体的 WinAnsi 编码，改由单测覆盖）。
+// ---------------------------------------------------------------------------
+
+const GARBLED_TEXT_PAGES = [
+  {
+    page: 1,
+    title: 'GARBLED TEXT LAYER FIXTURE',
+    lines: [
+      // 字母之间写双空格：pdftotext -layout 会把它们保留成独立 token，
+      // 更接近「劣质 OCR 一个字一个字往外蹦」的文字层。
+      'q  z  x  k  j  v  b  n  m  w  r  t  p  s  d  f  g  h  l  c',
+      'A  E  I  O  U  B  C  D  F  G  H  J  K  L  M  N  P  R  S  T  V  W  X  Z',
+      'a  b  c  d  e  f  g  h  i  j  k  l  m  n  o  p  q  r  s  t  u  v  w  x  y  z',
+      'Z  X  C  V  B  N  M  Q  W  E  R  T  Y  U  I  O  P  A  S  D  F  G  H  J  K',
+      '### @@ ^^^ &&& *** ((( ))) [[[ ]]]',
+      '~~~ ||| ??? !!! ... ,,, ;;; ::: ///',
+      '@@@ %%% ^^^ &&& *** +++ === --- ___',
+      '### ??? %% @@ !! ** ++ == -- __ __',
+      '<<< >>> (( )) [[ ]] {{ }} ~~ || ?? !!',
+    ],
+  },
+  {
+    page: 2,
+    title: 'PAGE TWO OF THE GARBLED FIXTURE',
+    lines: [
+      'm  n  b  v  c  x  l  k  j  h  g  f  d  s  a  p  o  i  u  y  t  r  e  w  q',
+      'K  J  H  G  F  D  S  A  P  O  I  U  Y  T  R  E  W  Q  Z  X  C  V  B  N  M',
+      '*** ??? !!! ### @@@ ^^^ &&& +++ === --- ___',
+      'x  c  v  b  n  m  z  l  k  j  h  g  f  d  s  a  q  w  e  r  t  y  u  i  o  p',
+      'B  N  M  Q  W  E  R  T  Y  U  I  O  P  A  S  D  F  G  H  J  K  L  Z  X  C',
+      '<<< >>> (( )) [[ ]] {{ }} ~~ || ?? !!',
+      'f  g  h  j  k  l  q  w  e  r  t  y  u  i  o  p  a  s  d  z  x  c  v  b  n  m',
+      'H  J  K  L  F  G  D  S  A  Q  W  E  R  T  Y  U  I  O  P  Z  X  C  V  B  N  M',
+      ';:: ::: ,,, ... ??? !!! (( )) [[ ]] {{ }}',
+    ],
+  },
+  {
+    page: 3,
+    title: 'PAGE THREE OF THE GARBLED FIXTURE',
+    lines: [
+      'v  b  n  m  q  w  e  r  t  y  u  i  o  p  a  s  d  f  g  h  j  k  l  z  x  c',
+      'V  B  N  M  Q  W  E  R  T  Y  U  I  O  P  A  S  D  F  G  H  J  K  L  Z  X  C',
+      '&&& *** ### @@@ ^^^ +++ === --- ___ ~~~ |||',
+      'z  x  c  v  b  n  m  l  k  j  h  g  f  d  s  a  p  o  i  u  y  t  r  e  w  q',
+      'X  C  V  B  N  M  Z  L  K  J  H  G  F  D  S  A  P  O  I  U  Y  T  R  E  W  Q',
+      ';;; ::: ,,, ... ??? !!! (( )) [[ ]] {{ }}',
+      'a  s  d  f  g  h  j  k  l  q  w  e  r  t  y  u  i  o  p  z  x  c  v  b  n  m',
+      'S  D  F  G  H  J  K  L  A  Q  W  E  R  T  Y  U  I  O  P  Z  X  C  V  B  N  M',
+      '### ??? %% @@ !! ** ++ == -- __ __',
+    ],
+  },
+];
+
+function generateSampleGarbledTextPdf(outDir) {
+  const pages = [];
+  const pageTruth = [];
+
+  for (const spec of GARBLED_TEXT_PAGES) {
+    const ops = [];
+    const textOps = [];
+    const lines = [];
+    const titleY = PDF_HEIGHT - PDF_MARGIN;
+    ops.push(pdfTextOp(PDF_MARGIN, titleY, spec.title, { font: 'F2', size: 16 }));
+    lines.push({ text: spec.title, xPt: PDF_MARGIN, yPt: titleY, font: 'F2', size: 16 });
+    textOps.push({ text: spec.title, xPt: PDF_MARGIN, yPt: titleY });
+
+    spec.lines.forEach((text, i) => {
+      const y = titleY - 30 - i * 20;
+      ops.push(pdfTextOp(PDF_MARGIN, y, text, { font: 'F1', size: 11 }));
+      lines.push({ text, xPt: PDF_MARGIN, yPt: y, font: 'F1', size: 11 });
+      textOps.push({ text, xPt: PDF_MARGIN, yPt: y });
+    });
+
+    pages.push({ kind: 'text', width: PDF_WIDTH, height: PDF_HEIGHT, ops, fonts: ['F1', 'F2'] });
+    pageTruth.push({ page: spec.page, lines, textOps });
+  }
+
+  const pdf = buildPDF({ pages });
+  writeFile(outDir, 'sample-garbled-text.pdf', pdf);
+
+  return {
+    id: 'sample-garbled-text-pdf',
+    kind: 'pdf',
+    file: 'sample-garbled-text.pdf',
+    generator: 'fixtures/generate.mjs',
+    pageCount: pages.length,
+    pageWidthPt: PDF_WIDTH,
+    pageHeightPt: PDF_HEIGHT,
+    marginPt: PDF_MARGIN,
+    hasTextLayer: true,
+    textLayerQuality: {
+      expected: 'looks-unreliable',
+      signals: ['isolated-single-letter-tokens', 'non-word-tokens'],
+      note:
+        'The text layer is present but every line is isolated letters and symbol noise, like a bad OCR ' +
+        'pass; media_probe must flag it as unreliable and suggest media_overview({ path, ocr: "force" }).',
+    },
+    pages: pageTruth,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // optional: macOS `say` speech sample (skipped on other platforms)
 // ---------------------------------------------------------------------------
 
@@ -1587,6 +1695,7 @@ async function main() {
   groundTruths.push(generateSampleScannedPdf(outDir));
   groundTruths.push(generateSampleImage(outDir));
   groundTruths.push(generateSampleMixedPdf(outDir));
+  groundTruths.push(generateSampleGarbledTextPdf(outDir));
   const optional = generateOptionalSpeech(outDir);
   if (optional) groundTruths.push(optional);
 

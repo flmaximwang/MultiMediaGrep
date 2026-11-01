@@ -234,9 +234,11 @@ export function createPdfSupport({ runCommand = run } = {}) {
    *   sampledPages: number[],
    *   checkedPages: number[],
    *   textPage: number|null,
+   *   sampleText: string,
    *   reason: string|null,
    * }>}
    *   reason 非 null 表示「判不出来」（本机没装抽取器），不是「没有文字层」。
+   *   sampleText 是命中页的文字（9z5.31 的可疑文字层启发式用它；没有文字时为空串）。
    */
   async function sampleHasText(filePath, { pageCount = null, signal } = {}) {
     const { textExtractor } = await resolveTools();
@@ -247,6 +249,7 @@ export function createPdfSupport({ runCommand = run } = {}) {
         sampledPages: [],
         checkedPages: [],
         textPage: null,
+        sampleText: '',
         reason: NO_TEXT_EXTRACTOR_REASON,
       };
     }
@@ -266,12 +269,14 @@ export function createPdfSupport({ runCommand = run } = {}) {
     const sampledPages = sampleTextLayerPages(total);
     const checkedPages = [];
     let textPage = null;
+    let sampleText = '';
     for (const page of sampledPages) {
       checkedPages.push(page);
       const extracted = await extractText(filePath, [page], { signal });
       const text = extracted.pages.get(page) ?? '';
       if (text.trim().length > 0) {
         textPage = page;
+        sampleText = text;
         break; // 命中就收工：不必把采样页全读完。
       }
     }
@@ -282,6 +287,7 @@ export function createPdfSupport({ runCommand = run } = {}) {
       sampledPages,
       checkedPages,
       textPage,
+      sampleText,
       reason: null,
     };
   }

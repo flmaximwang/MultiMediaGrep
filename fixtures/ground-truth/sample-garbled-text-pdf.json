@@ -1,0 +1,402 @@
+{
+  "id": "sample-garbled-text-pdf",
+  "kind": "pdf",
+  "file": "sample-garbled-text.pdf",
+  "generator": "fixtures/generate.mjs",
+  "pageCount": 3,
+  "pageWidthPt": 595,
+  "pageHeightPt": 842,
+  "marginPt": 72,
+  "hasTextLayer": true,
+  "textLayerQuality": {
+    "expected": "looks-unreliable",
+    "signals": [
+      "isolated-single-letter-tokens",
+      "non-word-tokens"
+    ],
+    "note": "The text layer is present but every line is isolated letters and symbol noise, like a bad OCR pass; media_probe must flag it as unreliable and suggest media_overview({ path, ocr: \"force\" })."
+  },
+  "pages": [
+    {
+      "page": 1,
+      "lines": [
+        {
+          "text": "GARBLED TEXT LAYER FIXTURE",
+          "xPt": 72,
+          "yPt": 770,
+          "font": "F2",
+          "size": 16
+        },
+        {
+          "text": "q  z  x  k  j  v  b  n  m  w  r  t  p  s  d  f  g  h  l  c",
+          "xPt": 72,
+          "yPt": 740,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "A  E  I  O  U  B  C  D  F  G  H  J  K  L  M  N  P  R  S  T  V  W  X  Z",
+          "xPt": 72,
+          "yPt": 720,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "a  b  c  d  e  f  g  h  i  j  k  l  m  n  o  p  q  r  s  t  u  v  w  x  y  z",
+          "xPt": 72,
+          "yPt": 700,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "Z  X  C  V  B  N  M  Q  W  E  R  T  Y  U  I  O  P  A  S  D  F  G  H  J  K",
+          "xPt": 72,
+          "yPt": 680,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "### @@ ^^^ &&& *** ((( ))) [[[ ]]]",
+          "xPt": 72,
+          "yPt": 660,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "~~~ ||| ??? !!! ... ,,, ;;; ::: ///",
+          "xPt": 72,
+          "yPt": 640,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "@@@ %%% ^^^ &&& *** +++ === --- ___",
+          "xPt": 72,
+          "yPt": 620,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "### ??? %% @@ !! ** ++ == -- __ __",
+          "xPt": 72,
+          "yPt": 600,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "<<< >>> (( )) [[ ]] {{ }} ~~ || ?? !!",
+          "xPt": 72,
+          "yPt": 580,
+          "font": "F1",
+          "size": 11
+        }
+      ],
+      "textOps": [
+        {
+          "text": "GARBLED TEXT LAYER FIXTURE",
+          "xPt": 72,
+          "yPt": 770
+        },
+        {
+          "text": "q  z  x  k  j  v  b  n  m  w  r  t  p  s  d  f  g  h  l  c",
+          "xPt": 72,
+          "yPt": 740
+        },
+        {
+          "text": "A  E  I  O  U  B  C  D  F  G  H  J  K  L  M  N  P  R  S  T  V  W  X  Z",
+          "xPt": 72,
+          "yPt": 720
+        },
+        {
+          "text": "a  b  c  d  e  f  g  h  i  j  k  l  m  n  o  p  q  r  s  t  u  v  w  x  y  z",
+          "xPt": 72,
+          "yPt": 700
+        },
+        {
+          "text": "Z  X  C  V  B  N  M  Q  W  E  R  T  Y  U  I  O  P  A  S  D  F  G  H  J  K",
+          "xPt": 72,
+          "yPt": 680
+        },
+        {
+          "text": "### @@ ^^^ &&& *** ((( ))) [[[ ]]]",
+          "xPt": 72,
+          "yPt": 660
+        },
+        {
+          "text": "~~~ ||| ??? !!! ... ,,, ;;; ::: ///",
+          "xPt": 72,
+          "yPt": 640
+        },
+        {
+          "text": "@@@ %%% ^^^ &&& *** +++ === --- ___",
+          "xPt": 72,
+          "yPt": 620
+        },
+        {
+          "text": "### ??? %% @@ !! ** ++ == -- __ __",
+          "xPt": 72,
+          "yPt": 600
+        },
+        {
+          "text": "<<< >>> (( )) [[ ]] {{ }} ~~ || ?? !!",
+          "xPt": 72,
+          "yPt": 580
+        }
+      ]
+    },
+    {
+      "page": 2,
+      "lines": [
+        {
+          "text": "PAGE TWO OF THE GARBLED FIXTURE",
+          "xPt": 72,
+          "yPt": 770,
+          "font": "F2",
+          "size": 16
+        },
+        {
+          "text": "m  n  b  v  c  x  l  k  j  h  g  f  d  s  a  p  o  i  u  y  t  r  e  w  q",
+          "xPt": 72,
+          "yPt": 740,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "K  J  H  G  F  D  S  A  P  O  I  U  Y  T  R  E  W  Q  Z  X  C  V  B  N  M",
+          "xPt": 72,
+          "yPt": 720,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "*** ??? !!! ### @@@ ^^^ &&& +++ === --- ___",
+          "xPt": 72,
+          "yPt": 700,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "x  c  v  b  n  m  z  l  k  j  h  g  f  d  s  a  q  w  e  r  t  y  u  i  o  p",
+          "xPt": 72,
+          "yPt": 680,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "B  N  M  Q  W  E  R  T  Y  U  I  O  P  A  S  D  F  G  H  J  K  L  Z  X  C",
+          "xPt": 72,
+          "yPt": 660,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "<<< >>> (( )) [[ ]] {{ }} ~~ || ?? !!",
+          "xPt": 72,
+          "yPt": 640,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "f  g  h  j  k  l  q  w  e  r  t  y  u  i  o  p  a  s  d  z  x  c  v  b  n  m",
+          "xPt": 72,
+          "yPt": 620,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "H  J  K  L  F  G  D  S  A  Q  W  E  R  T  Y  U  I  O  P  Z  X  C  V  B  N  M",
+          "xPt": 72,
+          "yPt": 600,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": ";:: ::: ,,, ... ??? !!! (( )) [[ ]] {{ }}",
+          "xPt": 72,
+          "yPt": 580,
+          "font": "F1",
+          "size": 11
+        }
+      ],
+      "textOps": [
+        {
+          "text": "PAGE TWO OF THE GARBLED FIXTURE",
+          "xPt": 72,
+          "yPt": 770
+        },
+        {
+          "text": "m  n  b  v  c  x  l  k  j  h  g  f  d  s  a  p  o  i  u  y  t  r  e  w  q",
+          "xPt": 72,
+          "yPt": 740
+        },
+        {
+          "text": "K  J  H  G  F  D  S  A  P  O  I  U  Y  T  R  E  W  Q  Z  X  C  V  B  N  M",
+          "xPt": 72,
+          "yPt": 720
+        },
+        {
+          "text": "*** ??? !!! ### @@@ ^^^ &&& +++ === --- ___",
+          "xPt": 72,
+          "yPt": 700
+        },
+        {
+          "text": "x  c  v  b  n  m  z  l  k  j  h  g  f  d  s  a  q  w  e  r  t  y  u  i  o  p",
+          "xPt": 72,
+          "yPt": 680
+        },
+        {
+          "text": "B  N  M  Q  W  E  R  T  Y  U  I  O  P  A  S  D  F  G  H  J  K  L  Z  X  C",
+          "xPt": 72,
+          "yPt": 660
+        },
+        {
+          "text": "<<< >>> (( )) [[ ]] {{ }} ~~ || ?? !!",
+          "xPt": 72,
+          "yPt": 640
+        },
+        {
+          "text": "f  g  h  j  k  l  q  w  e  r  t  y  u  i  o  p  a  s  d  z  x  c  v  b  n  m",
+          "xPt": 72,
+          "yPt": 620
+        },
+        {
+          "text": "H  J  K  L  F  G  D  S  A  Q  W  E  R  T  Y  U  I  O  P  Z  X  C  V  B  N  M",
+          "xPt": 72,
+          "yPt": 600
+        },
+        {
+          "text": ";:: ::: ,,, ... ??? !!! (( )) [[ ]] {{ }}",
+          "xPt": 72,
+          "yPt": 580
+        }
+      ]
+    },
+    {
+      "page": 3,
+      "lines": [
+        {
+          "text": "PAGE THREE OF THE GARBLED FIXTURE",
+          "xPt": 72,
+          "yPt": 770,
+          "font": "F2",
+          "size": 16
+        },
+        {
+          "text": "v  b  n  m  q  w  e  r  t  y  u  i  o  p  a  s  d  f  g  h  j  k  l  z  x  c",
+          "xPt": 72,
+          "yPt": 740,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "V  B  N  M  Q  W  E  R  T  Y  U  I  O  P  A  S  D  F  G  H  J  K  L  Z  X  C",
+          "xPt": 72,
+          "yPt": 720,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "&&& *** ### @@@ ^^^ +++ === --- ___ ~~~ |||",
+          "xPt": 72,
+          "yPt": 700,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "z  x  c  v  b  n  m  l  k  j  h  g  f  d  s  a  p  o  i  u  y  t  r  e  w  q",
+          "xPt": 72,
+          "yPt": 680,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "X  C  V  B  N  M  Z  L  K  J  H  G  F  D  S  A  P  O  I  U  Y  T  R  E  W  Q",
+          "xPt": 72,
+          "yPt": 660,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": ";;; ::: ,,, ... ??? !!! (( )) [[ ]] {{ }}",
+          "xPt": 72,
+          "yPt": 640,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "a  s  d  f  g  h  j  k  l  q  w  e  r  t  y  u  i  o  p  z  x  c  v  b  n  m",
+          "xPt": 72,
+          "yPt": 620,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "S  D  F  G  H  J  K  L  A  Q  W  E  R  T  Y  U  I  O  P  Z  X  C  V  B  N  M",
+          "xPt": 72,
+          "yPt": 600,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "### ??? %% @@ !! ** ++ == -- __ __",
+          "xPt": 72,
+          "yPt": 580,
+          "font": "F1",
+          "size": 11
+        }
+      ],
+      "textOps": [
+        {
+          "text": "PAGE THREE OF THE GARBLED FIXTURE",
+          "xPt": 72,
+          "yPt": 770
+        },
+        {
+          "text": "v  b  n  m  q  w  e  r  t  y  u  i  o  p  a  s  d  f  g  h  j  k  l  z  x  c",
+          "xPt": 72,
+          "yPt": 740
+        },
+        {
+          "text": "V  B  N  M  Q  W  E  R  T  Y  U  I  O  P  A  S  D  F  G  H  J  K  L  Z  X  C",
+          "xPt": 72,
+          "yPt": 720
+        },
+        {
+          "text": "&&& *** ### @@@ ^^^ +++ === --- ___ ~~~ |||",
+          "xPt": 72,
+          "yPt": 700
+        },
+        {
+          "text": "z  x  c  v  b  n  m  l  k  j  h  g  f  d  s  a  p  o  i  u  y  t  r  e  w  q",
+          "xPt": 72,
+          "yPt": 680
+        },
+        {
+          "text": "X  C  V  B  N  M  Z  L  K  J  H  G  F  D  S  A  P  O  I  U  Y  T  R  E  W  Q",
+          "xPt": 72,
+          "yPt": 660
+        },
+        {
+          "text": ";;; ::: ,,, ... ??? !!! (( )) [[ ]] {{ }}",
+          "xPt": 72,
+          "yPt": 640
+        },
+        {
+          "text": "a  s  d  f  g  h  j  k  l  q  w  e  r  t  y  u  i  o  p  z  x  c  v  b  n  m",
+          "xPt": 72,
+          "yPt": 620
+        },
+        {
+          "text": "S  D  F  G  H  J  K  L  A  Q  W  E  R  T  Y  U  I  O  P  Z  X  C  V  B  N  M",
+          "xPt": 72,
+          "yPt": 600
+        },
+        {
+          "text": "### ??? %% @@ !! ** ++ == -- __ __",
+          "xPt": 72,
+          "yPt": 580
+        }
+      ]
+    }
+  ]
+}

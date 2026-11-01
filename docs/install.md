@@ -323,7 +323,8 @@ MMGREP_OPENAI_COMPATIBLE_MODEL=whisper-1
 
 0.2.0 起，文档 provider 拆成两个角色，分别配置：
 
-- **OCR**（`MMGREP_OCR_PROVIDER`，默认 `none`）：只处理**没有文字层**的扫描页 / 图片。
+- **OCR**（`MMGREP_OCR_PROVIDER`，默认 `none`）：只处理**没有文字层**的扫描页 / 图片；
+  以及工具参数 `ocr: "force"` 明确要求重新识别的页（见下面的「坏文字层」）。
 - **typeset**（`MMGREP_TYPESET_PROVIDER`，默认 `builtin`）：只处理**有文字层**的页，
   恢复阅读顺序与结构，**不会重新识别字符**。`builtin` 是本地实现，不联网；想让 MinerU
   也参与排版结构时再设成 `mineru`。
@@ -361,6 +362,11 @@ MMGREP_TYPESET_PROVIDER=mineru
 - 文档 provider 失败时，`media_overview` **不报错**——有文字层的页退回原生文字层，
   没有文字层的页降级成「只有页面图 + 一条警告」；但 `media_locate`（必须要文字）会报
   `PROVIDER_FAILED` / `PROVIDER_NOT_CONFIGURED`。
+- **坏文字层**：有些 PDF 的文字层是早先劣质 OCR 工具写进去的。`media_probe` 会报
+  `text layer: looks unreliable (...)`；这时用 `media_overview({ path, pages, ocr: "force" })`
+  或 `media_locate({ path, query, ocr: "force" })` 让 OCR 角色重新识别（有文字层也重识别，
+  结果标 `(ocr)`、单独缓存）。没有配置 OCR provider 时 force 会直接报
+  `PROVIDER_NOT_CONFIGURED`，不会静默退回坏文字层。
 - **旧变量已删除**：`MMGREP_DOC_PROVIDER` / `MMGREP_DOC_API_KEY` /
   `MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL` 不再生效；启动时会 warn 并指出替代变量。
 
@@ -456,7 +462,7 @@ rm -rf ~/.cache/multimediagrep/ab/abcdef.../
 | `TOOL_NOT_FOUND: cannot read PDF metadata: no PDF tool is installed (pdfinfo, mutool, or qpdf).` | 同上（缺的是元信息工具） | 同上 |
 | probe 说 `asr: unavailable — No ASR provider is configured (set MMGREP_ASR_PROVIDER and the matching provider key: MMGREP_ELEVENLABS_API_KEY or MMGREP_OPENAI_COMPATIBLE_API_KEY).` | 没配 ASR | 配 `MMGREP_ASR_PROVIDER` + 对应 provider 的 key（§3.1 / §3.2），或传一个本地字幕文件 |
 | probe 说 `ocr: unavailable — No OCR provider is configured (MMGREP_OCR_PROVIDER is "none"). Pages without a text layer are returned as page images only.` | 没配 OCR | 配 `MMGREP_OCR_PROVIDER=mineru` + `MMGREP_MINERU_API_KEY`（§3.3）；扫描件没 OCR 就只能看页图 |
-| `PROVIDER_NOT_CONFIGURED`（文档） | 选了 provider 但缺 key | `MMGREP_MINERU_API_KEY` 填上，或把对应角色设成 `none`（`MMGREP_OCR_PROVIDER=none` / `MMGREP_TYPESET_PROVIDER=none`）退回「只有页图」/「原生文字层」 |
+| `PROVIDER_NOT_CONFIGURED`（文档，含 `ocr: "force"`） | 选了 provider 但缺 key；或 force 时根本没配 OCR provider | `MMGREP_MINERU_API_KEY` 填上，或把对应角色设成 `none`（`MMGREP_OCR_PROVIDER=none` / `MMGREP_TYPESET_PROVIDER=none`）退回「只有页图」/「原生文字层」 |
 | `PROVIDER_FAILED: … HTTP 401/403 …` | key 不对 / token 过期 | 换 key；MinerU 常见业务码 `A0202`（token 错）、`A0211`（token 过期） |
 | `PROVIDER_FAILED`，但我明明用的是自己的服务 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_MODEL` 没改 | 这两个的默认值是 OpenAI 官方的 `https://api.openai.com/v1` + `whisper-1`；用自己的服务时显式写上（见 §3.2） |
 | `PROVIDER_FAILED: … HTTP 404 …` | 基址写错 | 检查 `MMGREP_ELEVENLABS_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_MINERU_BASE_URL` |

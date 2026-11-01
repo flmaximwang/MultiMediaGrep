@@ -102,6 +102,7 @@ flowchart TD
 | `end`（秒） | ✅ | ✅ | ❌ | `end is not applicable to document media. Use "pages" instead (e.g. pages: "3-10,15").` |
 | `segment`（秒） | ✅ | ✅ | ❌ | `segment is not applicable to document media.` |
 | `pages` | ❌ | ❌ | ✅ | `pages is not applicable to video media. Use "start" and "end" (seconds) instead.` |
+| `ocr` | ❌ | ❌ | ✅ | `ocr is not applicable to video media. Only documents have a page text layer or page images to OCR; video and audio use subtitles/transcript instead.` |
 | `query` | ✅ | ✅ | ✅ | — |
 | `max` | ✅ | ✅ | ✅ | — |
 | `includeFrame` | ✅ | ❌ | ✅ | `includeFrame is not applicable to audio media. There are no frames to show.` |
@@ -277,7 +278,7 @@ progress token 形如 `media_overview 3/5 · scanning 0-300s`，让宿主 UI 能
 | **快速指纹索引** | 另有一份 `fingerprint-index.json`：`sha256(绝对路径 + ':' + size + ':' + mtimeMs)` → 内容 sha256。命中指纹就跳过全文件哈希；不命中就老老实实算内容 hash 并写回索引 |
 | 缓存目录 | `MMGREP_CACHE_DIR`（默认 `~/.cache/multimediagrep`），**绝不写到用户文件旁边** |
 | 容量 | `MMGREP_CACHE_MAX_BYTES`（默认 10 GiB），超出按 LRU 淘汰整条目 |
-| provider 逐页结果缓存 | 文档 provider 的结果按页写入同一缓存树：namespace = `sha256:<源内容 hash>:doc-provider:<role>:<hash(源 hash + provider id + model + ocrMode + role)>`，每页存契约 v2 的 page 对象。同一范围再次调用（overview / locate 共享）不再请求 provider，只把缺失页发出去；`ocrMode=force` 单独成键，不覆盖 auto / 文字层结果 |
+| provider 逐页结果缓存 | 文档 provider 的结果按页写入同一缓存树：namespace = `sha256:<源内容 hash>:doc-provider:<role>:<hash(源 hash + provider id + model + ocrMode + role)>`，每页存契约 v2 的 page 对象。同一范围再次调用（overview / locate 共享）不再请求 provider，只把缺失页发出去；工具参数 `ocr: "force"`（= 后端 `ocrMode=force`）单独成键，不覆盖 auto / 文字层结果 |
 | 落盘产物 | `content.md` + `segments.jsonl` + `manifest.json`（三个必备）+ `document.json`（可选，cangjie `SourceDocument Contract v1`） |
 
 细节见 §9。
@@ -341,6 +342,11 @@ nothing. Then pick the right next tool:
 - document       -> media_overview to see page thumbnails and per-page text
 - a specific moment or page -> media_zoom for a close-up
 - "where was X said / on which page" -> media_locate for a timestamp or a page number
+
+For documents it also checks whether the text layer looks unreliable — U+FFFD replacement
+characters, private-use characters, isolated single letters, symbol noise — and, when it does,
+points at media_overview({ path, ocr: "force" }) to re-recognize the pages.
+(文档文字层看起来不可靠时会提示，可用 ocr: "force" 强制重新识别)
 
 For audio it also reports a quick health check — average level, speech ratio and silence ratio
 — so you know whether the recording actually contains audible speech before you spend an ASR
@@ -409,6 +415,9 @@ path, and it only prepares images and text for your own model to look at.
 | `capabilities.textLayer.sampledPages` | integer[] | 计划采样的页码，按采样顺序 | 页 |
 | `capabilities.textLayer.checkedPages` | integer[] | 实际读过的采样页（提前返回时比 `sampledPages` 短） | 页 |
 | `capabilities.textLayer.textPage` | integer \| null | 第一个读到文字的采样页（`null` = 全部采样页都空，或根本没查） | 页 |
+| `capabilities.textLayer.reliable` | boolean \| null | 采样页文本看起来是否可信（9z5.31 启发式：U+FFFD / 私用区 / 孤立单字母 / 非词 token）。`null` = 没样本可判（没有文字层、非 PDF，或本机没装抽取器） | — |
+| `capabilities.textLayer.reasons` | string[] | 判定为不可靠的原因（人话，逐条）；可靠时为空数组 | — |
+| `capabilities.textLayer.warning` | string \| null | 不可靠时的完整提示：`looks unreliable (<原因>) — consider media_overview({ path, ocr: "force" })`；可靠时为 `null` | — |
 | `recommended.mode` | `"single"` \| `"sequence"` | 短素材一次读完 / 长素材分段读 | — |
 | `recommended.segmentSec` | integer | 分段读时的建议窗口长度 | s |
 | `recommended.overviewImages` | integer | 建议的 overview 图片数 | 张 |
@@ -456,6 +465,23 @@ path, and it only prepares images and text for your own model to look at.
 
 **逐页**结论不在这个探针字段上，而在抽取路径上：`media_overview` / `media_locate` 逐页拿文字层（有文字层的页可以按原样引用，没有的才需要 OCR）。
 
+**可疑文字层（9z5.31，最小启发式）：**「有文字层」不等于「文字是对的」——有些 PDF 的文字层是早先劣质 OCR 工具写进去的。probe 会对采样到的页文本（第一个命中的采样页）做一次保守检查，命中任一条件就报不可靠：
+
+| 信号 | 阈值 | 为什么 |
+|---|---|---|
+| U+FFFD 替换字符 | ≥ 3 个，或占非空白字符 ≥ 0.2% | 字体 / 编码映射坏掉的典型症状 |
+| 私用区字符（U+E000–U+F8FF） | ≥ 5 个，或占非空白字符 ≥ 0.5% | ToUnicode 映射缺失时的常见产物（正常 PDF 偶有零星图标字符，故不按 1 个就报） |
+| 孤立单字母 token | ≥ 25% 的「有字母或数字的 token」 | 劣质 OCR「一个字一个字往外蹦」；正常论文约 2%–4% |
+| 非词 token（不含字母 / 数字） | ≥ 30% 的 token | 符号噪声；正常论文约 0%–2% |
+
+样本少于 20 个 token 时不按比例判定（避免一两个字符就误报）。判定结果写入 `capabilities.textLayer.reliable / reasons / warning`，文本输出把 `text layer:` 行换成：
+
+```
+text layer: looks unreliable (96% of word tokens are isolated single letters; 34% of tokens contain no letter or digit) — consider media_overview({ path, ocr: "force" })
+```
+
+这只是**提示**，不是断言：agent 看到后应改用 `media_overview({ path, ocr: "force" })`（或对指定页 force），让 OCR provider 重新识别；需要 OCR provider 已配置。
+
 文本输出里的 `textLayer="..."` 属性随探针文案一并调整（见 9z5.21）：`null` 要渲染成 `unknown`，不能渲染成 `no` —— 否则等于在说「这份 PDF 没有文字层」。
 
 ### 4.4 文本输出形态
@@ -495,7 +521,14 @@ transcript source: text
 One overview shows page thumbnails and page text. Use media_zoom({ path, page }) to read a page closely.
 ```
 
-- `text layer:` 与 `textLayer` 属性都是三态：`yes` / `no` / `unknown`（本机没有文字抽取器，**判不出来**，不是「没有文字层」）。
+文字层看起来是坏的时候（9z5.31），`text layer:` 行换成带下一步动作的形式：
+
+```
+text layer: looks unreliable (96% of word tokens are isolated single letters; 34% of tokens contain no letter or digit) — consider media_overview({ path, ocr: "force" })
+```
+
+- `text layer:` 与 `textLayer` 属性都是三态：`yes` / `no` / `unknown`（本机没有文字抽取器，**判不出来**，不是「没有文字层」）；`textLayer` 属性仍按「有没有文字层」给 `yes`，可疑结论只在分行里表达。
+- `capabilities.textLayer.reliable = false` 时 agent 应改用 `ocr: "force"` 重新识别（见 §5.2 / §7.2）；可靠时 `reliable = true`、`warning = null`。
 - `ocr provider:` / `typeset provider:` 分别说明两个角色；`none` 时附原因。
 - `transcript source:` 是实际会走的来源：`text`（原生文字层 / 纯文本）、`ocr`（只有 OCR）、`mixed`（文字层与 OCR 都可用，逐页路由可能混合）、`none`。
 - 旧输出的 `ocr: unavailable` 与 `transcript source: ocr` 不会再同时出现：前者描述角色可用性，后者描述实际文字来源，二者不是一回事。
@@ -524,6 +557,12 @@ What you get depends on the media:
              time-aligned text index of the cells
 - audio    : a timestamped transcript, segment by segment
 - document : a grid of page thumbnails plus page text, when a document parser is configured
+
+For DOCUMENTS, ocr: "auto" (default) uses the PDF text layer where one exists and calls the OCR
+provider only for pages without one; ocr: "force" re-recognizes every requested page with the
+OCR provider, even pages that already have a text layer, and tags them (ocr). Use force when
+media_probe says "text layer: looks unreliable" or when the extracted text is visibly garbled.
+Forced results are cached separately from auto. (文档：ocr: "force" = 强制重新 OCR / 重新识别文字层)
 
 Pass images: 0 for a text-only, zero-pixel overview: no grid is rendered and no frame is
 decoded (a video costs no ffmpeg work at all), so you get only the transcript — or the page
@@ -578,6 +617,7 @@ through the rest.
 | `end` | number | ❌ | 媒体末尾 | video, audio | 终点（秒，浮点） |
 | `segment` | integer | ❌ | `300` | video, audio | 只给 `start` 不给 `end` 时的窗口长度（秒，30–3600） |
 | `pages` | string | ❌ | 全文 | document | 页码范围，如 `"3-10,15"` |
+| `ocr` | `"auto"` \| `"force"` | ❌ | `"auto"` | document | 页文字的获取方式。`"auto"`：有文字层就用文字层，只有没文字层的页走 OCR；`"force"`：请求的页**无论有没有文字层**都交给 OCR provider 重新识别，结果 `textOrigin = "ocr"`、页标 `(ocr)`，并单独缓存（不覆盖 auto 结果）。用在 probe 说 `text layer: looks unreliable` 时。需要已配置 OCR provider（`MMGREP_OCR_PROVIDER`），否则报 `PROVIDER_NOT_CONFIGURED`；video / audio 传它报 `INVALID_ARGUMENT` |
 | `cells` | integer | ❌ | video `9` / document `6` | video, document | 每张拼图的格数（video=镜头格，document=页缩略图），1–16 |
 | `images` | integer | ❌ | `2` | video, document, audio（仅 `0`） | 返回几张拼图，`0`–`4`；`0` = 零像素纯文本模式（不出图，只回文字，`budget` 全零） |
 | `maxEdge` | integer | ❌ | `1280` | video, document | 单张图最长边（px），上限 1600 |
@@ -721,6 +761,17 @@ note: some page text comes from OCR — names, numbers and jargon may be misread
 full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
 
+文字层不可靠、agent 用 `ocr: "force"` 重新识别后（请求页全部是 `(ocr)`；header 的 `source="ocr"`，`ocrProvider` 指向实际做识别的 provider）：
+
+```
+<overview path="/abs/a.pdf" type="document" pages="1-12" source="ocr" ocrProvider="mineru" />
+[page 1  ] (ocr)  「……」
+[page 2  ] (ocr)  「……」
+note: some page text comes from OCR — names, numbers and jargon may be misread; verify them
+      against the page image via media_zoom({ path, page }).
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
+```
+
 OCR 的核对 note **只在真的有 OCR 页时出现**，不再无条件写给所有文档。请求范围整体放得下时是 tier 1，允许宣称完整（且只有此时可以）：
 
 ```
@@ -741,6 +792,8 @@ full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, m
 | audio，有字幕但无 ASR | 用字幕，`transcript.source = "subtitle"` | 画面 + 字幕文字（同上，核对专名与数字） |
 | document，**有文字层** | 不再把所有页标成 `ocr`：文字层页 `source = "text"`、`origin = "textlayer"`（字符精确，可引用）；`transcript.source = "text"`（有 OCR 角色参与时可能是 `mixed`） | 页面缩略图 + 文字层正文；无需为核对字符去 zoom |
 | document，图片封面 + 数字正文 | 封面无文字（没配 OCR 时 `source = "none"`，配置 OCR 后为 `ocr`）；正文 `source = "text"`；整份 `transcript.source = "mixed"` | 每页行首标签 `(text)` / `(ocr)` / 不出现（无文字页）；按标签决定是否核对 |
+| document，文字层像劣质 OCR 且**没有** OCR provider | probe 报 `text layer: looks unreliable (...)`；`media_overview({ ocr: "force" })` 报 `PROVIDER_NOT_CONFIGURED`（不静默退回坏文字层） | probe 的提示 + 错误 hint；可以先看页图，或配置 OCR provider 后重试 |
+| document，文字层像劣质 OCR 且**配置了** OCR provider | `ocr: "force"` 重新识别请求页，逐页 `(ocr)`；auto 仍按原文字层（结果分开缓存） | 重新识别后的页文字 + 页图；专名数字仍建议核对 |
 | document，`MMGREP_OCR_PROVIDER=none` 且无文字层 | 照常出页缩略图宫格；`pages[].text` 为空；`transcript.source = "none"` | 只有页面缩略图 |
 | document，扫描件且 OCR 未配置 | 同上，且 `capabilities.ocr.available = false` | 只有页面缩略图；需要读字就 `media_zoom` 单页放大 |
 
@@ -753,6 +806,8 @@ full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, m
 ### 5.6 错误行为
 
 - `path` 校验见 §2.4；范围校验见 §2.4。
+- `ocr` 用在 video / audio 上 → `INVALID_ARGUMENT`（见 §2.2）。
+- `ocr: "force"` 但没有可用的 OCR provider → `PROVIDER_NOT_CONFIGURED`，hint 指向 `MMGREP_OCR_PROVIDER`（HTTP 模式可用 `x-mmgrep-ocr-provider` 头）。这是**唯一**一种「文档 overview 直接失败」的 provider 情形：force 是明确指令，不能静默退回坏文字层。
 - `cells` / `images` 越界 → `BUDGET_EXCEEDED`（见 §10）。
 - 需要转写但完全无来源，且调用方要求了转写 → 不报错（出画面 + 说明）。只有 `media_locate` 这种「非要有转写不可」的工具才报 `NO_TRANSCRIPT`。
 
@@ -864,6 +919,12 @@ query appears on that page (hits), and a short snippet around the first hit — 
 whole page. Pages that matched but did not fit are listed as "N more pages match: ...".
 Read a full page with media_overview({ path, pages }).
 
+For DOCUMENTS, ocr: "auto" (default) searches the PDF text layer where one exists and OCRs only
+pages without one; ocr: "force" re-recognizes every requested page with the OCR provider first,
+even pages that already have a text layer, and tags those matches (ocr). Use force when
+media_probe says "text layer: looks unreliable". Forced results are cached separately from auto.
+(文档：ocr: "force" = 强制重新 OCR / 重新识别文字层)
+
 Text only by default — no image, no pixels spent. Add includeFrame: true to also get the
 picture at the best match (one image, roughly 1,900 vision tokens).
 
@@ -888,6 +949,7 @@ speaker's exact words.
 | `start` / `end` | number | ❌ | 全媒体 | video, audio | 只在这个时间窗里找 |
 | `segment` | integer | ❌ | `300` | video, audio | 只给 `start` 不给 `end` 时的窗口长度 |
 | `pages` | string | ❌ | 全文 | document | 只在这些页里找 |
+| `ocr` | `"auto"` \| `"force"` | ❌ | `"auto"` | document | 同 `media_overview`：`"force"` 先让 OCR provider 重新识别请求页（有文字层也重识别），再在这些文字里定位；命中行标 `(ocr)`。需要已配置 OCR provider，否则报 `PROVIDER_NOT_CONFIGURED`；video / audio 传它报 `INVALID_ARGUMENT` |
 | `includeFrame` | boolean | ❌ | `false` | video, document | 是否附带最佳匹配处的画面 |
 
 ### 7.3 返回结构
@@ -934,6 +996,7 @@ speaker's exact words.
 | 排序 | **精确命中优先** → `hits` 降序 → 页码升序（token 覆盖会把只命中一个常见词的页也算进来，精确命中必须压过它们） |
 | 整页正文 | **不再返回**。要整页用 `media_overview({ path, pages })` 或缓存里的 `content.md` |
 | 输出预算 | 文本输出约 3 KB 上限：超了就少展示几页，其余折叠成一行 `N more pages match: 3, 9, 14`（页码升序）。被折叠的页**不算丢失**，文本里写明了页码 |
+| `ocr` | `"force"` 时先重新识别请求页再定位；命中行的 `source` / `origin` / `textOrigin` 都是 `ocr`，文本行写 `(ocr)`。force 结果走独立缓存，和 auto / 文字层结果互不覆盖 |
 | 候选窗口 | 一次 locate 最多向后端要 20 页候选（后端上限）：`N more pages match` 列的是**已知命中但没展示**的页；想看更后面的页，用 `pages` 缩小范围再查 |
 
 > 视频 / 录音的 `score`（0–1）与文档的 `hits` 是两种粒度下的两种指标：前者比「像不像」，
@@ -965,6 +1028,7 @@ Feed any of these pages to media_zoom({ path, page }) — no need to re-read the
 ### 7.5 错误行为
 
 - 无 `query` → `INVALID_ARGUMENT: query is required.`
+- `ocr: "force"` 但没有可用的 OCR provider → `PROVIDER_NOT_CONFIGURED`（与 overview 同一套 hint）；video / audio 传 `ocr` → `INVALID_ARGUMENT`。
 - **无任何转写来源** → `NO_TRANSCRIPT`，文案：
   `no transcript available for this file and no ASR provider is configured (MMGREP_ASR_PROVIDER="none"). Pass subtitle with a local .srt/.vtt file, a track index, or a language code, or configure an ASR provider. For visuals only, use media_overview instead.`
 - `includeFrame: true` 但媒体是 audio → `includeFrame is not applicable to audio media. There are no frames to show.`
@@ -1507,6 +1571,10 @@ READING ORDER
    whether transcription (ASR), OCR and a native text layer are available for this file. For
    audio it also gives a health check (level, speech ratio): a recording with no effective
    speech yields an EMPTY transcript by design.
+   If the probe says "text layer: looks unreliable", the PDF's text layer is probably the
+   output of a bad OCR pass: call media_overview({ path, ocr: "force" }) to re-recognize the
+   requested pages with the OCR provider (this needs MMGREP_OCR_PROVIDER configured). Forced
+   pages are tagged "ocr" and cached separately from the default "auto".
 2. media_overview — the main read. Video: numbered storyboard grids plus a time-aligned text
    index. Audio: a timestamped transcript. Document: page thumbnails plus page text.
    The full text of the requested range is written to disk, and the result text ends with a
@@ -1605,7 +1673,9 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 ### 12.3 文档 provider：OCR 角色
 
 0.2.0 起文档 provider 拆成 **ocr** / **typeset** 两个角色（契约 v2）。OCR 角色只处理
-**没有文字层**的页（以及 `ocrMode=force` 的页）。
+**没有文字层**的页（以及 `ocrMode=force` 的页）。工具参数 `ocr: "force"`（`media_overview` /
+`media_locate`）由工具层转成后端的 `ocrMode=force`：请求页无论有没有文字层都交给这个角色，
+结果 `textOrigin = "ocr"`、页标 `(ocr)`，并按独立缓存键保存。
 
 | 变量 | 类型 | 默认值 | 作用 | 没配 / 配错时的行为 |
 |---|---|---|---|---|
@@ -1649,6 +1719,9 @@ provider 无法保证原字符时必须返回 `textOrigin = "ocr"` / `"unknown"`
 > 小数、带单位、非数字）记 warning 并回落到环境变量 / 默认值，**不会让请求失败**；空头等于没带。
 > stdio 传输没有请求头，仍然只读环境变量；也**没有**按调用的工具参数——agent 不能自己调大。
 > 头值不进日志（日志只出现头名），也不进 `requestOverrides`（那里只记录头名）。
+
+> **文档 provider 逐页缓存键**（含 `ocrMode`；工具参数 `ocr: "force"` 单独成键、不覆盖 auto）
+> 见 §2.7 与 §9.0。`ocr` 是工具参数，不是环境变量。
 
 > **MCP 的 stdout 是协议通道**：日志一律走 stderr，`LOG_LEVEL` 控制不了这一点。
 
