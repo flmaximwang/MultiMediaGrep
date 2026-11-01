@@ -1,12 +1,16 @@
 // src/media/transcript.js —— 字幕来源解析（契约 §8.5，视频与录音共用）
 //
-// 判定顺序（写死）：
-//   1. transcriptFile（显式给出，读不了就报错，不静默回退）
-//   2. 容器内嵌的字幕轨（第一条文本型轨，语言优先级 zh-Hans → zh-CN → zh → en-US → en → 轨序）
-//   3. 同目录同名文件（a.mp4 → a.srt / a.vtt / a.ass / a.ssa，再 base.<lang>.<ext>）
-// 三步都没有 → 返回 null（ASR 兜底由后端决定；video_subtitles 直接 NO_TRANSCRIPT）。
+// 显式选择（subtitle，一个参数三种形态）：
+//   绝对路径 → 本地字幕文件；非负整数 → ffprobe 流 index；其他字符串 → 语言码（tags.language）。
+//   显式选择是排他的：只按它来，不可用就抛 INVALID_ARGUMENT，绝不静默回退。
+//
+// 未显式选择时的判定顺序（写死）：
+//   1. 容器内嵌的字幕轨（第一条文本型轨，语言优先级 zh-Hans → zh-CN → zh → en-US → en → 轨序）
+//   2. 同目录同名文件（a.mp4 → a.srt / a.vtt / a.ass / a.ssa，再 base.<lang>.<ext>）
+// 两步都没有 → 返回 null（ASR 兜底由后端决定；video_subtitles 直接 NO_TRANSCRIPT）。
 
-import { readdir } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { access, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 
 import { run } from './ffmpeg.js';
@@ -19,6 +23,22 @@ const BITMAP_SUBTITLE_CODECS = new Set(['hdmv_pgs_subtitle', 'dvd_subtitle', 'dv
 /** 语言优先级（契约 §8.5），未列出的语言排在后面、按字典序 */
 export const LANGUAGE_PRIORITY = Object.freeze(['zh-Hans', 'zh-CN', 'zh', 'en-US', 'en']);
 
+/** 语言码的常见别名（ISO 639-1 ↔ ISO 639-2），值统一到主语言子标签 */
+const LANGUAGE_ALIASES = new Map([
+  ['zh', 'zh'], ['zho', 'zh'], ['chi', 'zh'],
+  ['en', 'en'], ['eng', 'en'],
+  ['ja', 'ja'], ['jpn', 'ja'],
+  ['ko', 'ko'], ['kor', 'ko'],
+  ['fr', 'fr'], ['fre', 'fr'], ['fra', 'fr'],
+  ['de', 'de'], ['ger', 'de'], ['deu', 'de'],
+  ['es', 'es'], ['spa', 'es'],
+  ['ru', 'ru'], ['rus', 'ru'],
+  ['it', 'it'], ['ita', 'it'],
+  ['pt', 'pt'], ['por', 'pt'],
+  ['ar', 'ar'], ['ara', 'ar'],
+  ['hi', 'hi'], ['hin', 'hi'],
+]);
+
 function languageRank(language) {
   if (!language) return LANGUAGE_PRIORITY.length + 1;
   const norm = String(language).trim().toLowerCase().replace('_', '-');
@@ -27,6 +47,20 @@ function languageRank(language) {
   // zh-Hant / zh-TW 之类的中文变体仍然优先于其它外语
   if (norm.startsWith('zh')) return LANGUAGE_PRIORITY.length;
   return LANGUAGE_PRIORITY.length + 1;
+}
+
+/** 语言标签归一：小写、下划线换连字符，只保留主语言子标签并套用别名表 */
+function languageKey(language) {
+  const norm = String(language ?? '').trim().toLowerCase().replace(/_/g, '-');
+  if (!norm) return '';
+  const primary = norm.split('-')[0];
+  return LANGUAGE_ALIASES.get(primary) ?? primary;
+}
+
+/** 显式语言码是否命中某条轨的 tags.language（大小写不敏感；zh ≈ chi/zho、en ≈ eng） */
+export function subtitleLanguageMatches(streamLanguage, language) {
+  const wanted = languageKey(language);
+  return wanted !== '' && wanted === languageKey(streamLanguage);
 }
 
 export function subtitleExtension(filePath) {
@@ -71,6 +105,241 @@ export function bitmapSkippedWarnings(bitmapSkipped = []) {
   return bitmapSkipped.map(
     ({ index, codec }) => `embedded-subtitle-bitmap-skipped (${codec}, track ${index ?? '?'})`,
   );
+}
+
+function trackIndex(stream, fallback = '?') {
+  return Number.isInteger(stream?.index) ? stream.index : fallback;
+}
+
+function subtitleTrackSummary(streams = []) {
+  const tracks = (streams ?? []).filter((stream) => stream?.codec_type === 'subtitle');
+  if (tracks.length === 0) return 'no subtitle tracks';
+  return `subtitle tracks: ${tracks
+    .map((stream) => `${stream?.tags?.language ?? 'unknown'} (track ${trackIndex(stream)})`)
+    .join(', ')}`;
+}
+
+/**
+ * 判定 subtitle 的形态（契约 §8.5）：文件路径 / 轨道 index / 语言码。
+ * 只做字符串形态判断，不碰文件系统。
+ *
+ * @returns {{kind:'file', path:string} | {kind:'index', value:number} | {kind:'language', value:string}}
+ */
+export function classifySubtitleSelection(value) {
+  if (typeof value === 'number') {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new ToolError(
+        'INVALID_ARGUMENT',
+        `subtitle track index must be a non-negative integer (got ${JSON.stringify(value)}).`,
+      );
+    }
+    return { kind: 'index', value };
+  }
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new ToolError(
+      'INVALID_ARGUMENT',
+      'subtitle must be a local subtitle file path, a non-negative track index, or a language code '
+        + `(got ${JSON.stringify(value ?? null)}).`,
+    );
+  }
+  const raw = value.trim();
+  // 绝对路径，或任何带路径分隔符 / 字幕扩展名的字符串，都按「文件」解释
+  if (path.isAbsolute(raw) || raw.includes('/') || raw.includes('\\') || subtitleExtension(raw)) {
+    return { kind: 'file', path: raw };
+  }
+  if (/^[+-]?\d+$/.test(raw)) {
+    const index = Number(raw);
+    if (!Number.isInteger(index) || index < 0) {
+      throw new ToolError(
+        'INVALID_ARGUMENT',
+        `subtitle track index must be a non-negative integer (got "${raw}").`,
+      );
+    }
+    return { kind: 'index', value: index };
+  }
+  return { kind: 'language', value: raw };
+}
+
+/** 位图字幕轨不能读成文字：错误文案沿用 §8.5 的 bitmap warning 形态 */
+function assertTextSubtitleStream(stream) {
+  const codec = String(stream?.codec_name ?? '').toLowerCase();
+  if (!BITMAP_SUBTITLE_CODECS.has(codec)) return;
+  throw new ToolError(
+    'INVALID_ARGUMENT',
+    `subtitle track ${trackIndex(stream)} is a bitmap subtitle track and cannot be read as text: `
+      + `embedded-subtitle-bitmap-skipped (${codec || 'unknown'}, track ${trackIndex(stream)}).`,
+    'Pick a text subtitle track, a local subtitle file, or omit subtitle to use automatic selection.',
+  );
+}
+
+/**
+ * 解析显式 subtitle 选中的轨（文件只返回路径，不读内容）。
+ * 轨道 index / 语言码不可用 → INVALID_ARGUMENT，绝不回退。
+ *
+ * @returns {{kind:'file', path:string, stream:null, language:null, warnings:string[]}
+ *   | {kind:'embedded', stream:object, language:string|null, warnings:string[]}}
+ */
+export function inspectSubtitleSelection({ subtitle, streams = [] } = {}) {
+  const selection = classifySubtitleSelection(subtitle);
+  const allStreams = streams ?? [];
+
+  if (selection.kind === 'file') {
+    return { kind: 'file', path: selection.path, stream: null, language: null, warnings: [] };
+  }
+
+  if (selection.kind === 'index') {
+    const stream = allStreams.find((item) => item?.index === selection.value);
+    if (!stream) {
+      throw new ToolError(
+        'INVALID_ARGUMENT',
+        `subtitle track index ${selection.value} does not exist in this file (${subtitleTrackSummary(allStreams)}).`,
+        'Pass an index from subtitleTracks, a local subtitle file path, or a language code.',
+      );
+    }
+    if (stream.codec_type !== 'subtitle') {
+      throw new ToolError(
+        'INVALID_ARGUMENT',
+        `subtitle track index ${selection.value} is not a subtitle track (it is a ${stream.codec_type ?? 'unknown'} track).`,
+      );
+    }
+    assertTextSubtitleStream(stream);
+    return { kind: 'embedded', stream, language: stream?.tags?.language ?? null, warnings: [] };
+  }
+
+  const matches = [];
+  const bitmapMatches = [];
+  for (const [order, stream] of allStreams.entries()) {
+    if (stream?.codec_type !== 'subtitle') continue;
+    if (!subtitleLanguageMatches(stream?.tags?.language, selection.value)) continue;
+    if (BITMAP_SUBTITLE_CODECS.has(String(stream?.codec_name ?? '').toLowerCase())) {
+      bitmapMatches.push({ index: stream?.index ?? null, codec: String(stream?.codec_name ?? '').toLowerCase() || 'unknown' });
+    } else {
+      matches.push({ stream, order });
+    }
+  }
+
+  if (matches.length === 0) {
+    const bitmapNote = bitmapMatches.length > 0
+      ? ` Bitmap subtitle tracks cannot be read as text: ${bitmapSkippedWarnings(bitmapMatches).join('; ')}.`
+      : '';
+    throw new ToolError(
+      'INVALID_ARGUMENT',
+      `no subtitle track matches language "${selection.value}" (${subtitleTrackSummary(allStreams)}).${bitmapNote}`,
+      'Pass a subtitle file path, a track index, or omit subtitle to use automatic selection.',
+    );
+  }
+
+  // 多条命中取文件中靠前的一条，其余写进 warnings（契约 §8.5）
+  matches.sort((a, b) => (trackIndex(a.stream, a.order) - trackIndex(b.stream, b.order)) || (a.order - b.order));
+  const chosen = matches[0].stream;
+  const warnings = matches.length > 1
+    ? [`subtitle-language-multiple-matches (language "${selection.value}": `
+      + `tracks ${matches.map(({ stream, order }) => trackIndex(stream, order)).join(', ')}; `
+      + `using track ${trackIndex(chosen)})`]
+    : [];
+  return { kind: 'embedded', stream: chosen, language: chosen?.tags?.language ?? null, warnings };
+}
+
+/** 文件路径的形态校验（契约 §2.4 的路径规则 + 字幕扩展名） */
+function assertSubtitleFileShape(filePath) {
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(filePath) || filePath.startsWith('//')) {
+    throw new ToolError(
+      'INVALID_ARGUMENT',
+      `subtitle file must be a local absolute file path; URLs are not accepted ("${filePath}"). `
+        + 'This server never downloads anything — fetch the file first, then pass its local path.',
+      'Pass a bare absolute path such as "/abs/path/a.srt".',
+    );
+  }
+  if (!path.isAbsolute(filePath)) {
+    throw new ToolError(
+      'INVALID_ARGUMENT',
+      `subtitle file must be an absolute local path; got "${filePath}". Use an absolute path such as "/abs/path/a.srt".`,
+    );
+  }
+  if (!subtitleExtension(filePath)) {
+    throw new ToolError(
+      'INVALID_ARGUMENT',
+      `subtitle file must be one of .srt, .vtt, .ass, .ssa (got "${path.extname(filePath) || '(none)'}").`,
+      'Pass a local subtitle file path, e.g. "/abs/a.zh.srt".',
+    );
+  }
+}
+
+/** 文件存在、是普通文件、可读；不可用 → INVALID_ARGUMENT（显式选择不回退） */
+async function checkSubtitleFileUsable(filePath) {
+  assertSubtitleFileShape(filePath);
+  let info;
+  try {
+    info = await stat(filePath);
+  } catch {
+    throw new ToolError('INVALID_ARGUMENT', `subtitle file does not exist: "${filePath}".`);
+  }
+  if (!info.isFile()) {
+    throw new ToolError('INVALID_ARGUMENT', `subtitle file is not a regular file: "${filePath}".`);
+  }
+  try {
+    await access(filePath, constants.R_OK);
+  } catch (error) {
+    throw new ToolError(
+      'INVALID_ARGUMENT',
+      `subtitle file cannot be read: "${filePath}" (${error?.code ?? error?.message ?? 'unknown'}).`,
+    );
+  }
+}
+
+/** 读显式字幕文件并解析；任何不可用都归为 INVALID_ARGUMENT */
+async function readExplicitSubtitleFile(filePath) {
+  await checkSubtitleFileUsable(filePath);
+  let parsed;
+  try {
+    parsed = await readSubtitleFile(filePath);
+  } catch (error) {
+    if (error instanceof ToolError && error.code === 'TRANSCRIPT_UNREADABLE') {
+      throw new ToolError('INVALID_ARGUMENT', `no subtitle cue could be parsed from "${filePath}".`, error.hint);
+    }
+    if (error instanceof ToolError && error.code === 'PATH_NOT_FOUND') {
+      throw new ToolError('INVALID_ARGUMENT', `subtitle file cannot be read: "${filePath}".`);
+    }
+    throw error;
+  }
+  return {
+    origin: 'file',
+    format: parsed.format,
+    sourcePath: filePath,
+    language: null,
+    segments: parsed.segments,
+    warnings: [],
+  };
+}
+
+/**
+ * probe 用的非抛错描述：显式 subtitle 可用 → 返回来源；不可用 → `error` 里给出原因。
+ * probe 只报告、不解析内容，也不借用其它来源冒充显式选择（契约 §4.5）。
+ *
+ * @returns {Promise<{origin:'file'|'embedded', sourcePath:string|null, language:string|null,
+ *   warnings:string[], error:string|null} | null>}
+ */
+export async function describeSubtitleSelection({ subtitle, streams = [] } = {}) {
+  if (subtitle === undefined || subtitle === null) return null;
+  try {
+    const selection = inspectSubtitleSelection({ subtitle, streams });
+    if (selection.kind === 'file') {
+      await checkSubtitleFileUsable(selection.path);
+      return { origin: 'file', sourcePath: selection.path, language: null, warnings: [], error: null };
+    }
+    return {
+      origin: 'embedded',
+      sourcePath: null,
+      language: selection.language,
+      warnings: selection.warnings,
+      error: null,
+    };
+  } catch (error) {
+    if (error instanceof ToolError) {
+      return { origin: null, sourcePath: null, language: null, warnings: [], error: error.message };
+    }
+    throw error;
+  }
 }
 
 /** 把内嵌字幕轨抽成 SRT 文本（ffmpeg 的 srt muxer 直接输出到 stdout） */
@@ -139,46 +408,13 @@ function escapeRegExp(text) {
 }
 
 /**
- * 解析一个显式的 transcriptFile：路径与扩展名的错误按契约 §8.6 的文案抛出。
- * @returns {Promise<{origin:'file', format:string, sourcePath:string, language:null, segments:Array, warnings:string[]}>}
- */
-export async function readExplicitTranscript(transcriptPath) {
-  if (typeof transcriptPath !== 'string' || transcriptPath.length === 0) {
-    throw new ToolError('INVALID_ARGUMENT', 'transcriptFile must be a non-empty string.');
-  }
-  const ext = subtitleExtension(transcriptPath);
-  if (!ext) {
-    throw new ToolError(
-      'INVALID_ARGUMENT',
-      `transcriptFile must be one of .srt, .vtt, .ass, .ssa (got "${path.extname(transcriptPath) || '(none)'}").`,
-    );
-  }
-  let parsed;
-  try {
-    parsed = await readSubtitleFile(transcriptPath);
-  } catch (error) {
-    if (error?.code === 'PATH_NOT_FOUND') {
-      throw new ToolError('PATH_NOT_FOUND', `transcriptFile does not exist: "${transcriptPath}".`);
-    }
-    throw error;
-  }
-  return {
-    origin: 'file',
-    format: parsed.format,
-    sourcePath: transcriptPath,
-    language: null,
-    segments: parsed.segments,
-    warnings: [],
-  };
-}
-
-/**
- * 按契约 §8.5 的顺序找字幕：transcriptFile → 内嵌轨 → 同目录同名文件。
- * 找到 → {origin, format, sourcePath, language, segments, warnings}；都没有 → null。
+ * 按契约 §8.5 找字幕。
+ * 显式 subtitle → 只按它（不可用就抛 INVALID_ARGUMENT，不回退）；
+ * 未给 → 内嵌轨 → 同目录同名文件。找到 → {origin, format, sourcePath, language, segments, warnings}；都没有 → null。
  *
  * @param {object} opts
  * @param {string} opts.mediaPath
- * @param {string} [opts.transcriptFile]
+ * @param {string|number} [opts.subtitle] 显式选择：文件绝对路径 / 非负 track index / 语言码
  * @param {Array<object>} [opts.streams] ffprobe 的 streams（用于找内嵌字幕轨）
  * @param {boolean} [opts.embedded=true] 是否尝试内嵌轨（纯音频文件通常没有）
  * @param {boolean} [opts.siblings=true] 是否尝试同目录同名文件
@@ -186,17 +422,50 @@ export async function readExplicitTranscript(transcriptPath) {
  */
 export async function resolveSubtitleSource({
   mediaPath,
-  transcriptFile,
+  subtitle,
   streams = [],
   embedded = true,
   siblings = true,
   signal,
   warnings = [],
 } = {}) {
-  if (transcriptFile !== undefined && transcriptFile !== null) {
-    const explicit = await readExplicitTranscript(transcriptFile);
-    warnings.push(...explicit.warnings);
-    return explicit;
+  if (subtitle !== undefined && subtitle !== null) {
+    const selection = inspectSubtitleSelection({ subtitle, streams });
+    if (selection.kind === 'file') {
+      const explicit = await readExplicitSubtitleFile(selection.path);
+      warnings.push(...explicit.warnings);
+      return explicit;
+    }
+
+    const streamIndex = selection.stream?.index;
+    if (streamIndex === undefined || streamIndex === null) {
+      throw new ToolError('INVALID_ARGUMENT', 'subtitle track has no stream index; pass a subtitle file or a language code instead.');
+    }
+    const track = streamIndex;
+    let text;
+    try {
+      text = await extractEmbeddedSubtitle(mediaPath, streamIndex, { signal });
+    } catch (error) {
+      throw new ToolError('INVALID_ARGUMENT', `subtitle track ${track} could not be read: ${error?.message ?? error}.`);
+    }
+    let segments;
+    try {
+      segments = parseSubtitles(text, { format: 'srt' });
+    } catch (error) {
+      throw new ToolError('INVALID_ARGUMENT', `subtitle track ${track} could not be parsed: ${error?.message ?? error}.`);
+    }
+    if (segments.length === 0) {
+      throw new ToolError('INVALID_ARGUMENT', `subtitle track ${track} contains no subtitle cues.`);
+    }
+    warnings.push(...selection.warnings);
+    return {
+      origin: 'embedded',
+      format: 'embedded',
+      sourcePath: null,
+      language: selection.language,
+      segments,
+      warnings,
+    };
   }
 
   if (embedded) {

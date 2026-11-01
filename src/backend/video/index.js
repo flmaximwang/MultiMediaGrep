@@ -18,7 +18,7 @@ import { composeOverviewImages, detectCuts } from './storyboard.js';
 import { captureFrame, outputGeometry, pickSharpest } from './capture.js';
 
 const NO_TRANSCRIPT_MESSAGE = 'no transcript available for this file and no ASR provider is configured (MMGREP_ASR_PROVIDER="none"). '
-  + 'Pass transcriptFile with a local .srt/.vtt file, or configure an ASR provider. '
+  + 'Pass subtitle with a local .srt/.vtt file, a track index, or a language code, or configure an ASR provider. '
   + 'For visuals only, use media_overview instead.';
 
 function clampInt(value, min, max, fallback) {
@@ -74,7 +74,7 @@ function noTranscriptError(input, ctx, transcript) {
   return new ToolError(
     'NO_TRANSCRIPT',
     `no transcript available for this file: ${reason} `
-      + 'Pass transcriptFile with a local .srt/.vtt file, or use media_overview instead.',
+      + 'Pass subtitle with a local .srt/.vtt file, a track index, or a language code, or use media_overview instead.',
   );
 }
 
@@ -110,7 +110,7 @@ export function createVideoBackend(ctx = {}) {
     const images = clampInt(input.images, 1, 4, 2);
     const maxEdge = clampInt(input.maxEdge, 256, 1600, 1280);
 
-    c.onProgress?.({ stage: 'transcript', used: input.transcriptFile ? 'transcriptFile' : (input.transcript ?? 'auto') });
+    c.onProgress?.({ stage: 'transcript', used: input.subtitle !== undefined && input.subtitle !== null ? String(input.subtitle) : (input.transcript ?? 'auto') });
     const transcriptData = await resolveTranscript(input, c, media, {
       fromSec: window.startSec,
       toSec: window.endSec,
@@ -317,7 +317,7 @@ export function createVideoBackend(ctx = {}) {
     const warnings = [];
     const subtitle = await resolveSubtitleSource({
       mediaPath: input.path,
-      transcriptFile: input.transcriptFile,
+      subtitle: input.subtitle,
       streams: media.streams,
       signal: c.signal,
       warnings,
@@ -326,7 +326,7 @@ export function createVideoBackend(ctx = {}) {
       throw new ToolError(
         'NO_TRANSCRIPT',
         `no subtitle source for "${input.path}": no embedded subtitle track, no sibling .srt/.vtt/.ass/.ssa file, `
-          + 'and no ASR provider configured. Pass transcriptFile with a local subtitle file.',
+          + 'and no ASR provider configured. Pass subtitle with a local subtitle file, a track index, or a language code.',
       );
     }
     mergeWarnings(warnings, subtitle.warnings);

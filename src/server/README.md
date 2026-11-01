@@ -60,11 +60,11 @@ node --test "test/server/**/*.test.js"
 
 | 工具 | 参数（类型 / 适用媒体） |
 |---|---|
-| `media_probe` | `path`；`transcriptFile`（video/audio）；`transcript`（video/audio，`auto`/`subtitle`/`off`） |
-| `media_overview` | `path`；`start` / `end`（秒，video/audio）；`segment`（30–3600，video/audio）；`pages`（`"3-10,15"`，document）；`cells`（1–16，video/document）；`images`（1–4，video/document）；`maxEdge`（256–1600，video/document）；`envelope`（audio）；`transcriptFile` / `transcript`（video/audio） |
+| `media_probe` | `path`；`subtitle`（video/audio：文件绝对路径 / 字幕轨 index / 语言码）；`transcript`（video/audio，`auto`/`subtitle`/`off`） |
+| `media_overview` | `path`；`start` / `end`（秒，video/audio）；`segment`（30–3600，video/audio）；`pages`（`"3-10,15"`，document）；`cells`（1–16，video/document）；`images`（1–4，video/document）；`maxEdge`（256–1600，video/document）；`envelope`（audio）；`subtitle` / `transcript`（video/audio） |
 | `media_zoom` | `path`；`at`（video）；`start` + `end`（video）；`page`（document）；`crop`（video/document）；`maxEdge` |
-| `media_locate` | `path` + `query`；`max`（1–20）；`start` / `end` / `segment` / `pages`；`transcriptFile` / `transcript`；`includeFrame`（video/document） |
-| `video_subtitles` | `path`（video/audio）；`start` / `end`；`pages` 仅用于报「不适用」；`transcriptFile` |
+| `media_locate` | `path` + `query`；`max`（1–20）；`start` / `end` / `segment` / `pages`；`subtitle` / `transcript`；`includeFrame`（video/document） |
+| `video_subtitles` | `path`（video/audio）；`start` / `end`；`pages` 仅用于报「不适用」；`subtitle` |
 
 参数 schema 通过 `.describe()` 标注适用媒体类型；**传了不适用于该媒体类型的参数会返回契约 §2.2 的
 `INVALID_ARGUMENT` 原文案**（`tools.js` 的 `PARAM_APPLICABILITY` / `checkApplicability`），不会静默忽略。
@@ -100,7 +100,7 @@ isError: true
 | 码 | 触发点 |
 |---|---|
 | `INVALID_ARGUMENT` | 相对路径/空 path（`validatePath` 第 1–2 步）、参数不适用、`page`/`max`/`crop`/`segment` 形状、`at` vs `start/end` 互斥、`query` 为空、`pages` 语法 |
-| `PATH_NOT_FOUND` | `validatePath` 第 3 步；`transcriptFile` 不存在 |
+| `PATH_NOT_FOUND` | `validatePath` 第 3 步（媒体本体路径） |
 | `NOT_A_FILE` | `validatePath` 第 4 步 |
 | `NOT_A_LOCAL_PATH` | `validatePath`：URL / `file://` / 远程路径 |
 | `UNSUPPORTED_MEDIA_TYPE` | 扩展名 + 魔数都识别不出（`detect.js` 抛错） |
@@ -198,7 +198,7 @@ transcriptSource, transcriptOrigin, transcriptPath }, recommended{...}`。
 ```js
 overview(input, ctx) -> { segments, images, transcript, warnings }
 ```
-- `input`: `{ path, mediaType, sizeBytes, modifiedMs, detectedBy, transcriptFile, transcript,
+- `input`: `{ path, mediaType, sizeBytes, modifiedMs, detectedBy, subtitle, transcript,
   startMs, endMs, startSec, endSec, clipped, pages, pageCount, durationSec, envelope,
   cells?, images?, maxEdge? }`
 - `segments[]`: `{ startMs, endMs, page?, text, source?, origin?, confidence?, bbox?, assetRef? }`
@@ -219,7 +219,7 @@ zoom(input, ctx) -> { images, target?, warnings }
 locate(input, ctx) -> { matches, totalSegments?, transcript?, frame?, warnings }
 ```
 - `input`: `{ path, mediaType, sizeBytes, modifiedMs, detectedBy, query, max,
-  transcriptFile, transcript, startMs, endMs, startSec, endSec, clipped, pages, pageCount,
+  subtitle, transcript, startMs, endMs, startSec, endSec, clipped, pages, pageCount,
   durationSec, includeFrame }`
 - `matches[]`: `{ startMs?, endMs?, page?, text, score?, source?, origin? }`；框架补 `rank` / `startSec` / `endSec`
 - `frame`（`includeFrame` 时）：`{ buffer, atMs?, width, height, cells? }`
@@ -227,7 +227,7 @@ locate(input, ctx) -> { matches, totalSegments?, transcript?, frame?, warnings }
 ```js
 subtitles(input, ctx) -> { segments, origin?, sourcePath?, format?, language?, warnings }
 ```
-- `input`: `{ path, mediaType, sizeBytes, modifiedMs, detectedBy, transcriptFile,
+- `input`: `{ path, mediaType, sizeBytes, modifiedMs, detectedBy, subtitle,
   startMs, endMs, startSec, endSec, clipped }`
 - `segments[]`: `{ startMs, endMs, text, source?, origin?, confidence? }`
 - `sourcePath` 是字幕文件路径（内嵌轨给 `null`）；`format` 如 `srt` / `vtt` / `ass`

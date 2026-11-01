@@ -261,6 +261,7 @@ HTTP 端点常被多个调用方共用，provider 的 key 不必都写死在 ser
    - `media_overview({ path })` → 视频出分镜宫格图 + 时间对齐文本；录音出带时间轴转写；文档出页图 + 每页文字。
    - `media_zoom({ path, at })` → 只在「画面上有字要读」时用，最贵（约 1900 token/张）。
    - `media_locate({ path, query })` → 「那句话在哪说的」，纯文本、零图片。
+   - 想指定字幕来源时给 `media_probe` / `media_overview` / `media_locate` 传 `subtitle`：本地字幕文件绝对路径、字幕轨 index（非负整数），或语言码（如 `zh` / `en`）；显式指定不可用会直接报错，不会静默换成别的来源。
 4. **记住三件事**：
    - 只吃**本地绝对路径**，它不下载任何东西；
    - server 自己不调 LLM，理解由你的模型完成；
