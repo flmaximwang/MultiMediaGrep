@@ -30,6 +30,7 @@ import { matchSegments } from '../../media/match.js';
 import { IMAGE_LIMITS, layoutForCells } from '../../server/images.js';
 import { providerApiKeyEnv, providerEnv } from '../../server/config.js';
 import {
+  analyzePageText,
   blocksToText,
   createBuiltinTypesetProvider,
   normalizeBlocks,
@@ -667,6 +668,35 @@ async function openProviderPageCache(ctx, info) {
 }
 
 /**
+ * builtin 对一页的版式判定：像不像双栏。
+ *
+ * 用于两处路由决策：
+ *   - `MMGREP_TYPESET_SKIP_SIMPLE=true`（默认）时，单栏页交给 builtin 本地处理，
+ *     只有判定双栏的「复杂页」才发给外部 typeset provider；
+ *   - typeset provider 关闭时，给「本页像双栏」加一条 note，提醒 agent 阅读顺序
+ *     可能交错。
+ */
+function looksTwoColumn(text) {
+  try {
+    return analyzePageText(text).twoColumn;
+  } catch {
+    return false;
+  }
+}
+
+/** 用内置 typeset（本地，不重新识别字符）排出这页：柱检测 → 重排 → blocks。 */
+function typesetPageLocally(page, text) {
+  const analysis = analyzePageText(text);
+  const blocks = textToBlocks(analysis.text);
+  return {
+    page,
+    textOrigin: 'textlayer',
+    blocks,
+    text: blocksToText(blocks),
+  };
+}
+
+/**
  * 收集页文字（契约 v2 的逐页路由）。
  *
  *   PDF：逐页文字层检测（9z5.27）→ 有文字层的页走 typeset，没有的走 OCR。
@@ -702,6 +732,8 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
   const texts = new Map(pages.map((page) => [page, '']));
   const ocrState = docRoleState(ctx, 'ocr');
   const typesetState = docRoleState(ctx, 'typeset');
+  // MMGREP_TYPESET_SKIP_SIMPLE：外部 typeset provider 只收「builtin 判不准」的页。
+  const skipSimple = ctx.config?.typeset?.skipSimple !== false;
   const providerErrors = {};
   const forceOcr = ocrMode === 'force';
   let textPageCount = 0;
@@ -929,19 +961,31 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
 
       if (sameProvider) {
         // 同一 provider 担两个角色：只发一次 parse，按 textOrigin 分配。
+        // SKIP_SIMPLE：双栏 / 复杂页才需要外部 typeset；单栏页由 builtin 本地处理。
+        // OCR 页无论如何都要发（builtin 不做 OCR）。
+        const simpleTextPages = [];
+        const complexTextPages = [];
+        for (const page of textPages) {
+          if (skipSimple && !looksTwoColumn(nativeLayerText.get(page) ?? '')) simpleTextPages.push(page);
+          else complexTextPages.push(page);
+        }
+        for (const page of simpleTextPages) {
+          setPage(typesetPageLocally(page, nativeLayerText.get(page) ?? ''));
+        }
+
         // 有缓存时，两个角色分别查各自的 namespace，随后把缺失页合并成**一次**请求。
         const provider = ctx.ocrProvider ?? ctx.typesetProvider;
         const model = describeModel(provider);
-        const textSet = new Set(textPages);
+        const textSet = new Set(complexTextPages);
         const cachedText = providerPageCache
-          ? await providerPageCache.lookup({ role: 'typeset', provider, model, ocrMode: 'auto', pages: textPages })
+          ? await providerPageCache.lookup({ role: 'typeset', provider, model, ocrMode: 'auto', pages: complexTextPages })
           : new Map();
         const cachedOcr = providerPageCache
           ? await providerPageCache.lookup({ role: 'ocr', provider, model, ocrMode: 'auto', pages: ocrPages })
           : new Map();
         applyCached(cachedText, provider, 'typeset');
         applyCached(cachedOcr, provider, 'ocr');
-        const missingText = textPages.filter((page) => !cachedText.has(page));
+        const missingText = complexTextPages.filter((page) => !cachedText.has(page));
         const missingOcr = ocrPages.filter((page) => !cachedOcr.has(page));
         const missing = [...missingText, ...missingOcr].sort((a, b) => a - b);
 
@@ -987,7 +1031,7 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
         }
 
         // typeset 的硬约束：有文字层的页必须保留原字符（缓存命中的页同样检查）。
-        const reRecognized = textPages.filter((page) => {
+        const reRecognized = complexTextPages.filter((page) => {
           const entry = pageMap.get(page);
           return entry && entry.text.trim() && entry.textOrigin !== 'textlayer';
         });
@@ -1004,60 +1048,89 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
         }
       } else {
         // 两个角色由不同 provider 承担（或只有一个角色启用）。
-        // 9z5.30：每个角色单独查缓存，只把**缺失页**发给对应的 provider。
         if (textPages.length > 0 && typesetState.available) {
-          const provider = ctx.typesetProvider;
-          const cacheRole = 'typeset';
-          const model = describeModel(provider);
-          const cachedText = providerPageCache
-            ? await providerPageCache.lookup({ role: cacheRole, provider, model, ocrMode: 'auto', pages: textPages })
-            : new Map();
-          applyCached(cachedText, provider, cacheRole);
-          const missingText = textPages.filter((page) => !cachedText.has(page));
-          if (missingText.length > 0) {
-            try {
-              const result = await parseWithProvider({
-                provider,
-                role: 'typeset',
-                pages: missingText,
-                ocrMode: 'auto',
-                textLayers: Object.fromEntries(missingText.map((page) => [page, nativeLayerText.get(page) ?? ''])),
-                info,
-                ctx,
-              });
-              const applied = applyResult(result, provider, {
-                role: 'typeset',
-                targetPages: missingText,
-                // 契约要求 typeset provider 显式返回 textOrigin；缺省时按保守值处理，
-                // 绝不能把「没声明」当成「保留了原字符」。
-                fallbackOrigin: 'unknown',
-              });
-              if (providerPageCache) {
-                await providerPageCache.store({ role: cacheRole, provider, model, ocrMode: 'auto', entries: applied });
+          // builtin 是本地 provider，所有页都自己处理；外部 provider 才谈「跳过简单页」。
+          const externalTypeset = typesetState.id !== 'builtin';
+          const simpleTextPages = [];
+          const providerTextPages = [];
+          if (externalTypeset && skipSimple) {
+            for (const page of textPages) {
+              if (looksTwoColumn(nativeLayerText.get(page) ?? '')) providerTextPages.push(page);
+              else simpleTextPages.push(page);
+            }
+          } else {
+            providerTextPages.push(...textPages);
+          }
+          for (const page of simpleTextPages) {
+            setPage(typesetPageLocally(page, nativeLayerText.get(page) ?? ''));
+          }
+          if (providerTextPages.length > 0) {
+            // 9z5.30：命中缓存的页不发 provider，只发缺失页。
+            const provider = ctx.typesetProvider;
+            const cacheRole = 'typeset';
+            const model = describeModel(provider);
+            const cachedText = providerPageCache
+              ? await providerPageCache.lookup({ role: cacheRole, provider, model, ocrMode: 'auto', pages: providerTextPages })
+              : new Map();
+            applyCached(cachedText, provider, cacheRole);
+            const missingText = providerTextPages.filter((page) => !cachedText.has(page));
+            if (missingText.length > 0) {
+              try {
+                const result = await parseWithProvider({
+                  provider,
+                  role: 'typeset',
+                  pages: missingText,
+                  ocrMode: 'auto',
+                  textLayers: Object.fromEntries(missingText.map((page) => [page, nativeLayerText.get(page) ?? ''])),
+                  info,
+                  ctx,
+                });
+                const applied = applyResult(result, provider, {
+                  role: 'typeset',
+                  targetPages: missingText,
+                  // 契约要求 typeset provider 显式返回 textOrigin；缺省时按保守值处理，
+                  // 绝不能把「没声明」当成「保留了原字符」。
+                  fallbackOrigin: 'unknown',
+                });
+                if (providerPageCache) {
+                  await providerPageCache.store({ role: cacheRole, provider, model, ocrMode: 'auto', entries: applied });
+                }
+              } catch (error) {
+                if (ctx.signal?.aborted) throw error;
+                providerErrors.typeset = toProviderFailure(error, ctx.config?.typeset?.apiKey ?? null);
+                warnings.push(
+                  `typeset provider "${typesetState.id ?? 'unknown'}" failed: ${providerErrors.typeset.message}. `
+                    + 'The PDF text layer was used instead where available.',
+                );
               }
-            } catch (error) {
-              if (ctx.signal?.aborted) throw error;
-              providerErrors.typeset = toProviderFailure(error, ctx.config?.typeset?.apiKey ?? null);
+            }
+            const reRecognized = providerTextPages.filter((page) => {
+              const entry = pageMap.get(page);
+              return entry && entry.text.trim() && entry.textOrigin !== 'textlayer';
+            });
+            if (reRecognized.length > 0) {
               warnings.push(
-                `typeset provider "${typesetState.id ?? 'unknown'}" failed: ${providerErrors.typeset.message}. `
-                  + 'The PDF text layer was used instead where available.',
+                `typeset provider "${typesetState.id}" returned textOrigin "${pageMap.get(reRecognized[0]).textOrigin}" `
+                  + `for ${reRecognized.length} page(s) that have a PDF text layer; characters may have been re-recognized.`,
               );
             }
-          }
-          const reRecognized = textPages.filter((page) => {
-            const entry = pageMap.get(page);
-            return entry && entry.text.trim() && entry.textOrigin !== 'textlayer';
-          });
-          if (reRecognized.length > 0) {
-            warnings.push(
-              `typeset provider "${typesetState.id}" returned textOrigin "${pageMap.get(reRecognized[0]).textOrigin}" `
-                + `for ${reRecognized.length} page(s) that have a PDF text layer; characters may have been re-recognized.`,
-            );
           }
         }
         // typeset=none 或失败 / 缺页：有文字层的页一律用原生文字层兜底（无警告）。
         for (const page of textPages) {
           if (!String(texts.get(page) ?? '').trim()) useNativePage(page);
+        }
+
+        // typeset 关闭时双栏页保持 -layout 原样：阅读顺序会左右交错，必须明说。
+        // （typeset provider 失败的情况已有自己的 warning，这里只覆盖「没配 / none」。）
+        if (!typesetState.available) {
+          for (const page of textPages) {
+            if (looksTwoColumn(nativeLayerText.get(page) ?? '')) {
+              warnings.push(
+                `page ${page} looks two-column; reading order may interleave — set MMGREP_TYPESET_PROVIDER=builtin.`,
+              );
+            }
+          }
         }
 
         if (ocrPages.length > 0 && ocrState.available) {

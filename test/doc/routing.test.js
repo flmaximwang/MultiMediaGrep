@@ -119,7 +119,8 @@ test('逐页路由：有文字层 → typeset，无文字层 → OCR（两个 pr
     const ocr = makeStubProvider({ id: 'ocr-stub' });
     const typeset = makeStubProvider({ id: 'typeset-stub' });
     const backend = createDocumentBackend({
-      config: { ocr: { provider: 'ocr-stub' }, typeset: { provider: 'typeset-stub' } },
+      // 9z5.24 的 skip-simple 默认会把单栏页留在本地；这条用例只测逐页路由。
+      config: { ocr: { provider: 'ocr-stub' }, typeset: { provider: 'typeset-stub', skipSimple: false } },
       ocrProvider: ocr.provider,
       typesetProvider: typeset.provider,
       pdfSupport: fakePdfSupport({ textPages: [1, 2] }),
@@ -158,7 +159,7 @@ test('同一 provider 担两个角色 → 只发一次 parse（role: both），�
       textOriginForPage: (page) => (page <= 2 ? 'textlayer' : 'ocr'),
     });
     const backend = createDocumentBackend({
-      config: { ocr: { provider: 'both-stub' }, typeset: { provider: 'both-stub' } },
+      config: { ocr: { provider: 'both-stub' }, typeset: { provider: 'both-stub', skipSimple: false } },
       ocrProvider: both.provider,
       typesetProvider: both.provider,
       pdfSupport: fakePdfSupport({ textPages: [1, 2] }),

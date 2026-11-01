@@ -32,6 +32,11 @@ export const DEFAULT_AUDIO_MIN_SPEECH_RATIO = 0.05;
 /** 契约 §12.5：provider 超时 */
 export const DEFAULT_ASR_TIMEOUT_MS = 120000;
 export const DEFAULT_DOC_TIMEOUT_MS = 180000;
+/**
+ * 9z5.24：外部 typeset provider 是否跳过「builtin 判定为单栏的简单页」。
+ * 默认 true：简单页由本地 builtin 处理，只把双栏 / 复杂页发给外部服务。
+ */
+export const DEFAULT_TYPESET_SKIP_SIMPLE = true;
 /** 契约 §12.2 / §12.3：默认基址与模型（按 provider 分组） */
 export const DEFAULT_ASR_BASE_URL = 'https://api.elevenlabs.io/v1';
 export const DEFAULT_ASR_MODEL = 'scribe_v1';
@@ -413,6 +418,12 @@ export function loadConfig(env = process.env) {
   const asrSection = resolveProviderSection('asr', asrProvider, env, warnings);
   const ocrSection = resolveDocRoleSection('ocr', ocrProvider, env, warnings);
   const typesetSection = resolveDocRoleSection('typeset', typesetProvider, env, warnings);
+  const typesetSkipSimple = readBool(
+    env,
+    'MMGREP_TYPESET_SKIP_SIMPLE',
+    DEFAULT_TYPESET_SKIP_SIMPLE,
+    { warnings },
+  );
   const docTimeoutMs = readInt(env, 'MMGREP_DOC_TIMEOUT_MS', DEFAULT_DOC_TIMEOUT_MS, { min: 1, warnings });
   warnLegacyDocEnv(env, warnings);
 
@@ -449,7 +460,7 @@ export function loadConfig(env = process.env) {
       timeoutMs: readInt(env, 'MMGREP_ASR_TIMEOUT_MS', DEFAULT_ASR_TIMEOUT_MS, { min: 1, warnings }),
     }),
     ocr: Object.freeze({ ...ocrSection, timeoutMs: docTimeoutMs }),
-    typeset: Object.freeze({ ...typesetSection, timeoutMs: docTimeoutMs }),
+    typeset: Object.freeze({ ...typesetSection, timeoutMs: docTimeoutMs, skipSimple: typesetSkipSimple }),
     images: Object.freeze({
       maxTokens: readInt(env, 'MMGREP_MAX_IMAGE_TOKENS', DEFAULT_MAX_IMAGE_TOKENS, { min: 1, warnings }),
       maxEdge: readInt(env, 'MMGREP_MAX_IMAGE_EDGE', DEFAULT_MAX_IMAGE_EDGE, { min: 1, warnings }),
@@ -535,6 +546,7 @@ export function describeConfig(config) {
       baseUrl: config.typeset.baseUrl,
       model: config.typeset.model,
       timeoutMs: config.typeset.timeoutMs,
+      skipSimple: config.typeset.skipSimple,
     },
     images: { maxTokens: config.images.maxTokens, maxEdge: config.images.maxEdge },
     text: { maxInlineChars: config.text.maxInlineChars },

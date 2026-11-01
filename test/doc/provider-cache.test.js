@@ -271,7 +271,7 @@ function makeBackend({ pdf, cache, ocrProvider, typesetProvider = null, pageCoun
       ocr: ocrProvider
         ? { provider: ocrProvider.id, apiKey: TEST_API_KEY, baseUrl: 'http://127.0.0.1:9/api/v4' }
         : { provider: 'none' },
-      typeset: typesetProvider ? { provider: typesetProvider.id } : { provider: 'none' },
+      typeset: typesetProvider ? { provider: typesetProvider.id, skipSimple: false } : { provider: 'none' },
     },
     ocrProvider,
     typesetProvider,
