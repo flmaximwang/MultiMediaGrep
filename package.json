@@ -1,0 +1,59 @@
+{
+  "name": "multimediagrep-mcp",
+  "version": "0.1.0",
+  "description": "MCP server giving agents eyes and ears over local media (video / recording / document): storyboard grids, zoomed crops, time- and page-aligned text. Local paths only — never downloads, never calls an LLM.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "agent",
+    "video",
+    "audio",
+    "transcription",
+    "asr",
+    "ocr",
+    "document",
+    "pdf",
+    "storyboard",
+    "local-first"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "multimediagrep-mcp": "./src/index.js"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./providers/asr": "./src/providers/asr/index.js",
+    "./providers/doc": "./src/providers/doc/index.js",
+    "./cache": "./src/cache/index.js"
+  },
+  "files": [
+    "src/",
+    "vendor/dsh-video-storyboard/src/",
+    "vendor/dsh-video-storyboard/LICENSE",
+    "vendor/dsh-video-storyboard/NOTICE",
+    "vendor/dsh-video-storyboard/CREDITS.md",
+    "vendor/dsh-video-storyboard/UPSTREAM.json",
+    "docs/mcp-contract.md",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "VENDOR.md",
+    "CREDITS.md"
+  ],
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test",
+    "check": "node scripts/check-syntax.mjs",
+    "fixtures": "node fixtures/generate.mjs",
+    "upstream:sync": "node scripts/upstream-sync.mjs",
+    "prepack": "node scripts/check-syntax.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^3.25.76"
+  }
+}
