@@ -81,7 +81,7 @@ npx -y multimediagrep-mcp
 
 ```bash
 # 2) 从 checkout 直接跑
-git clone <仓库地址> && cd MultiMediaGrep
+git clone https://github.com/flmaximwang/MultiMediaGrep.git && cd MultiMediaGrep
 npm install
 node src/index.js
 ```

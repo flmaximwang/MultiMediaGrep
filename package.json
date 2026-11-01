@@ -3,6 +3,15 @@
   "version": "0.1.0",
   "description": "MCP server giving agents eyes and ears over local media (video / recording / document): storyboard grids, zoomed crops, time- and page-aligned text. Local paths only — never downloads, never calls an LLM.",
   "license": "Apache-2.0",
+  "author": "flmaximwang",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/flmaximwang/MultiMediaGrep.git"
+  },
+  "homepage": "https://github.com/flmaximwang/MultiMediaGrep#readme",
+  "bugs": {
+    "url": "https://github.com/flmaximwang/MultiMediaGrep/issues"
+  },
   "type": "module",
   "keywords": [
     "mcp",

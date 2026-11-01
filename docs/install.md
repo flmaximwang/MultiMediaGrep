@@ -148,7 +148,7 @@ mcp_servers:
 ### 2.4 从 checkout 跑（不想装 npm 包时）
 
 ```bash
-git clone <仓库地址>
+git clone https://github.com/flmaximwang/MultiMediaGrep.git
 cd MultiMediaGrep
 npm install
 node src/index.js
@@ -436,4 +436,5 @@ npx @modelcontextprotocol/inspector npx -y multimediagrep-mcp
 - 本文档里的 Claude Code 与 Hermes 命令，是在**本机安装的这两个 CLI** 上核对过帮助文本 /
   源码得到的；不同版本的参数可能不同，以 `claude mcp add --help` / `hermes mcp add --help` 为准。
 - npm 包名与版本、发布流程**没有在本仓库里验证过**——本文档只描述「怎么装、怎么配、怎么查」。
-- 仓库地址、主页、issue 追踪链接一律没写：写不出来的就不写。
+- 仓库地址、主页、issue 追踪链接现在都指向 <https://github.com/flmaximwang/MultiMediaGrep>；
+  其它没核实过的信息（作者邮箱、CI 徽章、npm 页）仍然不写。
