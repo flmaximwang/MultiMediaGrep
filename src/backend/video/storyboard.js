@@ -1,22 +1,19 @@
 // src/backend/video/storyboard.js —— overview 的镜头格与拼图
 //
-// 为什么不直接用 vendor 的 runStoryboard：
-//   pipeline.js 无论如何都会 remember()/saveCells()，也就是往 ~/.cache/dsh-video-storyboard
-//   写文件。本项目的约束是「临时文件只能进 MMGREP_CACHE_DIR」，所以这里只调用
-//   vendor 里无副作用的纯 IO 层：scanShots / extractFrameRaw / composeSheet / encodePngBuffer。
+// 这里自己把零件拼起来，不走上游那套一站式 pipeline：
+//   上游 dsh-video-storyboard 的 pipeline.js 无论如何都会 remember()/saveCells()，
+//   也就是往 ~/.cache/dsh-video-storyboard 写文件。本项目的约束是「临时文件只能进
+//   MMGREP_CACHE_DIR」，所以只挑无副作用的零件用：
+//   切点来自 ./shots.js 的 scanShots，取帧与 PNG 编码来自 ./frames.js，
+//   宫格绘制来自 ./sheet.js。三个模块都在本仓库内（派生自上游，Apache-2.0）。
 //
 // 格的时间范围严格覆盖 [startSec, endSec]：第一格从窗口起点开始，最后一格在窗口终点结束。
 // 镜头切点只用来对齐边界；切点太多就合并，切点太少就在长段内均分。
 
 import { ToolError } from '../../media/interface.js';
-import {
-  composeSheet,
-  encodePngBuffer,
-  extractFrameRaw,
-  layoutCanvas,
-} from '../../../vendor/dsh-video-storyboard/src/storyboard/sheet.js';
-import { mapPool } from '../../../vendor/dsh-video-storyboard/src/storyboard/frames.js';
-import { scanShots } from '../../../vendor/dsh-video-storyboard/src/storyboard/scan.js';
+import { encodePngBuffer, extractFrameRaw } from './frames.js';
+import { composeSheet, layoutCanvas } from './sheet.js';
+import { scanShots } from './shots.js';
 
 /** 与 server/images.js 的 layoutForCells 保持一致（1–16 格的宫格） */
 export function layoutForCells(cells) {
@@ -192,6 +189,27 @@ function textForRange(segments, fromMs, toMs) {
     parts.push(text);
   }
   return parts.join(' ');
+}
+
+/**
+ * 固定并发数的 map：保持输出顺序，任何一个失败就整体失败（取帧失败不能静默跳过，否则图会缺格）。
+ * 为什么不用 Promise.all：一次起 16 个 ffmpeg 会把机械硬盘打到爬行，也会把内存顶上去。
+ *
+ * 派生自 dsh-video-storyboard v0.5.9 的 `src/storyboard/frames.js`，
+ * © 2026 SAOS-3624，Apache-2.0；逻辑逐字照搬，只把 `export` 改成模块私有。
+ */
+async function mapPool(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const n = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: n }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i], i);
+    }
+  }));
+  return out;
 }
 
 async function grabFrame({ inputPath, range, cellW, cellH }) {

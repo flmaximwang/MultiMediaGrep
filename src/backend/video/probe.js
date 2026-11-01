@@ -15,7 +15,7 @@ import {
   parseRational,
   parseSar,
   uprightSize,
-} from '../../../vendor/dsh-video-storyboard/src/storyboard/probe.js';
+} from './geometry.js';
 
 const NO_AUDIO_HEALTH = Object.freeze({
   verdict: 'no-audio-track',

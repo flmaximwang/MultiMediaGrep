@@ -11,7 +11,11 @@
 | `index.js` | 五个工具入口、窗口校验、NO_TRANSCRIPT 文案 |
 | `probe.js` | ffprobe 读流信息；只解码音频流做 audioHealth（带进程内缓存） |
 | `transcript.js` | 转写来源解析：显式文件 → 内嵌轨 → 同名字幕 → ASR 兜底 |
-| `storyboard.js` | 镜头切点、格范围、宫格拼图（只用 vendor 的无副作用函数） |
+| `storyboard.js` | 镜头切点、格范围、宫格拼图 |
+| `shots.js` | 扫描镜头切点（HSV 加权，失败降级为「均分」） |
+| `frames.js` | 取帧、锐度选帧、PNG 编码（走 `media/ffmpeg.js`，认 `MMGREP_FFMPEG_PATH`） |
+| `sheet.js` | 宫格纯绘制层：画布布局、填色、点阵数字、编号徽标、贴帧 |
+| `geometry.js` | 显示几何换算：帧率/SAR 解析、旋转归一、显示宽高比 |
 | `capture.js` | zoom / locate(includeFrame) 单帧抓取与缩放后裁切 |
 | `work.js` | 按 路径+大小+mtime 生成缓存工作目录 |
 
@@ -25,6 +29,6 @@
 - **overview** 的格范围严格覆盖 `startMs..endMs`：第一格从起点开始、最后一格在终点结束；
   镜头切点只用于对齐边界。输出格数不超过 `cells × images`，且窗口过短时宁可少给。
 - **zoom** 的 `crop` 是输出图的分数坐标，在缩放到 `maxEdge` 后再裁。
-- **不调用 vendor `runStoryboard`**：它会无条件写 `~/.cache/dsh-video-storyboard`。
-  这里改用 `scanShots` / `extractFrameRaw` / `composeSheet` / `encodePngBuffer` 自行组合。
 - **二进制 PNG** 走临时文件再读回：共享 `run()` 的 stdout 是字符串，不能承载二进制。
+- **Apache-2.0 派生**：`shots.js` / `frames.js` / `sheet.js` / `geometry.js` 派生自
+  dsh-video-storyboard v0.5.9（© 2026 SAOS-3624），各文件的改动声明见仓库根目录 `NOTICE`。
