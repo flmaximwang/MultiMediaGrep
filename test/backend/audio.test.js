@@ -207,6 +207,45 @@ test('后端 probe/overview/zoom/locate：字幕文件路径', { skip }, async (
   }
 });
 
+test('后端 overview：images: 0 是零像素纯文本模式——即使 envelope: true 也不出波形图', { skip }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-audio-zero-'));
+  const prevCache = process.env.MMGREP_CACHE_DIR;
+  process.env.MMGREP_CACHE_DIR = path.join(dir, 'cache');
+  try {
+    const audio = await makeAudio(dir, 'tone.wav', '0.5*sin(2*PI*440*t)', 12);
+    await writeFile(path.join(dir, 'tone.srt'), `1
+00:00:00,000 --> 00:00:03,000
+零像素也要有文字
+
+2
+00:00:03,000 --> 00:00:06,000
+第二句
+`);
+
+    const backend = createAudioBackend({ config: {} });
+
+    // images: 0 压过 envelope: true：一张图都不出，文字照旧。
+    const zero = await backend.overview({ path: audio, images: 0, envelope: true });
+    assert.deepEqual(zero.images, [], '零像素模式不得出波形图');
+    assert.equal(zero.segments.length, 2);
+    assert.ok(zero.segments.some((segment) => /零像素也要有文字/.test(segment.text)));
+    assert.equal(zero.transcript.source, 'subtitle');
+
+    // 对照组：envelope: true（不带 images: 0）仍然出波形图。
+    const withWave = await backend.overview({ path: audio, envelope: true });
+    assert.equal(withWave.images.length, 1);
+    assert.equal(withWave.images[0].width, 1200);
+
+    // images: 0 且不要波形：同样零图。
+    const plain = await backend.overview({ path: audio, images: 0, envelope: false });
+    assert.deepEqual(plain.images, []);
+  } finally {
+    if (prevCache === undefined) delete process.env.MMGREP_CACHE_DIR;
+    else process.env.MMGREP_CACHE_DIR = prevCache;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('后端 transcript 三值：subtitle 只读字幕、off 不读字幕，且都不调用 ASR', { skip }, async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-audio-modes-'));
   const prevCache = process.env.MMGREP_CACHE_DIR;

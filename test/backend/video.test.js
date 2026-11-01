@@ -6,7 +6,7 @@
 
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -160,6 +160,32 @@ function throwingProvider() {
 function assertPng(buffer) {
   assert.ok(Buffer.isBuffer(buffer), 'image must be a Buffer');
   assert.equal(buffer.subarray(1, 4).toString('latin1'), 'PNG', 'image must be a real PNG');
+}
+
+/**
+ * 统计 ffmpeg 子进程调用次数：把 MMGREP_FFMPEG_PATH 指向一个记账脚本，
+ * 每次调用都往日志里追加一行。仓库里没有别的统计手段，用这个来证明
+ * 「零像素模式没有走抽帧 / 镜头扫描路径」。
+ */
+async function installFfmpegCounter(dir) {
+  const logPath = path.join(dir, 'ffmpeg-calls.log');
+  const scriptPath = path.join(dir, 'ffmpeg-counter.sh');
+  await writeFile(scriptPath, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${logPath}'\nexec ffmpeg "$@"\n`, { mode: 0o755 });
+  const previous = process.env.MMGREP_FFMPEG_PATH;
+  process.env.MMGREP_FFMPEG_PATH = scriptPath;
+  return {
+    async calls() {
+      try {
+        return (await readFile(logPath, 'utf8')).split('\n').filter((line) => line.length > 0);
+      } catch {
+        return [];
+      }
+    },
+    restore() {
+      if (previous === undefined) delete process.env.MMGREP_FFMPEG_PATH;
+      else process.env.MMGREP_FFMPEG_PATH = previous;
+    },
+  };
 }
 
 function longestEdge(image) {
@@ -466,6 +492,104 @@ test('overview：transcript="off" 不读字幕也不跑 ASR', { skip, timeout: 1
     assert.equal(result.transcript.origin, 'none');
     assert.match(result.transcript.reason, /disabled/i);
     assert.ok(result.warnings.includes('transcript-disabled'));
+  });
+});
+
+test('overview：images: 0 是零像素纯文本模式——不出图、不扫镜头、不抽帧', { skip, timeout: 120000 }, async () => {
+  await withCache(async (dir) => {
+    const counter = await installFfmpegCounter(dir);
+    try {
+      const backend = createVideoBackend({ config: {} });
+      const result = await backend.overview({
+        path: SUBTITLES,
+        startMs: 0,
+        endMs: 12000,
+        cells: 4,
+        images: 0,
+        maxEdge: 640,
+        transcript: 'subtitle',
+        transcriptFile: null,
+      });
+
+      assert.equal(result.images.length, 0, '零像素模式不得出图');
+      assert.ok(result.segments.length > 0, '仍要回字幕段落');
+      assert.ok(result.segments.some((segment) => /FIRST SUBTITLE LINE/.test(segment.text)));
+      assert.ok(result.segments.some((segment) => /FOURTH SUBTITLE LINE/.test(segment.text)));
+      assert.ok(result.segments.every((segment) => segment.source === 'subtitle' && segment.origin === 'file'));
+      assert.ok(result.segments.every((segment) => segment.startMs !== null && segment.endMs !== null));
+      assert.ok(result.segments.every((segment) => segment.startMs >= 0 && segment.endMs <= 12000));
+      assert.equal(result.transcript.source, 'subtitle');
+      assert.equal(result.transcript.origin, 'file');
+
+      // 关键断言：镜头扫描与抽帧都要跑 ffmpeg，这里一次都不许跑。
+      const calls = await counter.calls();
+      assert.deepEqual(calls, [], `零像素模式不得调用 ffmpeg（镜头扫描 / 抽帧），实际调用：\n${calls.join('\n')}`);
+
+      // 对照组：images: 1 时确实会跑 ffmpeg —— 说明上面的计数是真的在数。
+      const withImage = await backend.overview({
+        path: SUBTITLES,
+        startMs: 0,
+        endMs: 12000,
+        cells: 4,
+        images: 1,
+        maxEdge: 640,
+        transcript: 'subtitle',
+        transcriptFile: null,
+      });
+      assert.equal(withImage.images.length, 1);
+      assert.ok((await counter.calls()).length > 0, '对照组必须记录到 ffmpeg 调用，否则计数没生效');
+    } finally {
+      counter.restore();
+    }
+  });
+});
+
+test('overview：images: 0 与 transcript="subtitle" 组合——零像素、零 ASR', { skip, timeout: 120000 }, async () => {
+  await withCache(async (dir) => {
+    const counter = await installFfmpegCounter(dir);
+    try {
+      const stub = throwingProvider();
+      const backend = createVideoBackend({ config: {}, asrProvider: stub.provider });
+      const result = await backend.overview({
+        path: SUBTITLES,
+        startMs: 0,
+        endMs: 12000,
+        cells: 4,
+        images: 0,
+        maxEdge: 640,
+        transcript: 'subtitle',
+        transcriptFile: null,
+      });
+
+      assert.equal(stub.calls.length, 0, '零像素模式不得触发 ASR');
+      assert.equal(result.images.length, 0);
+      assert.ok(result.segments.some((segment) => /FIRST SUBTITLE LINE/.test(segment.text)));
+      assert.deepEqual(await counter.calls(), [], '零像素 + 字幕模式不得调用 ffmpeg');
+    } finally {
+      counter.restore();
+    }
+  });
+});
+
+test('overview：images: 0 时窗口仍然生效，超窗段落被过滤掉', { skip, timeout: 120000 }, async () => {
+  await withCache(async () => {
+    const backend = createVideoBackend({ config: {} });
+    const result = await backend.overview({
+      path: SUBTITLES,
+      startMs: 3000,
+      endMs: 6000,
+      cells: 4,
+      images: 0,
+      maxEdge: 640,
+      transcript: 'subtitle',
+      transcriptFile: null,
+    });
+
+    assert.equal(result.images.length, 0);
+    assert.ok(result.segments.length > 0);
+    assert.ok(result.segments.every((segment) => segment.startMs >= 3000 && segment.endMs <= 6000));
+    assert.ok(result.segments.some((segment) => /SECOND SUBTITLE LINE/.test(segment.text)));
+    assert.ok(result.segments.every((segment) => !/FIRST SUBTITLE LINE/.test(segment.text)));
   });
 });
 

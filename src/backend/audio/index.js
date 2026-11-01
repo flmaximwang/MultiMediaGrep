@@ -377,8 +377,9 @@ export function createAudioBackend(ctx = {}) {
     }
 
     // 可选音频包络图（后端只给 buffer + 尺寸，内容和预算由 server 组装）
+    // images: 0 是零像素模式：压过 envelope，一律不出波形图。
     const images = [];
-    if (input.envelope === true) {
+    if (input.envelope === true && input.images !== 0) {
       c.onProgress?.({ stage: 'images', detail: 'rendering waveform' });
       const workDir = await makeWorkDir(c, input.path, 'audio');
       const wavePath = path.join(workDir, 'envelope.png');

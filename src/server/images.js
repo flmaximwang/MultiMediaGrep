@@ -112,8 +112,9 @@ export function validateImageShape({ cells = 1, images = 1, maxEdge = 1280, limi
 
   assertInteger(cells, 'cells');
   assertInteger(images, 'images');
-  if (images < 1) {
-    throw new ToolError('INVALID_ARGUMENT', `images must be an integer >= 1 (got ${images}).`);
+  // images: 0 是「零像素纯文本模式」：不出图，但形状仍然合法（预算全零）。
+  if (images < 0) {
+    throw new ToolError('INVALID_ARGUMENT', `images must be an integer >= 0 (got ${images}).`);
   }
   if (images > IMAGE_LIMITS.maxImagesPerCall) {
     throw new ToolError(

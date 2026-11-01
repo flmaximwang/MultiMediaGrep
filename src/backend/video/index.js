@@ -3,6 +3,7 @@
 // 职责：
 //   probe     容器/流信息 + 音频体检 + 转写来源判定（不扫镜头、不烧图）
 //   overview  分镜宫格 + 按格对齐的时间/文字清单（字幕优先，ASR 兜底）
+//              images: 0 时走零像素纯文本模式：不扫镜头、不抽帧，只回转写段落
 //   zoom      单帧特写（at 精确帧 / start+end 选最清晰帧，crop 在缩放后裁）
 //   locate    在转写里找短语，返回时间码；可选附带最佳匹配处的一帧
 //   subtitles 只读已有字幕，绝不跑 ASR
@@ -107,7 +108,7 @@ export function createVideoBackend(ctx = {}) {
     const warnings = [];
     const window = computeWindow(input, media, warnings);
     const cells = clampInt(input.cells, 1, 16, 9);
-    const images = clampInt(input.images, 1, 4, 2);
+    const images = clampInt(input.images, 0, 4, 2);
     const maxEdge = clampInt(input.maxEdge, 256, 1600, 1280);
 
     c.onProgress?.({ stage: 'transcript', used: input.transcriptFile ? 'transcriptFile' : (input.transcript ?? 'auto') });
@@ -123,34 +124,50 @@ export function createVideoBackend(ctx = {}) {
       (segment) => overlapsWindow(segment, window.startMs, window.endMs),
     );
 
-    c.onProgress?.({ stage: 'scanning', used: `${window.startSec.toFixed(2)}-${window.endSec.toFixed(2)}s` });
-    const cuts = await detectCuts({
-      inputPath: input.path,
-      fps: media.fpsForScan,
-      startSec: window.startSec,
-      endSec: window.endSec,
-      signal: c.signal,
-      warnings,
-    });
+    // images: 0 = 零像素纯文本模式：完全不扫镜头、不抽帧，只回转写段落。
+    // 这条路径上不会有任何 ffmpeg 子进程（探针只走 ffprobe 读元信息）。
+    let composed = { images: [], segments: [] };
+    if (images > 0) {
+      c.onProgress?.({ stage: 'scanning', used: `${window.startSec.toFixed(2)}-${window.endSec.toFixed(2)}s` });
+      const cuts = await detectCuts({
+        inputPath: input.path,
+        fps: media.fpsForScan,
+        startSec: window.startSec,
+        endSec: window.endSec,
+        signal: c.signal,
+        warnings,
+      });
 
-    c.onProgress?.({ stage: 'frames', used: `${cells} cells x up to ${images} image(s)` });
-    const composed = await composeOverviewImages({
-      inputPath: input.path,
-      startSec: window.startSec,
-      endSec: window.endSec,
-      cuts,
-      capacity: cells,
-      maxImages: images,
-      maxEdge,
-      aspect: media.aspect,
-      transcriptSegments,
-      transcriptSource: transcriptData.transcript.source,
-      transcriptOrigin: transcriptData.transcript.origin,
-      concurrency: c.config?.runtime?.concurrency ?? 2,
-      signal: c.signal,
-      onProgress: c.onProgress,
-      warnings,
-    });
+      c.onProgress?.({ stage: 'frames', used: `${cells} cells x up to ${images} image(s)` });
+      composed = await composeOverviewImages({
+        inputPath: input.path,
+        startSec: window.startSec,
+        endSec: window.endSec,
+        cuts,
+        capacity: cells,
+        maxImages: images,
+        maxEdge,
+        aspect: media.aspect,
+        transcriptSegments,
+        transcriptSource: transcriptData.transcript.source,
+        transcriptOrigin: transcriptData.transcript.origin,
+        concurrency: c.config?.runtime?.concurrency ?? 2,
+        signal: c.signal,
+        onProgress: c.onProgress,
+        warnings,
+      });
+    } else {
+      // 没有宫格就没有 cell：段落直接就是转写行（字幕 / ASR），时间码原样保留。
+      composed.segments = transcriptSegments.map((segment, i) => ({
+        index: i + 1,
+        startMs: segment.startMs ?? null,
+        endMs: segment.endMs ?? null,
+        text: segment.text ?? '',
+        source: segment.source ?? transcriptData.transcript.source,
+        origin: segment.origin ?? transcriptData.transcript.origin,
+        page: null,
+      }));
+    }
 
     return {
       mediaType: 'video',
