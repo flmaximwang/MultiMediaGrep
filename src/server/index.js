@@ -54,8 +54,17 @@ async function loadCache(config, logger) {
  *   - 没配（none）→ null，功能降级为「只有画面」；
  *   - 配了但缺 key → provider 对象存在，真正转写时才抛清晰错误（由 provider 自己负责）；
  *   - provider 名拼错 / 模块缺失 → 记进 providerErrors，probe 的 capabilities 会说明原因。
+ *
+ * `pinCredentials` 供 HTTP 的逐请求路径使用：config 已经是「本请求最终生效」的凭据，
+ * 传空串也会原样钉住，从而阻止各 provider 工厂再去环境变量里找 key —— 否则请求头切到
+ * 另一个 provider 时，工厂的兜底逻辑可能把服务器上另一组凭据又捡回来。
+ *
+ * @param {object} config
+ * @param {object} env
+ * @param {object} logger
+ * @param {{ pinCredentials?: boolean }} [options]
  */
-async function loadProviders(config, env, logger) {
+export async function loadProviders(config, env, logger, { pinCredentials = false } = {}) {
   const providerErrors = {};
   let asrProvider = null;
   let docProvider = null;
@@ -69,10 +78,12 @@ async function loadProviders(config, env, logger) {
       } else {
         asrProvider = mod.createAsrProvider(env, {
           provider: config.asr.provider,
-          apiKey: config.asr.apiKey || undefined,
+          apiKey: pinCredentials ? config.asr.apiKey : (config.asr.apiKey || undefined),
           baseUrl: config.asr.baseUrl,
           model: config.asr.model,
-          language: config.asr.language === 'auto' ? undefined : config.asr.language,
+          language: pinCredentials && config.asr.language === 'auto'
+            ? ''
+            : (config.asr.language === 'auto' ? undefined : config.asr.language),
           timeoutMs: config.asr.timeoutMs,
         });
       }
@@ -93,9 +104,9 @@ async function loadProviders(config, env, logger) {
       } else {
         docProvider = mod.createDocProvider(env, {
           provider: config.doc.provider,
-          apiKey: config.doc.apiKey || undefined,
+          apiKey: pinCredentials ? config.doc.apiKey : (config.doc.apiKey || undefined),
           baseUrl: config.doc.baseUrl,
-          model: config.doc.model || undefined,
+          model: pinCredentials ? config.doc.model : (config.doc.model || undefined),
           timeoutMs: config.doc.timeoutMs,
         });
       }

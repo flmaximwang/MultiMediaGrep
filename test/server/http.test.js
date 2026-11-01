@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -59,14 +59,19 @@ function createCapturingLogger(level = 'debug') {
  * 日志走注入的 logger（写到内存里的数组），这样既能断言「日志里没有令牌」，
  * 又不会去动全局的 console。
  */
-async function withHttpServer(env, fn) {
+async function withHttpServer(env, fn, options = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-http-'));
   const baseEnv = { MMGREP_CACHE_DIR: path.join(dir, 'cache'), ...env };
   const config = loadConfig(baseEnv);
   const { logger, lines } = createCapturingLogger();
   const runtime = await createRuntime({ env: baseEnv, config, logger });
   // 端口 0：让操作系统挑空闲端口，真实地址从 server 对象读回来
-  const endpoint = await startHttpServer({ runtime, config, port: 0 });
+  const endpoint = await startHttpServer({
+    runtime,
+    config,
+    port: 0,
+    ...(options.serverFactory ? { serverFactory: options.serverFactory } : {}),
+  });
   try {
     return await fn({ endpoint, config, runtime, logger, logs: lines, dir });
   } finally {
@@ -111,6 +116,52 @@ async function findFreePort() {
   const { port } = probe.address();
   await new Promise((resolve) => { probe.close(resolve); });
   return port;
+}
+
+/**
+ * 起一个本地 ASR 供应商 stub：记录每个请求的 URL 与请求头，回一个固定 JSON。
+ *
+ * 为什么不用真网络：集成测试要证明「请求头里的 key 真的送到了 provider」，
+ * 而不是只证明 config 里有字符串。stub 同时接 ElevenLabs（xi-api-key）与
+ * OpenAI-compatible（Authorization: Bearer）两种鉴权方式。
+ */
+async function startProviderStub() {
+  const requests = [];
+  const stub = http.createServer((req, res) => {
+    requests.push({ url: req.url, headers: req.headers });
+    const isEleven = String(req.url).includes('/speech-to-text');
+    const payload = JSON.stringify({
+      text: isEleven ? 'hello from elevenlabs' : 'hello from openai',
+      segments: [{ start: 0, end: 1, text: isEleven ? 'hello from elevenlabs' : 'hello from openai' }],
+    });
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(payload),
+    });
+    res.end(payload);
+  });
+  await new Promise((resolve) => { stub.listen(0, '127.0.0.1', resolve); });
+  const { port } = stub.address();
+  return {
+    url: `http://127.0.0.1:${port}`,
+    requests,
+    async close() {
+      await new Promise((resolve) => { stub.close(resolve); });
+    },
+  };
+}
+
+/** 递归列出目录里的普通文件（缓存目录落盘检查用） */
+async function listFiles(dir) {
+  let entries;
+  try {
+    entries = await readdir(dir, { recursive: true, withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((entry) => entry.isFile())
+    .map((entry) => path.join(entry.parentPath ?? entry.path, entry.name));
 }
 
 /* ------------------------------------------------------------------ *
@@ -397,4 +448,155 @@ test('http：真实进程起得来、鉴权生效、SIGINT 后退出码 0', asyn
     if (child.exitCode === null) child.kill('SIGKILL');
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * 逐请求凭据（HTTP 头）
+ * ------------------------------------------------------------------ */
+
+test('http：逐请求凭据 —— 同一端点两个请求各用各的 provider / key', async () => {
+  const stub = await startProviderStub();
+  const seen = [];
+  const serverFactory = (runtimeForRequest) => {
+    seen.push(runtimeForRequest);
+    return createServer(runtimeForRequest);
+  };
+
+  try {
+    await withHttpServer({}, async ({ endpoint, runtime, logs, dir }) => {
+      const audioPath = path.join(dir, 'tone.bin');
+      // provider stub 不解析音频内容，只要文件存在、读得出来即可。
+      await writeFile(audioPath, Buffer.from('not really audio; the stub does not care'));
+
+      const list = { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} };
+      const first = await rpc(endpoint, list, {
+        'x-mmgrep-asr-provider': 'elevenlabs',
+        'x-mmgrep-elevenlabs-api-key': 'sentinel-elevenlabs-request-key',
+        'x-mmgrep-elevenlabs-base-url': `${stub.url}/eleven`,
+        'x-mmgrep-elevenlabs-model': 'sentinel-elevenlabs-model',
+      });
+      assert.equal(first.status, 200);
+      assert.equal(first.json.result.tools.length, 5);
+
+      const second = await rpc(endpoint, { ...list, id: 2 }, {
+        'x-mmgrep-asr-provider': 'openai-compatible',
+        'x-mmgrep-openai-compatible-api-key': 'sentinel-openai-request-key',
+        'x-mmgrep-openai-compatible-base-url': `${stub.url}/openai`,
+        'x-mmgrep-openai-compatible-model': 'sentinel-openai-model',
+      });
+      assert.equal(second.status, 200);
+
+      // 每个请求都有自己的 runtime / provider；共享的那个没有被改动。
+      assert.equal(seen.length, 2);
+      assert.notEqual(seen[0], runtime);
+      assert.notEqual(seen[1], runtime);
+      assert.notEqual(seen[0], seen[1], '两个请求必须各有一份 runtime');
+      assert.equal(seen[0].config.asr.provider, 'elevenlabs');
+      assert.equal(seen[1].config.asr.provider, 'openai-compatible');
+      assert.equal(seen[0].config.asr.apiKey, 'sentinel-elevenlabs-request-key');
+      assert.equal(seen[1].config.asr.apiKey, 'sentinel-openai-request-key');
+      assert.equal(runtime.config.asr.provider, 'none', '共享 runtime 的配置被改动了');
+
+      // 真正打一次 provider：各自的 key 要出现在各自的鉴权头里。
+      const eleven = await seen[0].asrProvider.transcribe({ audioPath });
+      const openai = await seen[1].asrProvider.transcribe({ audioPath });
+      assert.equal(eleven.provider, 'elevenlabs');
+      assert.equal(openai.provider, 'openai-compatible');
+
+      assert.equal(stub.requests.length, 2);
+      const [elevenRequest, openaiRequest] = stub.requests;
+      assert.match(elevenRequest.url, /\/speech-to-text$/);
+      assert.equal(elevenRequest.headers['xi-api-key'], 'sentinel-elevenlabs-request-key');
+      assert.equal(elevenRequest.headers.authorization, undefined);
+      assert.match(openaiRequest.url, /\/audio\/transcriptions$/);
+      assert.equal(openaiRequest.headers.authorization, 'Bearer sentinel-openai-request-key');
+      assert.equal(openaiRequest.headers['xi-api-key'], undefined);
+
+      // 日志只回答「哪些头出现了」，绝不出现任何头的值。
+      const text = logs.join('\n');
+      assert.match(text, /x-mmgrep-asr-provider/);
+      for (const secret of [
+        'sentinel-elevenlabs-request-key',
+        'sentinel-openai-request-key',
+        'sentinel-elevenlabs-model',
+        'sentinel-openai-model',
+        stub.url,
+      ]) {
+        assert.ok(!text.includes(secret), `日志泄漏了请求头的值 ${secret}：${text}`);
+      }
+    }, { serverFactory });
+  } finally {
+    await stub.close();
+  }
+});
+
+test('http：没有凭据头的请求复用共享 runtime（不重建 provider）', async () => {
+  const seen = [];
+  const serverFactory = (runtimeForRequest) => {
+    seen.push(runtimeForRequest);
+    return createServer(runtimeForRequest);
+  };
+
+  await withHttpServer({}, async ({ endpoint, runtime }) => {
+    const res = await rpc(endpoint, { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
+    assert.equal(res.status, 200);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0], runtime, '没带凭据时必须原样复用共享 runtime');
+  }, { serverFactory });
+});
+
+test('http：未知 provider 头 → 400 / -32602，不构造 provider，也不回显 key', async () => {
+  const seen = [];
+  const sentinel = 'sentinel-key-must-not-be-echoed';
+  const serverFactory = (runtimeForRequest) => {
+    seen.push(runtimeForRequest);
+    return createServer(runtimeForRequest);
+  };
+
+  await withHttpServer({}, async ({ endpoint, logs }) => {
+    const res = await rpc(
+      endpoint,
+      { jsonrpc: '2.0', id: 7, method: 'tools/list', params: {} },
+      {
+        'x-mmgrep-asr-provider': 'whisper-cloud',
+        'x-mmgrep-elevenlabs-api-key': sentinel,
+      },
+    );
+
+    assert.equal(res.status, 400);
+    assert.equal(res.json.jsonrpc, '2.0');
+    assert.equal(res.json.error.code, -32602, 'INVALID_ARGUMENT 应该是 JSON-RPC 的 -32602');
+    assert.equal(res.json.id, 7, '错误信封要带回请求 id');
+    assert.match(res.json.error.message, /x-mmgrep-asr-provider/);
+    assert.match(res.json.error.message, /elevenlabs/);
+    assert.match(res.json.error.message, /openai-compatible/);
+    assert.ok(!res.text.includes(sentinel), '错误响应回显了 key');
+    assert.equal(seen.length, 0, 'provider id 不合法时不该构造任何 server / provider');
+
+    const text = logs.join('\n');
+    assert.ok(!text.includes(sentinel), `日志泄漏了 key：${text}`);
+    assert.ok(!text.includes('whisper-cloud'), `日志泄漏了 provider 头的值：${text}`);
+  }, { serverFactory });
+});
+
+test('http：请求头里的 key 不会落进缓存目录', async () => {
+  const sentinel = 'sentinel-cache-dir-must-stay-clean';
+
+  await withHttpServer({}, async ({ endpoint, dir }) => {
+    const res = await rpc(
+      endpoint,
+      { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} },
+      {
+        'x-mmgrep-asr-provider': 'elevenlabs',
+        'x-mmgrep-elevenlabs-api-key': sentinel,
+      },
+    );
+    assert.equal(res.status, 200);
+
+    const files = await listFiles(path.join(dir, 'cache'));
+    for (const file of files) {
+      const content = await readFile(file);
+      assert.ok(!content.includes(sentinel), `${file} 的落盘内容里出现了请求头的 key`);
+    }
+  });
 });
