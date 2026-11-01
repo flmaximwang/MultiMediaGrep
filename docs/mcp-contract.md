@@ -4,7 +4,7 @@
 >
 > 状态：设计稿 v1 · 对应 beads `MultiMediaGrep-9z5.4`（工具 MCP 契约）与 `MultiMediaGrep-32x`（图片 token 预算）
 >
-> 上游参考：`dsh-video-storyboard` v0.5.9（Apache-2.0，本地副本 `~/.hermes/cache/scratch/dsh-video-storyboard`）。
+> 上游参考：[`dsh-video-storyboard`](https://github.com/SAOS-3624/dsh-video-storyboard) v0.5.9（Apache-2.0）。本项目的视频模块部分派生自它，见 `NOTICE` / `CREDITS.md`。
 
 ---
 
@@ -53,14 +53,14 @@ MultiMediaGrep 是一个 **stdio MCP server**。它给任何 MCP client 的 agen
 
 | mediaType | 后端 | 关键组成 |
 |---|---|---|
-| `video` | **视频后端** | vendor 进来的 `dsh-video-storyboard` 管线：`probe.js`（ffprobe）、`scan`/`plan`（镜头检测与分格）、`frames`/`sheet`（取帧与拼图）、`segments`/`asr`（转写） |
+| `video` | **视频后端** | 本项目自己的视频管线（部分模块派生自 `dsh-video-storyboard`）：`probe.js`（ffprobe）、`shots.js`/`storyboard.js`（镜头检测与分格）、`frames.js`/`sheet.js`（取帧与拼图）、`transcript.js`（转写） |
 | `audio` | **录音后端** | ffmpeg 抽 16 kHz 单声道 WAV → ASR provider → 带时间轴的 segments；可选音频包络图 |
 | `document` | **文档后端** | 页面栅格化（页图）＋ 可选文档解析 provider（每页文字） |
 
 ```mermaid
 flowchart TD
   A["media_* tool call<br/>path = 本地绝对路径"] --> B{"mediaType?<br/>扩展名 + 容器嗅探"}
-  B -->|video| V["视频后端<br/>vendor dsh-video-storyboard"]
+  B -->|video| V["视频后端<br/>本项目 video 模块<br/>（部分派生自上游）"]
   B -->|audio| AU["录音后端<br/>ffmpeg → WAV → ASR"]
   B -->|document| D["文档后端<br/>页面栅格化"]
   B -->|无法判定| E["✗ UNSUPPORTED_MEDIA_TYPE"]
@@ -1395,7 +1395,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | 15 | 返回 `{ images: [attachment], text }`，图片走 DSH `attachments` 服务 | 返回标准 MCP content blocks：`{type:"image", data: base64, mimeType}` + `structuredContent` | 我们是标准 MCP server，不依赖 DSH 宿主。附带收益：任何 MCP client 都能直接看到图 |
 | 16 | `video_subtitles` = 把**硬字幕**裁成一条竖长图（`subtitle-strip.js` / `buildSubtitleStrip`） | `video_subtitles` = 读字幕文件 / 内嵌字幕轨，解析成**带时间轴的文本段落**，不出图 | 需求定位不同。我们先做「读已有字幕」这件高频事；裁硬字幕带的能力可以由 `media_zoom` 的 `crop` 部分覆盖，属于可后置项 |
 | 17 | `transcriptFile` 只吃 SRT 与 JSON（`[{start,end,text}]` / `[{from,to,text}]` / B 站 `{body:[…]}`） | 吃 `.srt` / `.vtt` / `.ass` / `.ssa` | 字幕文件更通用。**注意**：VTT/ASS 的解析是**新代码**，上游没有现成实现（上游 `transcript-file.js` 只有 SRT + JSON） |
-| 18 | `video_locate` 用 LCS 归一化匹配（`locate.js` 的 `matchSegments`，中英文同构、忽略标点空白） | 沿用同一套打分（直接复用 vendor 进来的实现） | 上游行为已验证（阈值 `minScore=0.34`、同分短句优先），不重写 |
+| 18 | `video_locate` 用 LCS 归一化匹配（上游 `locate.js` 的 `matchSegments`，中英文同构、忽略标点空白） | 沿用同一套打分（由本项目 `src/media/match.js` 独立实现，思路来自上游） | 上游行为已验证（阈值 `minScore=0.34`、同分短句优先），不重写 |
 | 19 | `video_locate` 纯文本、永不出图 | 默认纯文本，`includeFrame: true` 时附一张最佳匹配处的画面 | 保持上游的「定位不花像素」哲学，同时给需要看图的 agent 一个出口 |
 | 20 | 无文档形态的 locate | `media_locate` 支持文档（返回页码 + 可选页图） | 跨媒体统一 |
 | 21 | 无进度通知 | 长任务发 MCP progress notification | 上游靠 DSH 宿主；我们是标准 MCP，用标准机制 |
@@ -1463,7 +1463,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | 7 | **`media_zoom` 的选帧规则** | 时间窗内选「最清晰的一帧」（上游 `pick: sharp` 的 Laplacian 方差口径）。也可改成「取中点帧」——更可预测但可能落在转场上 | §6.3 `target.selection` |
 | 8 | **`structuredContent` 的宿主兼容性** | 契约里定义了结构化 payload，但**是否所有宿主都消费** `structuredContent` 需要实现时按 SDK 版本验证；不支持时退化为只返回 content 文本块（内容不变） | §4.3 / §5.3 / §6.3 / §7.3 / §8.3 |
 | 9 | **ASR 的分片策略与长音频** | 建议沿用上游「≤45 s 切片、切在静音中点」的口径（上游 `asr-contract.md` 明确警告固定长度切分会切词） | §12.2 |
-| 10 | **vendor 代码的许可与署名** | 上游 v0.5.0 起为 **Apache-2.0**（v0.5.0 之前是 MIT）。vendor 进来必须保留 `LICENSE` / `NOTICE` / `CREDITS.md`，并在 README 里署名 | 打包与分发 |
+| 10 | **派生代码的许可与署名** | 上游 v0.5.0 起为 **Apache-2.0**（v0.5.0 之前是 MIT）。派生进来的部分必须保留上游署名：根目录 `NOTICE` 按 §4(d) 复现版权与授权，每个改动文件顶部按 §4(b) 标注修改；完整清单见 `CREDITS.md` | 打包与分发 |
 | 11 | **音频体检的阈值** | 我选了 `meanDbfs >= -35` 且 `speechRatio >= 0.05` 为「有有效声音」。这两个数是拍的，没有实测样本支撑；不同录音（手机远讲、会议室、播客）差别很大 | §4.3.1 / §12.5；上线前最好用一批真实录音回归 |
 | 12 | **`speechRatio` 的静音门限（-45 dBFS）** | 短时 RMS 门限取 -45 dBFS。同样没实测 | §4.3.1；环境噪声大的录音需要调 |
 | 13 | **`source = "ocr"` 的独立 provider** | 文档 provider（MinerU）自带 OCR，`MMGREP_OCR_PROVIDER` 只用于独立本地 OCR 路径（tesseract）。两条路是否要并存，需要产品定 | §12.4 |

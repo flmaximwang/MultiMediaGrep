@@ -93,8 +93,8 @@ npm i -g github:flmaximwang/MultiMediaGrep           # 装成本地命令 multim
 npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.1.0/multimediagrep-mcp-0.1.0.tgz   # 只装 release 里的运行时包
 ```
 
-> 从 GitHub 源码装会把整个仓库拉下来（含 vendor 源码与文档），首次安装比 npm 慢；
-> release 里的 `.tgz` 只含运行时（src + vendor 运行时 + 署名材料）。
+> 从 GitHub 源码装会把整个仓库拉下来（源码与文档），首次安装比 npm 慢；
+> release 里的 `.tgz` 只含运行时（src + 署名材料）。
 
 **只有 stdio 传输。** 没有 HTTP / SSE 端点，也没有 `--port` 之类的开关——它被谁拉起、怎么拉起，
 由 MCP client 决定。
@@ -273,10 +273,9 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 - **系统依赖**：ffmpeg / ffprobe（不打包、不链接，按独立子进程调用）、poppler 或 mutool 或 gs（只读 PDF 时用）。
 - **可选外部服务**：ElevenLabs（ASR）、MinerU（文档解析）。都是用户自备 key，代码里不含它们的凭据。
 - **许可**：本项目 **Apache-2.0**（[`LICENSE`](LICENSE)）。
-- **vendored 源码**：视频部分基于 Apache-2.0 的
-  [dsh-video-storyboard](https://github.com/SAOS-3624/dsh-video-storyboard) v0.5.9 改造而来，
-  源码在 `vendor/dsh-video-storyboard/`（[`VENDOR.md`](VENDOR.md) 逐文件说明改了什么；
-  上游 `LICENSE` / `NOTICE` / `CREDITS.md` 逐字复制在同目录下）。
+- **派生源码**：`src/backend/video/` 下的 `geometry.js`、`frames.js`、`sheet.js`、`shots.js`
+  以及 `storyboard.js` 的 `mapPool` 派生自 Apache-2.0 的
+  [dsh-video-storyboard](https://github.com/SAOS-3624/dsh-video-storyboard) v0.5.9（已修改）。
   被改动的文件顶部都有 `Modifications:` 段落（Apache-2.0 §4(b)）。
   完整署名见 [`NOTICE`](NOTICE) 与 [`CREDITS.md`](CREDITS.md)。
 
@@ -288,7 +287,7 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 
 ```bash
 npm install
-npm run check        # 语法检查（src/ 与 vendor/ 全量 node --check）
+npm run check        # 语法检查（src/、test/、scripts/、fixtures/ 全量 node --check）
 npm test             # node --test
 npm run fixtures     # 生成测试素材（ffmpeg 脚本生成，仓库不含任何第三方媒体）
 ```

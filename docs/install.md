@@ -184,7 +184,7 @@ npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.1.0/
 }
 ```
 
-> A / B 会把整个仓库拉下来（含 vendor 源码与文档），首次安装比 npm 慢一些；
+> A / B 会把整个仓库拉下来（源码与文档），首次安装比 npm 慢一些；
 > C 只含运行时。`npx` 会在本地缓存，第二次启动就快了。
 > 注意：GitHub 源的安装不走 npm registry 的版本号管理，升级要自己 `git pull` 或换回 npm 包。
 
