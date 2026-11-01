@@ -264,6 +264,7 @@ progress token 形如 `media_overview 3/5 · scanning 0-300s`，让宿主 UI 能
 | **快速指纹索引** | 另有一份 `fingerprint-index.json`：`sha256(绝对路径 + ':' + size + ':' + mtimeMs)` → 内容 sha256。命中指纹就跳过全文件哈希；不命中就老老实实算内容 hash 并写回索引 |
 | 缓存目录 | `MMGREP_CACHE_DIR`（默认 `~/.cache/multimediagrep`），**绝不写到用户文件旁边** |
 | 容量 | `MMGREP_CACHE_MAX_BYTES`（默认 10 GiB），超出按 LRU 淘汰整条目 |
+| provider 逐页结果缓存 | 文档 provider 的结果按页写入同一缓存树：namespace = `sha256:<源内容 hash>:doc-provider:<role>:<hash(源 hash + provider id + model + ocrMode + role)>`，每页存契约 v2 的 page 对象。同一范围再次调用（overview / locate 共享）不再请求 provider，只把缺失页发出去；`ocrMode=force` 单独成键，不覆盖 auto / 文字层结果 |
 | 落盘产物 | `content.md` + `segments.jsonl` + `manifest.json`（三个必备）+ `document.json`（可选，cangjie `SourceDocument Contract v1`） |
 
 细节见 §9。
@@ -1100,6 +1101,11 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
     <stem>.<variant>/             同一份内容的其它产物（如宫格图、特写图）
     .meta-<stem>.json             条目记录（LRU 与清理的依据）
 ```
+
+文档 provider 的逐页结果也挂在这棵树里（namespace 含 provider / model / ocrMode / role，
+每页一个 JSON），与全文产物共用同一套内容哈希、LRU 与容量上限；见 §2.7。
+同一 provider 担两个角色且 `ocrMode=auto` 时，缺失的 typeset / OCR 页合并成**一次**
+`role: "both"` 请求，按返回的 `textOrigin` 分配后再按每页实际路由到的角色落缓存。
 
 ### 9.1 `content.md`
 
