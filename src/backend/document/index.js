@@ -17,10 +17,11 @@
 //   - 图片预算（§10）由 server 的 planImageBudget 传入；这里只保证不超：每张拼图
 //     ≤ cells 格、≤ images 张、长边 ≤ maxEdge、单图 ≤ 2,000,000 px。
 
-import { mkdir, mkdtemp, open, readFile, rm, stat } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
+import { mkdir, mkdtemp, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
-import { hashFile } from '../../cache/hash.js';
+import { contentKey, hashBuffer, hashFile } from '../../cache/hash.js';
 import { resolveCacheConfig } from '../../cache/index.js';
 import { extOf, sniffMagic } from '../../media/detect.js';
 import { ffprobeJson } from '../../media/ffmpeg.js';
@@ -493,6 +494,178 @@ async function parseWithProvider({ provider, role, pages, ocrMode, textLayers, i
   );
 }
 
+/* ------------------------------------------------------------------ *
+ * provider 逐页结果缓存（9z5.30）
+ *
+ * 复用 server 的内容缓存（src/cache）：**一个 namespace 一个缓存条目**
+ * （`prepareDir` + `register`，参与同一套 LRU / MMGREP_CACHE_MAX_BYTES 上限），
+ * 条目里**每页一个 JSON**，存契约 v2 的 page 对象：
+ *
+ *   <MMGREP_CACHE_DIR>/<shard>/<stem>/
+ *     namespace.json             本 namespace 的身份（便于排查）
+ *     page-0001.json             { version, page: { page, textOrigin, blocks, text, tables } }
+ *     page-0002.json
+ *
+ * namespace key =
+ *   sha256:<源文件内容 sha256>:doc-provider:<role>:<hash(源 sha256 + provider id + model + ocrMode + role)>
+ *
+ * 设计要点：
+ *   - 主键仍由**源文件内容**决定（cache.contentKeyForFile，指纹索引加速）；
+ *     文件内容一变，sha256 变，整组页缓存自然失效。
+ *   - role（ocr / typeset）也进 key：同一 provider 的两个角色结果不能互相顶掉。
+ *   - ocrMode 进 key：`force`（9z5.31）单独一个 namespace，**不覆盖** auto /
+ *     文字层的结果。
+ *   - 同一 provider 同时担两个角色、一次 `role: 'both'` 请求时，返回的每页按
+ *     **该页实际路由到的角色**（有文字层 → typeset，无文字层 → ocr）落缓存；
+ *     这样以后单独走 typeset / OCR 的调用也能复用。
+ *   - 缓存是 best-effort：读坏 / 读不到 → 当成 miss；写失败只记 debug，绝不让
+ *     provider 调用失败。命中会 touch 条目刷新 LRU。
+ * ------------------------------------------------------------------ */
+
+/** 缓存条目 / 页文件的格式版本（与 provider 契约 v2 绑定的落盘 schema）。 */
+const PROVIDER_CACHE_SCHEMA = 1;
+
+/** 每页一个文件，页码补零便于人读与排序。 */
+function providerPageFileName(page) {
+  return `page-${String(page).padStart(4, '0')}.json`;
+}
+
+/** 计算 namespace 的缓存 key（见上方注释）。 */
+function providerCacheKey({ sha256, role, provider, model, ocrMode }) {
+  const material = JSON.stringify({
+    schema: PROVIDER_CACHE_SCHEMA,
+    source: sha256,
+    provider: provider?.id ?? null,
+    model: model ?? null,
+    ocrMode: ocrMode === 'force' ? 'force' : 'auto',
+    role,
+  });
+  return `${contentKey({ sha256 })}:doc-provider:${role}:${hashBuffer(material).slice(0, 16)}`;
+}
+
+/**
+ * 打开本次调用的 provider 页缓存。没有可用缓存 / 算不出源文件 hash 时返回 null
+ * （整条链路退化成「每次都问 provider」，与 9z5.28 行为一致）。
+ *
+ * @param {{ cache?: object, logger?: object }} ctx
+ * @param {{ path: string }} info
+ * @returns {Promise<null|{
+ *   lookup: Function,
+ *   store: Function,
+ * }>}
+ */
+async function openProviderPageCache(ctx, info) {
+  const cache = ctx?.cache;
+  if (
+    !cache
+    || typeof cache.contentKeyForFile !== 'function'
+    || typeof cache.getPath !== 'function'
+    || typeof cache.prepareDir !== 'function'
+    || typeof cache.register !== 'function'
+  ) {
+    return null;
+  }
+
+  let sha256;
+  try {
+    ({ sha256 } = await cache.contentKeyForFile(info.path));
+  } catch (error) {
+    ctx?.logger?.debug?.(`provider page cache disabled: ${error?.message ?? error}`);
+    return null;
+  }
+  if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(sha256)) return null;
+
+  const nsKey = ({ role, provider, model, ocrMode }) =>
+    providerCacheKey({ sha256, role, provider, model, ocrMode });
+
+  const nsMeta = ({ role, provider, model, ocrMode }) => ({
+    version: PROVIDER_CACHE_SCHEMA,
+    sourceSha256: sha256,
+    provider: provider?.id ?? null,
+    model: model ?? null,
+    ocrMode: ocrMode === 'force' ? 'force' : 'auto',
+    role,
+  });
+
+  /**
+   * 读回已缓存的页。坏文件 / 读失败都当 miss。
+   *
+   * @param {{ role: string, provider: object, model: string|null, ocrMode: string, pages: number[] }} spec
+   * @returns {Promise<Map<number, object>>} page → 契约 v2 page 对象
+   */
+  async function lookup({ role, provider, model, ocrMode, pages }) {
+    const result = new Map();
+    if (!Array.isArray(pages) || pages.length === 0) return result;
+    let dir;
+    try {
+      dir = cache.getPath(nsKey({ role, provider, model, ocrMode }));
+    } catch (error) {
+      ctx?.logger?.debug?.(`provider page cache lookup skipped: ${error?.message ?? error}`);
+      return result;
+    }
+
+    for (const page of pages) {
+      try {
+        const raw = await readFile(path.join(dir, providerPageFileName(page)), 'utf8');
+        const parsed = JSON.parse(raw);
+        const candidate = parsed && typeof parsed === 'object' && parsed.page && typeof parsed.page === 'object'
+          ? parsed.page
+          : parsed;
+        const entry = normalizeProviderPage(candidate, 'unknown');
+        if (entry && entry.page === page) result.set(page, entry);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          // 损坏 / 半截文件：忽略并重取（下次写入会覆盖它）
+          ctx?.logger?.debug?.(`ignoring unreadable provider cache page ${page}: ${error?.message ?? error}`);
+        }
+      }
+    }
+
+    if (result.size > 0 && typeof cache.touch === 'function') {
+      try {
+        await cache.touch(nsKey({ role, provider, model, ocrMode }));
+      } catch {
+        /* touch 失败只影响 LRU 新鲜度，不影响结果 */
+      }
+    }
+    return result;
+  }
+
+  /**
+   * 把 provider 返回的页写回缓存（逐页原子写，最后登记条目）。
+   * 任何失败都只记 debug —— 缓存写坏不能把一次成功的解析变成失败。
+   *
+   * @param {{ role: string, provider: object, model: string|null, ocrMode: string, entries: object[] }} spec
+   * @returns {Promise<void>}
+   */
+  async function store({ role, provider, model, ocrMode, entries }) {
+    if (!Array.isArray(entries) || entries.length === 0) return;
+    const key = nsKey({ role, provider, model, ocrMode });
+    let dir;
+    try {
+      dir = await cache.prepareDir(key);
+      await writeFile(path.join(dir, 'namespace.json'), JSON.stringify(nsMeta({ role, provider, model, ocrMode })), 'utf8');
+      for (const entry of entries) {
+        if (!entry || !Number.isInteger(entry.page) || entry.page < 1) continue;
+        const target = path.join(dir, providerPageFileName(entry.page));
+        const temp = path.join(dir, `.tmp-page-${process.pid}-${randomBytes(6).toString('hex')}`);
+        try {
+          await writeFile(temp, JSON.stringify({ version: PROVIDER_CACHE_SCHEMA, page: entry }), 'utf8');
+          await rename(temp, target);
+        } catch (error) {
+          await rm(temp, { force: true }).catch(() => {});
+          throw error;
+        }
+      }
+      await cache.register(key);
+    } catch (error) {
+      ctx?.logger?.debug?.(`provider page cache write failed: ${error?.message ?? error}`);
+    }
+  }
+
+  return { lookup, store };
+}
+
 /**
  * 收集页文字（契约 v2 的逐页路由）。
  *
@@ -564,19 +737,32 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
     }
   };
 
-  /** 把 provider 结果写进 pageMap；只接受本次目标页。 */
+  /**
+   * 把 provider 结果写进 pageMap；只接受本次目标页。
+   * 返回实际写入的页对象（逐页落缓存时用）。
+   */
   const applyResult = (result, provider, { role, targetPages, fallbackOrigin, forceOrigin = null }) => {
     const wanted = new Set(targetPages);
-    let matched = 0;
+    const applied = [];
     for (const raw of Array.isArray(result?.pages) ? result.pages : []) {
       const entry = normalizeProviderPage(raw, fallbackOrigin);
       if (!entry || !wanted.has(entry.page)) continue;
       if (forceOrigin) entry.textOrigin = entry.text.trim() ? forceOrigin : 'unknown';
       setPage(entry);
-      matched += 1;
+      applied.push(entry);
     }
     markUsed(result, provider, role);
-    return matched;
+    return applied;
+  };
+
+  /** 把缓存命中的页写进 pageMap；命中也算「用到了 provider 的结果」。 */
+  const applyCached = (cached, provider, role) => {
+    let applied = 0;
+    for (const entry of cached.values()) {
+      if (setPage(entry)) applied += 1;
+    }
+    if (applied > 0) markUsed(null, provider, role);
+    return applied;
   };
 
   const useNativePage = (page) => {
@@ -622,32 +808,51 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
 
   let nativeLayerText = new Map();
 
+  // provider 结果按页缓存（9z5.30）：只读/写 MMGREP_CACHE_DIR；没有缓存时整条链路
+  // 与 9z5.28 完全一致（每次直接问 provider）。
+  const providerPageCache = ctx.cache && (ocrState.available || typesetState.available)
+    ? await openProviderPageCache(ctx, info)
+    : null;
+
   // 图片文档：一律走 OCR 角色（图片没有文字层）。
   if (info.kind === 'image') {
     ocrPageCount = pages.length;
     if (ocrState.available && pages.length > 0) {
-      try {
-        const provider = ctx.ocrProvider;
-        const result = await parseWithProvider({
-          provider,
-          role: 'ocr',
-          pages,
-          ocrMode: forceOcr ? 'force' : 'auto',
-          info,
-          ctx,
-        });
-        applyResult(result, provider, {
-          role: 'ocr',
-          targetPages: pages,
-          fallbackOrigin: 'ocr',
-          forceOrigin: forceOcr ? 'ocr' : null,
-        });
-      } catch (error) {
-        if (ctx.signal?.aborted) throw error;
-        providerErrors.ocr = toProviderFailure(error, ctx.config?.ocr?.apiKey ?? null);
-        warnings.push(
-          `OCR provider "${ocrState.id ?? 'unknown'}" failed: ${providerErrors.ocr.message}. Page images only.`,
-        );
+      const provider = ctx.ocrProvider;
+      const cacheRole = 'ocr';
+      const callOcrMode = forceOcr ? 'force' : 'auto';
+      const model = describeModel(provider);
+      const cached = providerPageCache
+        ? await providerPageCache.lookup({ role: cacheRole, provider, model, ocrMode: callOcrMode, pages })
+        : new Map();
+      applyCached(cached, provider, cacheRole);
+      const missing = pages.filter((page) => !cached.has(page));
+      if (missing.length > 0) {
+        try {
+          const result = await parseWithProvider({
+            provider,
+            role: 'ocr',
+            pages: missing,
+            ocrMode: callOcrMode,
+            info,
+            ctx,
+          });
+          const applied = applyResult(result, provider, {
+            role: 'ocr',
+            targetPages: missing,
+            fallbackOrigin: 'ocr',
+            forceOrigin: forceOcr ? 'ocr' : null,
+          });
+          if (providerPageCache) {
+            await providerPageCache.store({ role: cacheRole, provider, model, ocrMode: callOcrMode, entries: applied });
+          }
+        } catch (error) {
+          if (ctx.signal?.aborted) throw error;
+          providerErrors.ocr = toProviderFailure(error, ctx.config?.ocr?.apiKey ?? null);
+          warnings.push(
+            `OCR provider "${ocrState.id ?? 'unknown'}" failed: ${providerErrors.ocr.message}. Page images only.`,
+          );
+        }
       }
     }
   } else if (info.kind === 'pdf') {
@@ -670,29 +875,43 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
       textPageCount = 0;
       ocrPageCount = pages.length;
       // 9z5.31：强制重新识别 —— 所有请求页都交给 OCR provider，不走 typeset。
+      // 9z5.30：force 结果单独一个 namespace，不覆盖 auto / 文字层的结果。
       if (ocrState.available && pages.length > 0) {
-        try {
-          const provider = ctx.ocrProvider;
-          const result = await parseWithProvider({
-            provider,
-            role: 'ocr',
-            pages,
-            ocrMode: 'force',
-            info,
-            ctx,
-          });
-          applyResult(result, provider, {
-            role: 'ocr',
-            targetPages: pages,
-            fallbackOrigin: 'ocr',
-            forceOrigin: 'ocr',
-          });
-        } catch (error) {
-          if (ctx.signal?.aborted) throw error;
-          providerErrors.ocr = toProviderFailure(error, ctx.config?.ocr?.apiKey ?? null);
-          warnings.push(
-            `OCR provider "${ocrState.id ?? 'unknown'}" failed: ${providerErrors.ocr.message}. Page images only.`,
-          );
+        const provider = ctx.ocrProvider;
+        const cacheRole = 'ocr';
+        const callOcrMode = 'force';
+        const model = describeModel(provider);
+        const cached = providerPageCache
+          ? await providerPageCache.lookup({ role: cacheRole, provider, model, ocrMode: callOcrMode, pages })
+          : new Map();
+        applyCached(cached, provider, cacheRole);
+        const missing = pages.filter((page) => !cached.has(page));
+        if (missing.length > 0) {
+          try {
+            const result = await parseWithProvider({
+              provider,
+              role: 'ocr',
+              pages: missing,
+              ocrMode: callOcrMode,
+              info,
+              ctx,
+            });
+            const applied = applyResult(result, provider, {
+              role: 'ocr',
+              targetPages: missing,
+              fallbackOrigin: 'ocr',
+              forceOrigin: 'ocr',
+            });
+            if (providerPageCache) {
+              await providerPageCache.store({ role: cacheRole, provider, model, ocrMode: callOcrMode, entries: applied });
+            }
+          } catch (error) {
+            if (ctx.signal?.aborted) throw error;
+            providerErrors.ocr = toProviderFailure(error, ctx.config?.ocr?.apiKey ?? null);
+            warnings.push(
+              `OCR provider "${ocrState.id ?? 'unknown'}" failed: ${providerErrors.ocr.message}. Page images only.`,
+            );
+          }
         }
       } else {
         providerErrors.ocr = {
@@ -710,24 +929,121 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
 
       if (sameProvider) {
         // 同一 provider 担两个角色：只发一次 parse，按 textOrigin 分配。
+        // 有缓存时，两个角色分别查各自的 namespace，随后把缺失页合并成**一次**请求。
         const provider = ctx.ocrProvider ?? ctx.typesetProvider;
-        try {
-          const result = await parseWithProvider({
-            provider,
-            role: 'both',
-            pages,
-            ocrMode: 'auto',
-            textLayers: Object.fromEntries(textPages.map((page) => [page, nativeLayerText.get(page) ?? ''])),
-            info,
-            ctx,
-          });
-          applyResult(result, provider, {
-            role: 'both',
-            targetPages: pages,
-            fallbackOrigin: 'unknown',
-          });
+        const model = describeModel(provider);
+        const textSet = new Set(textPages);
+        const cachedText = providerPageCache
+          ? await providerPageCache.lookup({ role: 'typeset', provider, model, ocrMode: 'auto', pages: textPages })
+          : new Map();
+        const cachedOcr = providerPageCache
+          ? await providerPageCache.lookup({ role: 'ocr', provider, model, ocrMode: 'auto', pages: ocrPages })
+          : new Map();
+        applyCached(cachedText, provider, 'typeset');
+        applyCached(cachedOcr, provider, 'ocr');
+        const missingText = textPages.filter((page) => !cachedText.has(page));
+        const missingOcr = ocrPages.filter((page) => !cachedOcr.has(page));
+        const missing = [...missingText, ...missingOcr].sort((a, b) => a - b);
 
-          // typeset 的硬约束：有文字层的页必须保留原字符。
+        if (missing.length > 0) {
+          try {
+            const result = await parseWithProvider({
+              provider,
+              role: 'both',
+              pages: missing,
+              ocrMode: 'auto',
+              textLayers: missingText.length > 0
+                ? Object.fromEntries(missingText.map((page) => [page, nativeLayerText.get(page) ?? '']))
+                : undefined,
+              info,
+              ctx,
+            });
+            const applied = applyResult(result, provider, {
+              role: 'both',
+              targetPages: missing,
+              fallbackOrigin: 'unknown',
+            });
+            if (providerPageCache && applied.length > 0) {
+              // 一次 role:both 的结果按**该页实际路由到的角色**分桶落缓存：
+              // 有文字层 → typeset，无文字层 → ocr。以后单独走某角色的调用也能命中。
+              const byRole = { typeset: [], ocr: [] };
+              for (const entry of applied) byRole[textSet.has(entry.page) ? 'typeset' : 'ocr'].push(entry);
+              for (const [role, entries] of Object.entries(byRole)) {
+                if (entries.length > 0) {
+                  await providerPageCache.store({ role, provider, model, ocrMode: 'auto', entries });
+                }
+              }
+            }
+          } catch (error) {
+            if (ctx.signal?.aborted) throw error;
+            const failure = toProviderFailure(error, ctx.config?.ocr?.apiKey ?? null);
+            providerErrors.ocr = failure;
+            providerErrors.typeset = failure;
+            warnings.push(
+              `document provider "${ocrState.id ?? 'unknown'}" failed: ${failure.message}. `
+                + 'Fell back to the PDF text layer where one exists; pages without one are returned as page images only.',
+            );
+          }
+        }
+
+        // typeset 的硬约束：有文字层的页必须保留原字符（缓存命中的页同样检查）。
+        const reRecognized = textPages.filter((page) => {
+          const entry = pageMap.get(page);
+          return entry && entry.text.trim() && entry.textOrigin !== 'textlayer';
+        });
+        if (reRecognized.length > 0) {
+          warnings.push(
+            `typeset provider "${typesetState.id}" returned textOrigin "${pageMap.get(reRecognized[0]).textOrigin}" `
+              + `for ${reRecognized.length} page(s) that have a PDF text layer; characters may have been re-recognized.`,
+          );
+        }
+
+        // 有文字层但 provider 没给文本的页：用原生文字层补齐。
+        for (const page of textPages) {
+          if (!String(texts.get(page) ?? '').trim()) useNativePage(page);
+        }
+      } else {
+        // 两个角色由不同 provider 承担（或只有一个角色启用）。
+        // 9z5.30：每个角色单独查缓存，只把**缺失页**发给对应的 provider。
+        if (textPages.length > 0 && typesetState.available) {
+          const provider = ctx.typesetProvider;
+          const cacheRole = 'typeset';
+          const model = describeModel(provider);
+          const cachedText = providerPageCache
+            ? await providerPageCache.lookup({ role: cacheRole, provider, model, ocrMode: 'auto', pages: textPages })
+            : new Map();
+          applyCached(cachedText, provider, cacheRole);
+          const missingText = textPages.filter((page) => !cachedText.has(page));
+          if (missingText.length > 0) {
+            try {
+              const result = await parseWithProvider({
+                provider,
+                role: 'typeset',
+                pages: missingText,
+                ocrMode: 'auto',
+                textLayers: Object.fromEntries(missingText.map((page) => [page, nativeLayerText.get(page) ?? ''])),
+                info,
+                ctx,
+              });
+              const applied = applyResult(result, provider, {
+                role: 'typeset',
+                targetPages: missingText,
+                // 契约要求 typeset provider 显式返回 textOrigin；缺省时按保守值处理，
+                // 绝不能把「没声明」当成「保留了原字符」。
+                fallbackOrigin: 'unknown',
+              });
+              if (providerPageCache) {
+                await providerPageCache.store({ role: cacheRole, provider, model, ocrMode: 'auto', entries: applied });
+              }
+            } catch (error) {
+              if (ctx.signal?.aborted) throw error;
+              providerErrors.typeset = toProviderFailure(error, ctx.config?.typeset?.apiKey ?? null);
+              warnings.push(
+                `typeset provider "${typesetState.id ?? 'unknown'}" failed: ${providerErrors.typeset.message}. `
+                  + 'The PDF text layer was used instead where available.',
+              );
+            }
+          }
           const reRecognized = textPages.filter((page) => {
             const entry = pageMap.get(page);
             return entry && entry.text.trim() && entry.textOrigin !== 'textlayer';
@@ -738,59 +1054,6 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
                 + `for ${reRecognized.length} page(s) that have a PDF text layer; characters may have been re-recognized.`,
             );
           }
-        } catch (error) {
-          if (ctx.signal?.aborted) throw error;
-          const failure = toProviderFailure(error, ctx.config?.ocr?.apiKey ?? null);
-          providerErrors.ocr = failure;
-          providerErrors.typeset = failure;
-          warnings.push(
-            `document provider "${ocrState.id ?? 'unknown'}" failed: ${failure.message}. `
-              + 'Fell back to the PDF text layer where one exists; pages without one are returned as page images only.',
-          );
-        }
-        // 有文字层但 provider 没给文本的页：用原生文字层补齐。
-        for (const page of textPages) {
-          if (!String(texts.get(page) ?? '').trim()) useNativePage(page);
-        }
-      } else {
-        // 两个角色由不同 provider 承担（或只有一个角色启用）。
-        if (textPages.length > 0 && typesetState.available) {
-          try {
-            const provider = ctx.typesetProvider;
-            const result = await parseWithProvider({
-              provider,
-              role: 'typeset',
-              pages: textPages,
-              ocrMode: 'auto',
-              textLayers: Object.fromEntries(textPages.map((page) => [page, nativeLayerText.get(page) ?? ''])),
-              info,
-              ctx,
-            });
-            applyResult(result, provider, {
-              role: 'typeset',
-              targetPages: textPages,
-              // 契约要求 typeset provider 显式返回 textOrigin；缺省时按保守值处理，
-              // 绝不能把「没声明」当成「保留了原字符」。
-              fallbackOrigin: 'unknown',
-            });
-            const reRecognized = textPages.filter((page) => {
-              const entry = pageMap.get(page);
-              return entry && entry.text.trim() && entry.textOrigin !== 'textlayer';
-            });
-            if (reRecognized.length > 0) {
-              warnings.push(
-                `typeset provider "${typesetState.id}" returned textOrigin "${pageMap.get(reRecognized[0]).textOrigin}" `
-                  + `for ${reRecognized.length} page(s) that have a PDF text layer; characters may have been re-recognized.`,
-              );
-            }
-          } catch (error) {
-            if (ctx.signal?.aborted) throw error;
-            providerErrors.typeset = toProviderFailure(error, ctx.config?.typeset?.apiKey ?? null);
-            warnings.push(
-              `typeset provider "${typesetState.id ?? 'unknown'}" failed: ${providerErrors.typeset.message}. `
-                + 'The PDF text layer was used instead where available.',
-            );
-          }
         }
         // typeset=none 或失败 / 缺页：有文字层的页一律用原生文字层兜底（无警告）。
         for (const page of textPages) {
@@ -798,28 +1061,40 @@ async function collectPageTexts({ info, pages, ctx, pdfSupport, warnings, ocrMod
         }
 
         if (ocrPages.length > 0 && ocrState.available) {
-          try {
-            const provider = ctx.ocrProvider;
-            const result = await parseWithProvider({
-              provider,
-              role: 'ocr',
-              pages: ocrPages,
-              ocrMode: 'auto',
-              info,
-              ctx,
-            });
-            applyResult(result, provider, {
-              role: 'ocr',
-              targetPages: ocrPages,
-              fallbackOrigin: 'ocr',
-            });
-          } catch (error) {
-            if (ctx.signal?.aborted) throw error;
-            providerErrors.ocr = toProviderFailure(error, ctx.config?.ocr?.apiKey ?? null);
-            warnings.push(
-              `OCR provider "${ocrState.id ?? 'unknown'}" failed: ${providerErrors.ocr.message}. `
-                + 'Pages without a text layer are returned as page images only.',
-            );
+          const provider = ctx.ocrProvider;
+          const cacheRole = 'ocr';
+          const model = describeModel(provider);
+          const cachedOcr = providerPageCache
+            ? await providerPageCache.lookup({ role: cacheRole, provider, model, ocrMode: 'auto', pages: ocrPages })
+            : new Map();
+          applyCached(cachedOcr, provider, cacheRole);
+          const missingOcr = ocrPages.filter((page) => !cachedOcr.has(page));
+          if (missingOcr.length > 0) {
+            try {
+              const result = await parseWithProvider({
+                provider,
+                role: 'ocr',
+                pages: missingOcr,
+                ocrMode: 'auto',
+                info,
+                ctx,
+              });
+              const applied = applyResult(result, provider, {
+                role: 'ocr',
+                targetPages: missingOcr,
+                fallbackOrigin: 'ocr',
+              });
+              if (providerPageCache) {
+                await providerPageCache.store({ role: cacheRole, provider, model, ocrMode: 'auto', entries: applied });
+              }
+            } catch (error) {
+              if (ctx.signal?.aborted) throw error;
+              providerErrors.ocr = toProviderFailure(error, ctx.config?.ocr?.apiKey ?? null);
+              warnings.push(
+                `OCR provider "${ocrState.id ?? 'unknown'}" failed: ${providerErrors.ocr.message}. `
+                  + 'Pages without a text layer are returned as page images only.',
+              );
+            }
           }
         }
       }
