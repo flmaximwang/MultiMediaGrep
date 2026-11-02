@@ -38,6 +38,15 @@ import {
 import { splitSentences } from '../media/sentences.js';
 import { guardToolHandler } from './errors.js';
 import {
+  OUTLINE_IMAGE_CONTAINERS,
+  formatProbeOutline,
+  noOutlineMessage,
+  outlinePageArg,
+  outlineTimeArg,
+  renderOutlineBlock,
+  resolveReadOutline,
+} from './outline-view.js';
+import {
   DEFAULT_MAX_IMAGE_TOKENS,
   DEFAULT_MAX_TEXT_INLINE_CHARS,
   providerApiKeyEnv,
@@ -79,12 +88,16 @@ For audio it also reports a quick health check — average level, speech ratio a
 call on it. A recording that is effectively silent is reported as such and is never sent to ASR
 (no hallucinated transcript).
 
-It also reports the file's own outline when it has one: PDF bookmarks (each entry carries the
-PHYSICAL page number — the same 1-based page numbers media_overview accepts — and, when the PDF
-defines page labels, the printed label too, e.g. "xii") and chapter markers in video/audio files
-(title + start/end timestamps). The text output shows at most 2 levels / 60 entries; the full
-outline is in structuredContent.outline. Use it to pick a range instead of reading the whole
-file. (内置目录：PDF 书签带物理页与打印页标签；视频/音频列出章节时间戳。文本最多 2 层 / 60 条)
+It also shows ONE outline for the file, from the first available source: the bookmark sidecar
+("<file>.mmgrep.bookmark.json", written by media_bookmark) when one exists, otherwise the
+file's own outline — PDF bookmarks (PHYSICAL page numbers, the same 1-based numbers
+media_overview accepts) or chapter markers in video/audio (title + start/end timestamps).
+Every line carries a bookmark id ("b3  p.12  title" for PDFs, "b3  00:12:34  title" for
+video/audio) — these are the ids media_bookmark accepts. When a sidecar exists, the last
+outline line is "full detail: <sidecar path>": read that file for the complete outline.
+The text shows at most 2 levels / 60 entries; structuredContent.outline has every entry, the
+source and the sidecar path. Read-only: probing never creates or modifies a sidecar.
+(读取侧只展示一份目录：sidecar 优先，其次文件自带目录；行首 b1…bN 就是 media_bookmark 的 id)
 
 This server never downloads anything and never calls an LLM: you always pass a local absolute
 path, and it only prepares images and text for your own model to look at.`;
@@ -145,20 +158,24 @@ drops a whole page silently: pages that could not be represented are listed, and
 over-long unit is truncated with a trailing "…[+N chars]". Read content.md when you need the
 complete text.
 
-VIEW — the view parameter controls the inline text (default "auto"). Many files carry a real
-outline: PDF bookmarks, or chapter markers in video/audio. (1) "auto": if the requested range
-fits, you get the full text; if it does not fit and the file has an outline, the outline comes
-first (page numbers for PDFs, timestamps for chapters) and the rest of the budget goes to the
-text preview; if there is no outline, you get the normal skim/sampled preview. A document
-without bookmarks gets an outline GENERATED FROM ITS HEADINGS when the range has at least 5
-headings, labelled "outline: generated from headings" (best-effort). (2) "outline": return only
-the outline — generated from headings for a document without bookmarks; for video/audio without
-chapters you get an explicit "no chapters" message and NOTHING is generated, because this server
-never invents an outline from content. In that case read the overview (or a start/end window)
-and write your own outline from the time-aligned text and storyboard grids. (3) "text": ignore
-the outline and force the text pipeline. The full outline is always in structuredContent.outline
-and, for an overview that writes an export, in manifest.json.
-(目录：view:auto 放不下时先出目录；view:outline 只出目录；view:text 只出文本。视频/音频没有章节时不生成目录)
+VIEW — the view parameter controls the inline text (default "auto"). The result carries ONE
+outline from the first available source: the bookmark sidecar ("<file>.mmgrep.bookmark.json",
+written by media_bookmark) when one exists, otherwise the file's own outline (PDF bookmarks, or
+chapter markers in video/audio); a document without bookmarks may get an outline GENERATED FROM
+ITS HEADINGS when the range has at least 5 headings, labelled "outline: generated from
+headings" (best-effort). (1) "auto": if the requested range fits, you get the full text; if it
+does not fit and there is an outline, the outline comes first (ids b1…bN with page numbers for
+PDFs, timestamps for chapters) and the rest of the budget goes to the text preview; if there is
+no outline, you get the normal skim/sampled preview. (2) "outline": return only the outline —
+generated from headings for a document without bookmarks; for video/audio without chapters you
+get an explicit "no chapters" message and NOTHING is generated, because this server never
+invents an outline from content. In that case read the overview (or a start/end window) and
+write your own outline from the time-aligned text and storyboard grids. (3) "text": ignore the
+outline and force the text pipeline. The full outline (entries, source, sidecar path) is always
+in structuredContent.outline and, for an overview that writes an export, in manifest.json. When
+a sidecar exists its last outline line is "full detail: <sidecar path>" — read that file for the
+complete bookmark detail.
+(目录：sidecar 优先，其次文件自带目录，最后才是 heading 生成；view:auto 放不下时先出目录；view:outline 只出目录；view:text 只出文本)
 
 Always call media_probe first: it tells you how long the file is, whether a subtitle source
 exists, which transcript source applies, and whether the file carries a built-in outline
@@ -216,7 +233,15 @@ says so instead of guessing. Use media_overview if you only need the visuals.
 
 Each match is tagged with its source. A match whose source is "asr" came from machine
 transcription, so the wording may be wrong (names, numbers, jargon) — do not present it as the
-speaker's exact words.`;
+speaker's exact words.
+
+The result also carries the same single outline as media_probe / media_overview in
+structuredContent.outline: the bookmark sidecar first, then the file's own PDF bookmarks or
+chapter markers. Its ids (b1…bN) are the ids media_bookmark accepts, and when a sidecar exists
+the last outline line is "full detail: <sidecar path>". Locate is read-only: it never creates or
+modifies a sidecar.
+(定位结果也带同一份目录：sidecar 优先，其次文件自带目录；line 首 b1…bN 可用于 media_bookmark)`;
+
 
 export const BOOKMARK_DESCRIPTION = `Write bookmarks (an outline, chapters) into a local media file so they survive across sessions and are
 visible to humans in the file itself: the PDF outline for a PDF, a sidecar VTT for video/audio, and a
@@ -289,11 +314,13 @@ const PAGES_PARAM = z.string().optional().describe(
 
 const VIEW_PARAM = z.enum(['auto', 'outline', 'text']).optional().describe(
   'What to put in the inline text. "auto" (default): the full text of the requested range when it fits; otherwise, '
-  + 'when the file has a built-in outline (PDF bookmarks, video/audio chapters) or the document has at least 5 headings, '
-  + 'the outline comes first and the remaining budget goes to a text preview; files without an outline use the normal '
-  + 'skim/sampled preview. "outline": return only the outline (generated from headings for a document without bookmarks; '
-  + 'an explicit "no chapters" message for video/audio — this server never invents an outline from content). '
-  + '"text": force the text pipeline and ignore any outline. (返回内容：auto 自动；outline 只出目录；text 只出文本)',
+  + 'when there is an outline (the bookmark sidecar when it exists, otherwise PDF bookmarks / video-audio chapters, '
+  + 'or ≥ 5 document headings), the outline comes first and the remaining budget goes to a text preview; files '
+  + 'without an outline use the normal skim/sampled preview. "outline": return only that same single outline '
+  + '(generated from headings for a document without bookmarks; an explicit "no chapters" message for video/audio — '
+  + 'this server never invents an outline from content). "text": force the text pipeline and ignore any outline. '
+  + 'The sidecar wins over the file\'s own outline, and its last outline line is "full detail: <sidecar path>". '
+  + '(返回内容：auto 自动；outline 只出目录（sidecar 优先）；text 只出文本)',
 );
 
 const OCR_PARAM = z.enum(['auto', 'force']).optional().describe(
@@ -1483,83 +1510,12 @@ function planOverviewPreview({
   };
 }
 
-/* ---------------- overview 的目录装配（9z5.33） ----------------
+/* ---------------- overview 的目录装配（9z5.37.6） ----------------
  *
- * 顺序：内置目录（PDF 书签 / 章节）优先；文档没有书签时才从契约 v2 blocks 的
- * heading 生成（>= 5 条）。视频/录音**不生成**：没有章节就返回 available=false
- * 与一句人话原因，view:"outline" 时把原因当正文返回。
+ * 读取侧的目录统一在 ./outline-view.js 里装配：sidecar → 文件自带目录
+ * （PDF 书签 / 章节）→ 从 blocks 的 heading 生成（文档，>= 5 条）。
+ * 这里只负责把结果交给格式化 / 落盘，不再重复实现来源优先级。
  */
-const GENERATED_OUTLINE_MIN_HEADINGS = 5;
-function buildBuiltInOverviewOutline(mediaType, probeOutline) {
-  if (!probeOutline || typeof probeOutline !== 'object' || !probeOutline.available) return null;
-  const entries = Array.isArray(probeOutline.entries) ? probeOutline.entries : [];
-  if (entries.length === 0) return null;
-  return {
-    available: true,
-    source: probeOutline.source ?? (mediaType === 'document' ? 'pdf-bookmarks' : 'chapters'),
-    generated: false,
-    total: entries.length,
-    entries,
-    reason: null,
-  };
-}
-
-/** 从契约 v2 blocks 的 heading 生成目录；少于 5 条不算目录（9z5.33 拍板）。 */
-function buildGeneratedOverviewOutline(mediaType, segments) {
-  if (mediaType !== 'document') return null;
-  const entries = [];
-  for (const segment of Array.isArray(segments) ? segments : []) {
-    const page = segment?.page ?? segment?.index ?? null;
-    for (const block of Array.isArray(segment?.blocks) ? segment.blocks : []) {
-      if (block?.type !== 'heading') continue;
-      const title = String(block.text ?? '').trim();
-      if (!title) continue;
-      const level = Number.isInteger(block.level) && block.level > 0 ? Math.min(block.level, 6) : 1;
-      entries.push({ level, title, page });
-    }
-  }
-  if (entries.length < GENERATED_OUTLINE_MIN_HEADINGS) return null;
-  return {
-    available: true,
-    source: 'headings',
-    generated: true,
-    total: entries.length,
-    entries,
-    reason: null,
-  };
-}
-
-function buildOverviewOutline({ mediaType, probeOutline, segments }) {
-  const builtIn = buildBuiltInOverviewOutline(mediaType, probeOutline);
-  if (builtIn) return builtIn;
-  const generated = buildGeneratedOverviewOutline(mediaType, segments);
-  if (generated) return generated;
-  const reason = mediaType === 'document'
-    ? `this document has no PDF bookmarks (${probeOutline?.reason ?? 'no outline found'}) and fewer than ${GENERATED_OUTLINE_MIN_HEADINGS} headings in the requested pages`
-    : (probeOutline?.reason ?? 'this file has no chapters (no chapter metadata in the container)');
-  return {
-    available: false,
-    source: null,
-    generated: false,
-    total: 0,
-    entries: [],
-    reason,
-  };
-}
-
-/** view:"outline" 但没有目录时的正文（视频/录音必须明确说「没有章节」，不生成内容）。 */
-function noOutlineMessage(outline, mediaType) {
-  const reason = String(outline?.reason ?? '').trim().replace(/\.$/, '');
-  if (mediaType === 'document') {
-    return `outline: none — ${reason || 'no bookmarks and fewer than 5 headings'}. `
-      + 'This server does not invent an outline from unstructured text. Use view:"auto" or view:"text" '
-      + 'to read the text preview, or read content.md and write your own outline.';
-  }
-  return `outline: none — no chapters: ${reason || 'this file has no chapters (no chapter metadata in the container)'}. `
-    + 'This server never generates an outline for video or audio (it does not call an LLM). '
-    + 'Read media_overview({ path }) or a start/end window, then write your own outline from the '
-    + 'time-aligned text and the storyboard grids.';
-}
 
 /** 最后一道保险：任何情况下 text 长度 <= 上限（极端小上限时截断并标注） */
 function clampInlineText(text, limit) {
@@ -1633,150 +1589,12 @@ function formatTextLayerLine(result) {
   return 'text layer: yes.';
 }
 
-/* ---------------- 内置目录（9z5.33） ----------------
+/* ---------------- 内置目录（9z5.33 → 9z5.37.6） ----------------
  *
- * PDF 书签（outline）与视频/录音章节是文件自带的真实元数据，是 overview 最好
- * 的起点。probe 文本最多展示 2 层 / 60 条，其余写 "+N more"；完整目录进
- * structuredContent.outline（overview 还进 manifest.json）。
- *
- * 文档没有书签时，overview 可以从契约 v2 blocks 的 heading 生成目录（>= 5 条
- * 才算），并标注 "generated from headings"。视频/录音**不生成**目录：没有章节
- * 就是没有，server 不调 LLM。
+ * 目录的装配、行格式与预算渲染都搬到了 ./outline-view.js：读取侧统一展示一份
+ * 目录（sidecar → PDF 书签 / 章节 → heading 生成），行格式与 media_bookmark
+ * 完全一致。这里只保留 probe 文本的拼装与 overview 的预算分配。
  */
-const PROBE_OUTLINE_MAX_DEPTH = 2;
-const PROBE_OUTLINE_MAX_ENTRIES = 60;
-
-function isPdfPath(filePath) {
-  return /\.pdf$/i.test(String(filePath ?? ''));
-}
-
-function clampOutlineTitle(title, max = 120) {
-  const text = String(title ?? '').replace(/\s+/g, ' ').trim();
-  return text.length > max ? `${text.slice(0, max)}…` : text;
-}
-
-/** 书签 / 标题 / 章节条目 → 一行文本（层级只影响缩进） */
-function formatOutlineEntry(entry, mediaType) {
-  const level = Math.max(0, Math.min(Number(entry?.level) || 1, 6) - 1);
-  const indent = '  '.repeat(level);
-  if (mediaType === 'document') {
-    const page = Number.isInteger(entry?.page) ? `page ${entry.page}` : 'page ?';
-    const label = entry.label && entry.label !== String(entry.page) ? ` (label "${entry.label}")` : '';
-    return `${indent}- ${clampOutlineTitle(entry?.title)}  — ${page}${label}`;
-  }
-  const start = formatTimestamp(entry?.startMs);
-  const end = entry?.endMs === null || entry?.endMs === undefined ? '' : `-${formatTimestamp(entry.endMs)}`;
-  return `${indent}- ${clampOutlineTitle(entry?.title)}  ${start}${end}`;
-}
-
-/** 目录标题：probe 与 overview 的说法不同（probe 不写 manifest，overview 要指路） */
-function outlineHeader(outline, mediaType, target, total) {
-  const single = total === 1;
-  const unit = mediaType === 'document'
-    ? (single ? 'entry' : 'entries')
-    : (single ? 'chapter' : 'chapters');
-  if (target === 'probe') {
-    if (outline.generated) return `outline: generated from headings — ${total} ${unit} — use the outline to pick a range`;
-    return `outline: ${total} ${mediaType === 'document' ? `PDF bookmark${single ? '' : 's'}` : unit} — use the outline to pick a range`;
-  }
-  if (outline.generated) {
-    return `outline: generated from headings — ${total} ${unit} (best-effort: built from block structure; full outline in structuredContent.outline and manifest.json)`;
-  }
-  return `outline: ${total} ${mediaType === 'document' ? `PDF bookmark${single ? '' : 's'}` : unit} — full outline in structuredContent.outline and manifest.json`;
-}
-
-/** 文档目录的示例页码范围：第一条有页码的书签往后 4 页（不超过总页数） */
-function outlinePageArg(outline, pageCount) {
-  const entry = (outline?.entries ?? []).find((item) => Number.isInteger(item?.page));
-  if (!entry) return null;
-  const start = entry.page;
-  const end = Number.isInteger(pageCount) && pageCount >= start ? Math.min(pageCount, start + 4) : start + 4;
-  return end > start ? `${start}-${end}` : String(start);
-}
-
-/** 视频/录音目录的示例时间范围：第一章的起点到终点（没有终点时给 5 分钟） */
-function outlineTimeArg(outline) {
-  const entry = (outline?.entries ?? []).find((item) => Number.isFinite(item?.startMs));
-  if (!entry) return { start: 0, end: 300 };
-  const start = Number((entry.startMs / 1000).toFixed(2));
-  const endMs = Number.isFinite(entry.endMs) ? entry.endMs : entry.startMs + 300_000;
-  return { start, end: Number((Math.max(endMs, entry.startMs + 1000) / 1000).toFixed(2)) };
-}
-
-/**
- * 目录块渲染（带预算）。maxDepth / maxEntries 控展示量，maxChars 控字符预算。
- * 返回的 inlined 是**真正写进文本**的条目数；total 是目录条目总数。
- */
-function renderOutlineBlock(outline, {
-  mediaType, pageCount = null, target = 'overview', maxDepth = Infinity, maxEntries = Infinity, maxChars = Infinity,
-}) {
-  const entries = Array.isArray(outline?.entries) ? outline.entries : [];
-  const total = Number.isInteger(outline?.total) ? outline.total : entries.length;
-  const header = outlineHeader(outline, mediaType, target, total);
-  let footer = '';
-  if (target === 'overview') {
-    if (mediaType === 'document') {
-      const arg = outlinePageArg(outline, pageCount);
-      if (arg) footer = `hint: pick a range with pages, e.g. media_overview({ path, pages: "${arg}" }).`;
-    } else if (entries.length > 0) {
-      const arg = outlineTimeArg(outline);
-      footer = `hint: pick a range with start/end, e.g. media_overview({ path, start: ${arg.start}, end: ${arg.end} }).`;
-    }
-  }
-
-  const lines = [];
-  let used = header.length;
-  let inlined = 0;
-  for (const entry of entries) {
-    if (Number(entry?.level) > maxDepth) continue;
-    if (inlined >= maxEntries) break;
-    const line = formatOutlineEntry(entry, mediaType);
-    if (used + 1 + line.length > maxChars) break;
-    lines.push(line);
-    used += 1 + line.length;
-    inlined += 1;
-  }
-
-  const hidden = Math.max(0, total - inlined);
-  if (hidden > 0) {
-    const more = target === 'probe'
-      ? `  +${hidden} more (full outline in structuredContent.outline)`
-      : `  +${hidden} more entries (full outline in structuredContent.outline and manifest.json)`;
-    if (used + 1 + more.length <= maxChars || lines.length === 0) {
-      lines.push(more);
-      used += 1 + more.length;
-    }
-  } else if (inlined === 0 && total > 0 && target === 'overview') {
-    lines.push('  (no entry fits the inline budget; read the full outline in structuredContent.outline / manifest.json)');
-  }
-
-  let text = [header, ...lines].join('\n');
-  if (footer && text.length + 1 + footer.length <= maxChars) {
-    text += `\n${footer}`;
-  }
-  return { text, inlined, total, hidden };
-}
-
-/** probe 文本里的目录行：有目录就列，没有就明说（PDF / 章节）。 */
-function formatProbeOutline(result) {
-  const outline = result.outline;
-  if (!outline || typeof outline !== 'object') return [];
-  if (outline.available) {
-    const block = renderOutlineBlock(outline, {
-      mediaType: result.mediaType,
-      pageCount: result.pageCount,
-      target: 'probe',
-      maxDepth: PROBE_OUTLINE_MAX_DEPTH,
-      maxEntries: PROBE_OUTLINE_MAX_ENTRIES,
-    });
-    return block.text.split('\n');
-  }
-  if (result.mediaType === 'document') {
-    if (!isPdfPath(result.path)) return [];
-    return [`outline: none — ${outline.reason ?? 'this PDF has no bookmarks.'}`];
-  }
-  return [`chapters: none — ${outline.reason ?? 'this file has no chapters.'}`];
-}
 
 function formatProbeText(result) {
   const mediaType = result.mediaType;
@@ -1857,7 +1675,9 @@ function formatProbeText(result) {
   const recommended = result.recommended ?? {};
   if (result.outline?.available) {
     // 有目录时先教 agent 用目录收窄范围（pages / start,end 两种写法）。
-    if (mediaType === 'document') {
+    if (result.outline.media === 'image') {
+      lines.push('How to read: use the outline to name regions; media_overview({ path }) or media_zoom({ path, page: 1 }) shows the picture.');
+    } else if (mediaType === 'document') {
       const arg = outlinePageArg(result.outline, result.pageCount) ?? '1-10';
       lines.push(`How to read: use the outline to pick a range, e.g. media_overview({ path, pages: "${arg}" }).`);
     } else {
@@ -1989,7 +1809,7 @@ function formatOverviewText({
   if (viewMode === 'outline') {
     // 只出目录：没有目录时给明确的「没有」说明，绝不生成视频/录音目录。
     const block = hasOutline
-      ? renderOutlineBlock(outline, { mediaType, pageCount, target: 'overview', maxChars: Math.max(1, capacity) })
+      ? renderOutlineBlock(outline, { pageCount, target: 'overview', maxChars: Math.max(1, capacity) })
       : { text: noOutlineMessage(outline, mediaType), inlined: 0, total: 0 };
     plan = {
       mode: 'outline',
@@ -2020,7 +1840,6 @@ function formatOverviewText({
     if (viewMode === 'auto' && hasOutline && firstPlan.preview.mode !== 'whole') {
       // 放不下且有目录：目录先占预算（最多一半），余量再交给 skim / 抽样。
       const block = renderOutlineBlock(outline, {
-        mediaType,
         pageCount,
         target: 'overview',
         maxChars: Math.max(1, Math.floor(capacity * 0.5)),
@@ -2291,6 +2110,14 @@ async function handleProbe(args, call) {
   const result = (await call.dispatcher.call(base.mediaType, 'probe', input, call.backendCtx)) ?? {};
   const mediaType = refineMediaType(result, base.mediaType);
   const normalized = normalizeProbeResult(result, { ...base, mediaType }, call);
+  // 9z5.37.6：读取侧只展示一份目录——sidecar（存在且可用）优先，其次文件自带目录
+  // （PDF 书签 / 容器章节）。只读，绝不创建 sidecar。
+  normalized.outline = await resolveReadOutline({
+    filePath: base.path,
+    mediaType,
+    container: normalized.container,
+    probeOutline: normalized.outline,
+  });
 
   return {
     content: [{ type: 'text', text: formatProbeText(normalized) }],
@@ -2519,10 +2346,15 @@ async function handleOverview(args, call) {
   // text 只内联预算内的部分。内置目录来自 probe（PDF 书签 / 章节），文档没有
   // 书签时才从 blocks 的 heading 生成（>= 5 条）。
   const view = args.view === 'outline' || args.view === 'text' ? args.view : 'auto';
-  const outline = buildOverviewOutline({
+  // 9z5.37.6：唯一的读取侧目录（sidecar → 文件自带 → heading 生成）。装配发生在
+  // 落盘与格式化之前：manifest.json 要拿到**完整**目录，text 只内联预算内的部分。
+  const outline = await resolveReadOutline({
+    filePath: base.path,
     mediaType,
+    container: probe.container,
     probeOutline: probe.outline,
     segments,
+    includeGenerated: true,
   });
   const rawImages = Array.isArray(result.images) ? result.images : [];
   const { blocks, descriptors } = plan
@@ -3026,10 +2858,20 @@ async function handleLocate(args, call) {
     morePages: plan ? plan.morePages : null,
   });
 
+  // 9z5.37.6：locate 也展示同一份目录（只读；不生成 heading 目录）。文本仍是
+  // 命中结果，目录只进 structuredContent，避免出现第二份/互相矛盾的时间轴。
+  const outline = await resolveReadOutline({
+    filePath: base.path,
+    mediaType,
+    container: probe.container,
+    probeOutline: probe.outline,
+  });
+
   const structuredContent = {
     mediaType,
     path: base.path,
     query: args.query,
+    outline,
     transcriptSource,
     transcriptOrigin,
     matches: shownMatches,
@@ -3124,9 +2966,6 @@ function buildDocumentMatches(matches, query) {
  * 本层只负责：路径/媒体判定、把 MCP 参数交给引擎、把结果变成文本 + structuredContent。
  * ------------------------------------------------------------------ */
 
-/** document probe 的 container → 图片（图片没有自带目录，只写 sidecar） */
-const BOOKMARK_IMAGE_CONTAINERS = new Set(['png', 'jpeg', 'jpg', 'gif', 'tiff', 'tif', 'webp', 'bmp']);
-
 /** 探测结果 → 书签媒体类型（pdf / video / audio / image），其它一律拒绝 */
 function bookmarkMediaType(base, probed) {
   const mediaType = refineMediaType(probed, base.mediaType);
@@ -3134,7 +2973,7 @@ function bookmarkMediaType(base, probed) {
   if (mediaType === 'document') {
     const container = typeof probed?.container === 'string' ? probed.container.toLowerCase() : '';
     if (container === 'pdf') return 'pdf';
-    if (BOOKMARK_IMAGE_CONTAINERS.has(container)) return 'image';
+    if (OUTLINE_IMAGE_CONTAINERS.has(container)) return 'image';
     throw new ToolError(
       'UNSUPPORTED_MEDIA_TYPE',
       `media_bookmark does not support this document (container: ${container || 'unknown'}).`,

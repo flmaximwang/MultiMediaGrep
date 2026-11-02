@@ -143,7 +143,7 @@ test('带书签的 PDF：probe 列出书签、物理页与打印页标签', { sk
     assert.equal(data.outline.entries.length, OUTLINE_GT.outline.total);
 
     const introduction = data.outline.entries.find((entry) => entry.title === '1. Introduction');
-    assert.deepEqual(introduction, { level: 1, title: '1. Introduction', page: 1, label: 'i' });
+    assert.deepEqual(introduction, { id: 'b1', level: 1, title: '1. Introduction', page: 1, label: 'i' });
     const methods = data.outline.entries.find((entry) => entry.title === '3. Methods');
     assert.equal(methods.page, 5);
     assert.equal(methods.label, '3');
@@ -152,9 +152,13 @@ test('带书签的 PDF：probe 列出书签、物理页与打印页标签', { sk
     assert.equal(deepDive.page, 5);
     assert.equal(deepDive.label, '3');
 
-    assert.match(text, /^outline: 68 PDF bookmarks — use the outline to pick a range$/m);
-    assert.match(text, /^- 1\. Introduction  — page 1 \(label "i"\)$/m);
-    assert.match(text, /^- 3\. Methods  — page 5 \(label "3"\)$/m);
+    // 统一行格式（9z5.37.6）：bN + 物理页；打印页标签只留在 structuredContent。
+    assert.match(text, /^outline: PDF outline — 68 entries — use the outline to pick a range$/m);
+    assert.match(text, /^b1  p\.1  1\. Introduction$/m);
+    assert.match(text, /^b23  p\.5  3\. Methods$/m);
+    // probe 文本最多 2 层：level 2 → 两个空格缩进；level 3 只在 structuredContent。
+    assert.match(text, /^ {2}b2  p\.1  1\.1 Setup$/m);
+    assert.doesNotMatch(text, /Deep dive/);
     assert.match(text, /^How to read: use the outline to pick a range, e\.g\. media_overview\(\{ path, pages: "1-5" \}\)\.$/m);
   });
 });
@@ -194,7 +198,7 @@ test('view:auto 短范围：请求范围放得下就给全文，不插目录', {
 
     assert.equal(data.preview.mode, 'whole');
     assert.match(text, /^note: complete text of page 1 \(nothing omitted\)\.$/m);
-    assert.doesNotMatch(text, /^outline: 68 PDF bookmarks/m);
+    assert.doesNotMatch(text, /^outline: PDF outline/m);
     // 目录仍然在 structuredContent（文件元数据），只是没有占正文预算
     assert.equal(data.outline.total, OUTLINE_GT.outline.total);
     assert.equal(data.preview.outlineInlined, 0);
@@ -208,13 +212,13 @@ test('view:auto 超预算：带书签的文档先出目录，再给文本预览'
     const data = result.structuredContent;
 
     assert.ok(text.length <= 24000, `text is ${text.length} chars`);
-    assert.match(text, /^outline: 68 PDF bookmarks — full outline in structuredContent\.outline and manifest\.json$/m);
+    assert.match(text, /^outline: PDF outline — 68 entries — full outline in structuredContent\.outline and manifest\.json$/m);
     assert.ok(['skim', 'sampled'].includes(data.preview.mode));
     assert.equal(data.preview.outlineSource, 'pdf-bookmarks');
     assert.ok(data.preview.outlineInlined > 0);
     assert.equal(data.outline.total, OUTLINE_GT.outline.total);
     assert.ok(
-      text.indexOf('outline: 68 PDF bookmarks') < text.indexOf('preview: '),
+      text.indexOf('outline: PDF outline') < text.indexOf('preview: '),
       'the outline must come before the text preview',
     );
 
@@ -225,7 +229,7 @@ test('view:auto 超预算：带书签的文档先出目录，再给文本预览'
     assert.equal(manifest.outline.entries.length, OUTLINE_GT.outline.total);
     assert.deepEqual(
       manifest.outline.entries.find((entry) => entry.title === '1. Introduction'),
-      { level: 1, title: '1. Introduction', page: 1, label: 'i' },
+      { id: 'b1', level: 1, title: '1. Introduction', page: 1, label: 'i' },
     );
   });
 });
@@ -237,7 +241,7 @@ test('view:text 超预算：忽略目录，仍走 skim/抽样文本管线', { sk
     const data = result.structuredContent;
 
     assert.ok(text.length <= 24000, `text is ${text.length} chars`);
-    assert.doesNotMatch(text, /^outline: 68 PDF bookmarks/m);
+    assert.doesNotMatch(text, /^outline: PDF outline/m);
     assert.ok(['skim', 'sampled'].includes(data.preview.mode));
     assert.equal(data.preview.mode, 'skim');
     assert.match(text, /^preview: skim/m);
@@ -256,8 +260,9 @@ test('view:outline 无内置目录、>= 5 个 heading：返回 heading 生成的
     assert.equal(data.outline.generated, true);
     assert.equal(data.outline.total, HEADINGS_GT.headings.length);
     assert.match(text, new RegExp(`^outline: generated from headings — ${HEADINGS_GT.headings.length} entries `, 'm'));
-    assert.match(text, /^\s+- 1\.1 Scope  — page 1$/m);
-    assert.match(text, /^- 3\. Results  — page 3$/m);
+    // 统一行格式：heading level 2 → 两个空格缩进 + bN + 物理页。
+    assert.match(text, /^ {2}b\d+  p\.1  1\.1 Scope$/m);
+    assert.match(text, /^b\d+  p\.3  3\. Results$/m);
     assert.equal(data.preview.mode, 'outline');
     assert.equal(data.preview.outlineSource, 'headings');
     assert.equal(data.preview.outlineInlined, HEADINGS_GT.headings.length);
@@ -299,14 +304,23 @@ test('带章节的 mp4：probe 列出章节标题与时间戳', { skip: skipChap
     assert.equal(data.outline.available, true);
     assert.equal(data.outline.source, 'chapters');
     assert.equal(data.outline.total, CHAPTERS_GT.chapters.length);
+    // 章节条目 = media_bookmark 的条目模型：id + start/end（秒）。
     assert.deepEqual(
-      data.outline.entries.map((entry) => ({ title: entry.title, startMs: entry.startMs, endMs: entry.endMs })),
-      CHAPTERS_GT.chapters,
+      data.outline.entries.map((entry) => ({
+        id: entry.id, title: entry.title, start: entry.start, end: entry.end,
+      })),
+      CHAPTERS_GT.chapters.map((chapter, index) => ({
+        id: `b${index + 1}`,
+        title: chapter.title,
+        start: chapter.startMs / 1000,
+        end: chapter.endMs / 1000,
+      })),
     );
-    assert.match(text, /^outline: 4 chapters — use the outline to pick a range$/m);
-    for (const chapter of CHAPTERS_GT.chapters) {
-      assert.match(text, new RegExp(`^- ${chapter.title}  \\d{2}:\\d{2}\\.\\d{3}-\\d{2}:\\d{2}\\.\\d{3}$`, 'm'));
-    }
+    assert.match(text, /^outline: container chapters — 4 chapters — use the outline to pick a range$/m);
+    assert.match(text, /^b1  00:00  Opening$/m);
+    assert.match(text, /^b2  00:02  Build Up$/m);
+    assert.match(text, /^b3  00:05  Main Section$/m);
+    assert.match(text, /^b4  00:09  Wrap Up$/m);
     assert.match(text, /^How to read: use the outline to pick a range, e\.g\. media_overview\(\{ path, start: 0, end: 2 \}\)\.$/m);
   });
 });
@@ -326,6 +340,6 @@ test('视频无章节 + view:outline：明确说「无章节」，不生成任�
     assert.equal(data.segments.length, 0);
     assert.match(text, /^outline: none — no chapters: this file has no chapters/m);
     assert.match(text, /does not call an LLM/);
-    assert.doesNotMatch(text, /^- .*00:0\d\./m);
+    assert.doesNotMatch(text, /^b\d+  \d{2}:\d{2}  /m);
   });
 });
