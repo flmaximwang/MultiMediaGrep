@@ -18,6 +18,8 @@ import { z } from 'zod';
 import { formatTimestamp } from '../export/format.js';
 import { exportAnalysis } from '../export/index.js';
 import { detectMediaType } from '../media/detect.js';
+import { DOC_SNIPPET_RADIUS, buildSnippet, countHits } from '../media/match.js';
+import { ROLLING_SUBTITLE_WARNING } from '../media/subtitles.js';
 import {
   METHOD_MATRIX,
   ToolError,
@@ -27,11 +29,13 @@ import {
   validatePath,
   validateTimeRange,
 } from '../media/interface.js';
+import { splitSentences } from '../media/sentences.js';
 import { guardToolHandler } from './errors.js';
 import {
   DEFAULT_MAX_IMAGE_TOKENS,
   DEFAULT_MAX_TEXT_INLINE_CHARS,
   providerApiKeyEnv,
+  providerEnv,
 } from './config.js';
 import {
   IMAGE_LIMITS,
@@ -59,10 +63,22 @@ nothing. Then pick the right next tool:
 - a specific moment or page -> media_zoom for a close-up
 - "where was X said / on which page" -> media_locate for a timestamp or a page number
 
+For documents it also checks whether the text layer looks unreliable — U+FFFD replacement
+characters, private-use characters, isolated single letters, symbol noise — and, when it does,
+points at media_overview({ path, ocr: "force" }) to re-recognize the pages.
+(文档文字层看起来不可靠时会提示，可用 ocr: "force" 强制重新识别)
+
 For audio it also reports a quick health check — average level, speech ratio and silence ratio
 — so you know whether the recording actually contains audible speech before you spend an ASR
 call on it. A recording that is effectively silent is reported as such and is never sent to ASR
 (no hallucinated transcript).
+
+It also reports the file's own outline when it has one: PDF bookmarks (each entry carries the
+PHYSICAL page number — the same 1-based page numbers media_overview accepts — and, when the PDF
+defines page labels, the printed label too, e.g. "xii") and chapter markers in video/audio files
+(title + start/end timestamps). The text output shows at most 2 levels / 60 entries; the full
+outline is in structuredContent.outline. Use it to pick a range instead of reading the whole
+file. (内置目录：PDF 书签带物理页与打印页标签；视频/音频列出章节时间戳。文本最多 2 层 / 60 条)
 
 This server never downloads anything and never calls an LLM: you always pass a local absolute
 path, and it only prepares images and text for your own model to look at.`;
@@ -72,10 +88,15 @@ export const OVERVIEW_DESCRIPTION = `Build an overview of a local media file so 
 
 What you get depends on the media:
 - video    : one or more numbered storyboard grids (each cell carries its cell number) plus a
-             time-aligned text index of every cell
+             time-aligned text index of the cells
 - audio    : a timestamped transcript, segment by segment
-- document : a grid of page thumbnails plus the text of each page, when a document parser is
-             configured
+- document : a grid of page thumbnails plus page text, when a document parser is configured
+
+For DOCUMENTS, ocr: "auto" (default) uses the PDF text layer where one exists and calls the OCR
+provider only for pages without one; ocr: "force" re-recognizes every requested page with the
+OCR provider, even pages that already have a text layer, and tags them (ocr). Use force when
+media_probe says "text layer: looks unreliable" or when the extracted text is visibly garbled.
+Forced results are cached separately from auto. (文档：ocr: "force" = 强制重新 OCR / 重新识别文字层)
 
 Pass images: 0 for a text-only, zero-pixel overview: no grid is rendered and no frame is
 decoded (a video costs no ffmpeg work at all), so you get only the transcript — or the page
@@ -86,7 +107,8 @@ TEXT SOURCE ORDER — subtitles first, ASR only as a fallback:
 2. the subtitle track embedded in the container,
 3. a subtitle file with the same base name in the same directory (a.srt next to a.mp4),
 4. ASR — only when none of the above exists and an ASR provider is configured.
-Every segment is tagged with its source. subtitle = the author's own words, safe to quote.
+Every segment is tagged with its source. subtitle = from a subtitle file/track; usually the
+author's words, but may be auto-generated: check names and numbers against the frame.
 asr = machine transcription: names, numbers and jargon are often wrong, so do NOT quote an ASR
 segment verbatim and do not present it as the speaker's exact words. visual = there is no text
 at all, only the picture.
@@ -95,13 +117,46 @@ The storyboard grid is for FINDING things, not for reading them: cells are small
 inside a cell is usually unreadable. To read text on screen, call media_zoom on that moment
 and read the cropped single frame.
 
-The full text is NOT inlined. It is written to disk and the returned paths point at it:
-content.md (readable), segments.jsonl (one segment per line, machine-readable), manifest.json
-(what was produced and how). Read those files section by section and summarise them in
-chunks yourself — do not ask for the same range again just to get more inline text.
+The full text is NOT inlined. It is written to disk, and the text of the result ends with a line
+like "full text: /abs/path/content.md (segments.jsonl, manifest.json in the same directory)".
+That absolute path is what you read: content.md is the readable full text, segments.jsonl has
+one segment per line, manifest.json records what was produced and how. Read those files section
+by section and summarise them in chunks yourself — do not ask for the same range again just to
+get more inline text. If the export could not be written, the line reads
+"full text: NOT written — <reason>" instead.
+
+The inline text is a PREVIEW with three tiers. (1) WHOLE: the requested range fits, and the
+result says "complete text ... nothing omitted". (2) SKIM (documents only, when the document
+parser exposes block structure): every heading plus the first complete sentence of each
+paragraph, tables as "[table: caption]", with captions/footnotes/equations left out; each page
+is labelled like "[page 4 · skim: 12 of 210 sentences]". A skim built from the built-in heuristic
+blocks is best-effort — section structure may be wrong; read content.md for the authoritative
+text. (3) SAMPLED: complete units — document sentences, video/audio transcript segments — are
+sampled evenly, with a line like "preview: sampled 84 of 312 sentences across pages 1-28; not
+represented: 2-6, 8-12". In a skim that still does not fit, all headings are kept and sentences
+are sampled; only when even the headings do not fit are the headings sampled. Sampling never
+drops a whole page silently: pages that could not be represented are listed, and a single
+over-long unit is truncated with a trailing "…[+N chars]". Read content.md when you need the
+complete text.
+
+VIEW — the view parameter controls the inline text (default "auto"). Many files carry a real
+outline: PDF bookmarks, or chapter markers in video/audio. (1) "auto": if the requested range
+fits, you get the full text; if it does not fit and the file has an outline, the outline comes
+first (page numbers for PDFs, timestamps for chapters) and the rest of the budget goes to the
+text preview; if there is no outline, you get the normal skim/sampled preview. A document
+without bookmarks gets an outline GENERATED FROM ITS HEADINGS when the range has at least 5
+headings, labelled "outline: generated from headings" (best-effort). (2) "outline": return only
+the outline — generated from headings for a document without bookmarks; for video/audio without
+chapters you get an explicit "no chapters" message and NOTHING is generated, because this server
+never invents an outline from content. In that case read the overview (or a start/end window)
+and write your own outline from the time-aligned text and storyboard grids. (3) "text": ignore
+the outline and force the text pipeline. The full outline is always in structuredContent.outline
+and, for an overview that writes an export, in manifest.json.
+(目录：view:auto 放不下时先出目录；view:outline 只出目录；view:text 只出文本。视频/音频没有章节时不生成目录)
 
 Always call media_probe first: it tells you how long the file is, whether a subtitle source
-exists, and which transcript source applies, for free. Long media must be narrowed with
+exists, which transcript source applies, and whether the file carries a built-in outline
+(PDF bookmarks / chapters), for free. Long media must be narrowed with
 start/end (video, audio) or pages (document) — one giant grid of a two-hour film gives you
 illegible cells and spoils the ending. Follow the continuation hint in the result to page
 through the rest.`;
@@ -133,6 +188,18 @@ export const LOCATE_DESCRIPTION = `Find where something appears in a local media
 Use it when you know roughly what was said but not when ("where does it mention X"), or when
 you need to know which page a phrase is on. Matching ignores punctuation, spacing and case,
 and works for both Chinese and English. Long phrases match better than single characters.
+
+For a video or recording, each match is a time window with a match score (0..1) and the
+matched line. For a document, each match is a page: the page number, how many times the
+query appears on that page (hits), and a short snippet around the first hit — never the
+whole page. Pages that matched but did not fit are listed as "N more pages match: ...".
+Read a full page with media_overview({ path, pages }).
+
+For DOCUMENTS, ocr: "auto" (default) searches the PDF text layer where one exists and OCRs only
+pages without one; ocr: "force" re-recognizes every requested page with the OCR provider first,
+even pages that already have a text layer, and tags those matches (ocr). Use force when
+media_probe says "text layer: looks unreliable". Forced results are cached separately from auto.
+(文档：ocr: "force" = 强制重新 OCR / 重新识别文字层)
 
 Text only by default — no image, no pixels spent. Add includeFrame: true to also get the
 picture at the best match (one image, roughly 1,900 vision tokens).
@@ -187,6 +254,22 @@ const SEGMENT_PARAM = z.number().optional().describe(
 
 const PAGES_PARAM = z.string().optional().describe(
   'Page range for document media: comma-separated 1-based page numbers and closed ranges, e.g. "3-10,15". Not applicable to video or audio. (页码范围)',
+);
+
+const VIEW_PARAM = z.enum(['auto', 'outline', 'text']).optional().describe(
+  'What to put in the inline text. "auto" (default): the full text of the requested range when it fits; otherwise, '
+  + 'when the file has a built-in outline (PDF bookmarks, video/audio chapters) or the document has at least 5 headings, '
+  + 'the outline comes first and the remaining budget goes to a text preview; files without an outline use the normal '
+  + 'skim/sampled preview. "outline": return only the outline (generated from headings for a document without bookmarks; '
+  + 'an explicit "no chapters" message for video/audio — this server never invents an outline from content). '
+  + '"text": force the text pipeline and ignore any outline. (返回内容：auto 自动；outline 只出目录；text 只出文本)',
+);
+
+const OCR_PARAM = z.enum(['auto', 'force']).optional().describe(
+  'Document media only: how to obtain page text. "auto" (default) uses the PDF text layer where one exists and OCR only for pages without one. '
+  + '"force" re-recognizes every requested page with the OCR provider even if it already has a text layer, and tags those pages (ocr); use it when '
+  + 'media_probe says "text layer: looks unreliable" or the extracted text is garbled. Forced results are cached separately from "auto". '
+  + 'Requires a configured OCR provider; not applicable to video or audio. (文档：ocr auto 默认；force = 强制重新 OCR / 重新识别文字层)',
 );
 
 const CELLS_PARAM = z.number().optional().describe(
@@ -251,6 +334,8 @@ export const TOOL_SHAPES = Object.freeze({
     end: END_PARAM,
     segment: SEGMENT_PARAM,
     pages: PAGES_PARAM,
+    ocr: OCR_PARAM,
+    view: VIEW_PARAM,
     cells: CELLS_PARAM,
     images: IMAGES_PARAM,
     maxEdge: MAX_EDGE_PARAM,
@@ -275,6 +360,7 @@ export const TOOL_SHAPES = Object.freeze({
     end: END_PARAM,
     segment: SEGMENT_PARAM,
     pages: PAGES_PARAM,
+    ocr: OCR_PARAM,
     includeFrame: INCLUDE_FRAME_PARAM,
   },
 });
@@ -324,6 +410,11 @@ export const PARAM_APPLICABILITY = Object.freeze({
     message: (t) => (t === 'document'
       ? 'pages is not applicable to document media.'
       : `pages is not applicable to ${t} media. Use "start" and "end" (seconds) instead.`),
+  },
+  ocr: {
+    media: ['document'],
+    message: (t) => `ocr is not applicable to ${t} media. Only documents have a page text layer or page images to OCR; `
+      + 'video and audio use subtitles/transcript instead.',
   },
   includeFrame: {
     media: ['video', 'document'],
@@ -541,12 +632,44 @@ function collectImages(rawImages, plan, config) {
   return describeImages(list, { source: 'visual' });
 }
 
+/** 契约 v2（9z5.28）允许的 block 类型；未知类型按 paragraph 处理 */
+const PREVIEW_BLOCK_TYPES = new Set([
+  'heading', 'paragraph', 'list', 'table', 'caption', 'equation', 'footnote',
+]);
+
+/**
+ * 逐页 blocks 的预览用规整（9z5.32）：只保留 skim 需要的字段与已知类型。
+ * 空文本丢；未知类型降级为 paragraph；heading 的 level 只保留 1..6 的整数。
+ *
+ * @param {Array<object>} raw
+ * @returns {Array<{type: string, text: string, level?: number}>}
+ */
+function normalizePreviewBlocks(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const block of raw) {
+    if (!block || typeof block !== 'object') continue;
+    const text = String(block.text ?? '').trim();
+    if (!text) continue;
+    const type = PREVIEW_BLOCK_TYPES.has(block.type) ? block.type : 'paragraph';
+    const normalized = { type, text };
+    const level = Number(block.level);
+    if (Number.isInteger(level) && level > 0) normalized.level = Math.min(level, 6);
+    out.push(normalized);
+  }
+  return out;
+}
+
 /** 段落的通用归一化（合同 §5.3 / §9.2 的字段口径；source/origin 缺省为 none） */
 function normalizeSegmentsSafe(raw) {
   const list = Array.isArray(raw) ? raw : [];
   return list.map((segment, i) => {
     const startMs = integerOrNull(segment?.startMs);
     const endMs = integerOrNull(segment?.endMs);
+    const page = integerOrNull(segment?.page);
+    // 契约 v2 的 blocks 只用于文档 skim（9z5.32）：只有带页码的 segment 才携带。
+    // 没有 blocks 的旧后端 / 视频 / 录音保持 .20 的 segment 形状（连空数组都不塞）。
+    const blocks = page === null ? [] : normalizePreviewBlocks(segment?.blocks);
     return {
       index: Number.isInteger(segment?.index) ? segment.index : i + 1,
       startMs,
@@ -556,8 +679,12 @@ function normalizeSegmentsSafe(raw) {
       text: String(segment?.text ?? ''),
       source: segment?.source ?? 'none',
       origin: segment?.origin ?? 'none',
-      page: integerOrNull(segment?.page),
+      // 契约 v2（9z5.28）的逐页来源细节：source 已按它映射，textOrigin 原样暴露，
+      // 让 agent 能看到「这页是文字层 / OCR / 没声明」（9z5.21）。
+      textOrigin: segment?.textOrigin ?? null,
+      page,
       speaker: segment?.speaker ? String(segment.speaker) : null,
+      ...(blocks.length > 0 ? { blocks } : {}),
     };
   });
 }
@@ -573,6 +700,9 @@ function resolveTranscriptInfo(result, segments) {
     segmentCount: segments.length,
     provider: given.provider ?? null,
     model: given.model ?? null,
+    // 文档 provider 的两个角色（9z5.28 契约 v2）：只列真正处理过返回页的角色。
+    ocrProvider: given.ocrProvider ?? null,
+    typesetProvider: given.typesetProvider ?? null,
     file: given.file ?? null,
     reason: given.reason ?? null,
   };
@@ -582,7 +712,11 @@ function resolveTranscriptInfo(result, segments) {
  * 文本格式化（契约 §4.4 / §5.4 / §6.4 / §7.4 / §8.4）
  * ------------------------------------------------------------------ */
 
-/** ASR 是机器转写：不加引号，避免看起来像原话（契约 §2.5 的硬约束） */
+/**
+ * 只有 ASR（机器听写）不加引号，避免看起来像原话（契约 §2.5 的硬约束）。
+ * subtitle / text / ocr 都加「」：text 是字符精确的原生文字（可当原话引用），
+ * subtitle / ocr 也是「文件里/页面上已有的字」，只是可能自动生成或识别错。
+ */
 function quoteBySource(text, source) {
   const value = String(text ?? '');
   if (!value) return '';
@@ -593,27 +727,812 @@ function padLabel(label, width = 9) {
   return label.padEnd(width);
 }
 
-/**
- * 内联清单的长度上限（MMGREP_MAX_TEXT_INLINE_CHARS）：在段落/格边界截断。
- * 全文始终落盘，不受这个上限影响（契约 §12.5）。
+/* ---------------- 内联预览（契约 §12.5，9z5.20 / 9z5.32） ----------------
+ *
+ * 内联上限（MMGREP_MAX_TEXT_INLINE_CHARS）之内只放**预览**，全文始终落盘：
+ *   tier 1 whole  请求范围整体放得下 → 原样全量返回；
+ *   tier 2 skim   标题 + 段首句（仅文档；需要契约 v2 blocks，9z5.32）；
+ *   tier 3 sample 按**完整单元**（文档 = 句子，视频/录音 = 转写段落）等距抽样。
+ * 旧实现按「行」截断且一超限就 break：文档一页一行，于是超限页和它后面的所有页
+ * 一起消失，而文本末尾还宣称「包含每一页」。这里改成按单元抽样的原因是：
+ * 单个超长单元可以硬截断（…[+N chars]），但绝不静默丢掉整页。
  */
-function truncateLines(headerLines, bodyLines, maxChars) {
-  const limit = Number.isFinite(maxChars) && maxChars > 0 ? maxChars : DEFAULT_MAX_TEXT_INLINE_CHARS;
-  const kept = [];
-  let length = 0;
-  for (const line of [...headerLines, ...bodyLines]) {
-    const addition = kept.length === 0 ? line.length : line.length + 1;
-    if (length + addition > limit) break;
-    kept.push(line);
-    length += addition;
+
+/** 单个预览单元的硬上限：min(正文预算 / 4, 2000) 字符 */
+const PREVIEW_UNIT_MAX_CHARS = 2000;
+/** 给预览说明（抽样数 / 未覆盖范围 / 截断提示）预留的字符数，先留再分配正文 */
+const PREVIEW_NOTE_RESERVE = 420;
+/** not represented 页码区间串的最大长度；超了压缩成 "+ N more ranges" */
+const PREVIEW_RANGE_LIST_MAX_CHARS = 140;
+
+function inlineCharLimit(value) {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : DEFAULT_MAX_TEXT_INLINE_CHARS;
+}
+
+/** 单元硬截断：尾部标 …[+N chars]（表格、参考文献、无标点 CJK 会踩到） */
+function capUnitText(text, cap) {
+  const value = String(text ?? '');
+  if (!Number.isFinite(cap) || cap <= 0 || value.length <= cap) {
+    return { text: value, truncated: false };
   }
-  const dropped = headerLines.length + bodyLines.length - kept.length;
+  return { text: `${value.slice(0, cap)}…[+${value.length - cap} chars]`, truncated: true };
+}
+
+/**
+ * 预览单元：文档把每页正文切成句子；视频/录音一个转写段落就是一个单元。
+ * `order` 是单元在全文里的位置，用来在渲染时判断相邻单元之间有没有省略。
+ */
+function buildPreviewUnits(mediaType, segments) {
+  if (mediaType !== 'document') {
+    return segments.map((segment, index) => ({
+      order: index,
+      page: null,
+      source: segment.source ?? 'none',
+      origin: segment.origin ?? 'none',
+      textOrigin: segment.textOrigin ?? null,
+      text: String(segment.text ?? ''),
+      segment,
+    }));
+  }
+  const units = [];
+  for (const segment of segments) {
+    const page = segment.page ?? segment.index;
+    for (const sentence of splitSentences(segment.text)) {
+      units.push({
+        order: units.length,
+        page,
+        source: segment.source ?? 'none',
+        origin: segment.origin ?? 'none',
+        // 9z5.21：逐页来源细节要一路带到 structuredContent.segments。
+        textOrigin: segment.textOrigin ?? null,
+        text: sentence,
+        segment,
+      });
+    }
+  }
+  return units;
+}
+
+/** 正文渲染：文档按页聚合（一页一行），视频/录音一行一个单元，省略处插 … */
+function renderPreviewBody({ mediaType, units, textOnly }) {
+  if (units.length === 0) return '';
+  if (mediaType === 'document') {
+    const byPage = new Map();
+    for (const unit of units) {
+      if (!byPage.has(unit.page)) byPage.set(unit.page, []);
+      byPage.get(unit.page).push(unit);
+    }
+    const lines = [];
+    for (const [page, list] of byPage) {
+      const parts = [];
+      list.forEach((unit, index) => {
+        if (index > 0 && unit.order !== list[index - 1].order + 1) parts.push('…');
+        parts.push(quoteBySource(unit.renderText, unit.source));
+      });
+      const source = list[0].source ?? 'none';
+      lines.push(`${padLabel(`[page ${page}`)}] (${source})  ${parts.join(' ')}`.trimEnd());
+    }
+    return lines.join('\n');
+  }
+  const lines = [];
+  units.forEach((unit, index) => {
+    if (index > 0 && unit.order !== units[index - 1].order + 1) lines.push('…');
+    lines.push(formatOverviewSegmentLine({ ...unit.segment, text: unit.renderText }, mediaType, textOnly));
+  });
+  return lines.join('\n');
+}
+
+/* ---------------- tier 2 skim（文档专属，9z5.32） ----------------
+ *
+ * 输入是契约 v2 的 blocks（9z5.28；外部 provider 或 .24 builtin 启发式）。
+ * 没有 blocks 的旧路径（以及视频/录音）没有 skim，仍走 tier 1 → tier 3。
+ * skim 内容 = 全部 heading + 每个段落的第一个完整句（复用 .20 的断句函数），
+ * table 只留 [table: caption]；caption / footnote / equation 不进速读视图。
+ */
+
+/** 不属于速读视图的 block 类型：题注 / 脚注 / 公式 */
+const SKIM_EXCLUDED_BLOCKS = new Set(['caption', 'footnote', 'equation']);
+/** 表格占位里 caption 的最大长度 */
+const SKIM_TABLE_CAPTION_MAX_CHARS = 120;
+
+/** table block → `[table: <caption>]`；没有 caption 时只写 `[table]`（不拿表头行冒充） */
+function tableSkimLabel(block) {
+  const firstLine = String(block?.text ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) ?? '';
+  const explicit = String(block?.caption ?? '').trim();
+  const caption = explicit || (/^(?:table|tab\.?|表)\s*\S/i.test(firstLine) ? firstLine : '');
+  if (!caption) return '[table]';
+  const clipped = caption.length > SKIM_TABLE_CAPTION_MAX_CHARS
+    ? `${caption.slice(0, SKIM_TABLE_CAPTION_MAX_CHARS)}…`
+    : caption;
+  return `[table: ${clipped}]`;
+}
+
+/**
+ * 从逐页 blocks 建 skim 模型：每页的 skim 单元、页内句子总数、heading 列表。
+ * 一个 block 至多产出一个单元：heading → 整段标题；paragraph / list → 第一句；
+ * table → 占位符；caption / footnote / equation 丢弃。
+ * 没有任何 block（旧路径）时返回 null。
+ *
+ * @param {'video'|'audio'|'document'} mediaType
+ * @param {Array<{page?: number|null, text: string, source?: string, origin?: string,
+ *   textOrigin?: string|null, blocks?: Array<object>}>} segments
+ * @returns {{pages: Array<object>, units: Array<object>, headings: Array<object>, sentenceTotal: number}|null}
+ */
+function buildSkimModel(mediaType, segments) {
+  if (mediaType !== 'document') return null;
+  const entries = [];
+  let blockCount = 0;
+  for (const segment of segments) {
+    const blocks = Array.isArray(segment.blocks) ? segment.blocks : [];
+    if (blocks.length === 0) continue;
+    blockCount += blocks.length;
+    const page = segment.page ?? segment.index;
+    const units = [];
+    for (const block of blocks) {
+      const type = block.type ?? 'paragraph';
+      const text = String(block.text ?? '').trim();
+      if (!text || SKIM_EXCLUDED_BLOCKS.has(type)) continue;
+      let unit = null;
+      if (type === 'heading') {
+        unit = { kind: 'heading', level: block.level ?? 1, text };
+      } else if (type === 'table') {
+        unit = { kind: 'table', text: tableSkimLabel(block) };
+      } else {
+        // paragraph / list（未知类型已按 paragraph 规整）：只取第一个完整句
+        const first = splitSentences(text)[0];
+        if (first) unit = { kind: 'sentence', text: first };
+      }
+      if (!unit) continue;
+      units.push({
+        ...unit,
+        page,
+        source: segment.source ?? 'none',
+        origin: segment.origin ?? 'none',
+        textOrigin: segment.textOrigin ?? null,
+        segment,
+      });
+    }
+    entries.push({
+      page,
+      units,
+      // 页内「全量」分母：与 tier 3 的句子口径一致（per-page skim 标注用）
+      sentenceTotal: splitSentences(segment.text ?? '').length,
+    });
+  }
+  if (blockCount === 0) return null;
+  const units = [];
+  let sentenceTotal = 0;
+  for (const entry of entries) {
+    sentenceTotal += entry.sentenceTotal;
+    for (const unit of entry.units) {
+      unit.order = units.length;
+      units.push(unit);
+    }
+  }
+  if (units.length === 0) return null;
   return {
-    text: kept.join('\n'),
-    truncated: dropped > 0,
-    keptCount: Math.max(0, kept.length - headerLines.length),
-    dropped,
+    pages: entries,
+    units,
+    headings: units.filter((unit) => unit.kind === 'heading'),
+    sentenceTotal,
   };
+}
+
+/** skim 单元的正文形态：heading 用 Markdown 层级，句子按来源加引号，表格占位原样 */
+function renderSkimUnit(unit) {
+  if (unit.kind === 'heading') {
+    const level = Math.min(Math.max(Number(unit.level) || 1, 1), 6);
+    return `${'#'.repeat(level)} ${unit.renderText}`;
+  }
+  if (unit.kind === 'table') return unit.renderText;
+  return quoteBySource(unit.renderText, unit.source);
+}
+
+/**
+ * skim 正文：文档按页聚合，页首标注 `[page 4 · skim: 38 of 210 sentences]`。
+ * 标注里的 N 是该页全文句子数，X 是这一页实际内联的 skim 单元数（heading 也算一个）。
+ */
+function renderSkimBody({ selected, stats, pageOrder }) {
+  if (selected.length === 0) return '';
+  const byPage = new Map();
+  for (const unit of selected) {
+    if (!byPage.has(unit.page)) byPage.set(unit.page, []);
+    byPage.get(unit.page).push(unit);
+  }
+  const order = [...pageOrder];
+  for (const page of [...byPage.keys()].sort((a, b) => a - b)) {
+    if (!order.includes(page)) order.push(page);
+  }
+  const lines = [];
+  for (const page of order) {
+    const list = byPage.get(page);
+    if (!list || list.length === 0) continue;
+    const parts = [];
+    list.forEach((unit, index) => {
+      if (index > 0 && unit.order !== list[index - 1].order + 1) parts.push('…');
+      parts.push(renderSkimUnit(unit));
+    });
+    const total = Math.max(stats.get(page)?.sentenceTotal ?? 0, list.length);
+    lines.push(`[page ${page} · skim: ${list.length} of ${total} sentences] (${list[0].source})  ${parts.join(' ')}`);
+  }
+  return lines.join('\n');
+}
+
+/** 按 skim 顺序合并多组单元（heading / 段首句） */
+function mergeSkimUnits(...lists) {
+  const seen = new Set();
+  const out = [];
+  for (const list of lists) {
+    for (const unit of list) {
+      if (seen.has(unit.order)) continue;
+      seen.add(unit.order);
+      out.push(unit);
+    }
+  }
+  return out.sort((a, b) => a.order - b.order);
+}
+
+/** 每页等距取 perPage 个非 heading 单元（页内均匀，页与页之间同权） */
+function selectSkimNonHeadings(byPage, pageOrder, perPage) {
+  if (perPage <= 0) return [];
+  const out = [];
+  for (const page of pageOrder) {
+    const list = (byPage.get(page) ?? []).filter((unit) => unit.kind !== 'heading');
+    if (list.length === 0) continue;
+    const count = Math.min(perPage, list.length);
+    for (const index of evenlySpacedIndices(list.length, count)) out.push(list[index]);
+  }
+  return out;
+}
+
+/** heading 本身等距抽样（只有连全部 heading 都放不下时才用） */
+function selectSkimHeadings(headings, count) {
+  if (count >= headings.length) return [...headings];
+  if (count <= 0) return [];
+  return evenlySpacedIndices(headings.length, count).map((index) => headings[index]);
+}
+
+/**
+ * 在预算内挑 skim 单元：
+ *   1. 全部 skim 放得下 → 原样；
+ *   2. 放不下 → **heading 全部保留**，每页再等距塞 r 个段首句（二分找最大 r）；
+ *   3. 连 heading 都放不下 → 对 heading 本身等距抽样（此时不再放句首）。
+ */
+function chooseSkimSelection({ units, headings, byPage, pageOrder, stats, target }) {
+  const bodyLength = (selection) => renderSkimBody({ selected: selection, stats, pageOrder }).length;
+  if (bodyLength(units) <= target) {
+    return { selected: units, sampled: false, headingsSampled: false };
+  }
+
+  // 2. heading 全保留 + 每页 r 个段首句（headings 为空时 r 从 0 起也走这条路）
+  if (bodyLength(headings) <= target) {
+    let maxPerPage = 0;
+    for (const list of byPage.values()) {
+      const count = list.filter((unit) => unit.kind !== 'heading').length;
+      if (count > maxPerPage) maxPerPage = count;
+    }
+    let lo = 0;
+    let hi = maxPerPage;
+    let best = 0;
+    while (lo <= hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      const selection = mergeSkimUnits(headings, selectSkimNonHeadings(byPage, pageOrder, mid));
+      if (bodyLength(selection) <= target) {
+        best = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    const selected = mergeSkimUnits(headings, selectSkimNonHeadings(byPage, pageOrder, best));
+    return { selected, sampled: selected.length < units.length, headingsSampled: false };
+  }
+
+  // 3. 连 heading 都放不下：heading 等距抽样（至少保留一个，交给最后的 clamp 兜底）
+  let lo = 0;
+  let hi = headings.length;
+  let best = 0;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (bodyLength(selectSkimHeadings(headings, mid)) <= target) {
+      best = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  const keep = Math.max(best, headings.length > 0 ? 1 : 0);
+  const selected = selectSkimHeadings(headings, keep);
+  return {
+    selected,
+    sampled: selected.length < units.length,
+    headingsSampled: selected.length < headings.length,
+  };
+}
+
+function buildSkimNote({ preview, pages, cap, anyTruncated, heuristic }) {
+  const coverage = preview.notRepresented.length > 0
+    ? `not represented: ${formatRangeList(preview.notRepresented)}`
+    : 'every requested page is represented';
+  const tail = anyTruncated ? `; units longer than ${cap} chars end with …[+N chars]` : '';
+  const bestEffort = heuristic
+    ? ' Skim was built from heuristic blocks (best-effort): section structure may be wrong.'
+    : '';
+  const across = `across ${pagesLabel(pages)}`;
+  const label = preview.sampled ? 'preview: skim (sampled)' : 'preview: skim';
+  if (preview.headingsSampled) {
+    return `${label} — sampled ${preview.headingsInlined} of ${preview.headingsTotal} headings ${across} (even the headings did not fit); no sentence was inlined; ${coverage}${tail}.${bestEffort}`;
+  }
+  const headingText = preview.headingsTotal > 0
+    ? `all ${preview.headingsTotal} heading${preview.headingsTotal === 1 ? '' : 's'} kept`
+    : 'no headings in these blocks';
+  const sampledSentences = preview.sampled
+    ? `; sampled ${preview.units - preview.headingsInlined} of ${preview.skimUnits - preview.headingsTotal} paragraph first sentences`
+    : '';
+  return `${label} — ${preview.units} of ${preview.totalUnits} sentences inlined ${across}; ${headingText}${sampledSentences}; ${coverage}${tail}. Skim = headings + first sentence per paragraph (tables as [table: caption]).${bestEffort}`;
+}
+
+/**
+ * tier 2 的装配。返回 null 表示这份文档没有可用 blocks（旧路径 → tier 3）。
+ * 与 .20 的抽样一样用「预留说明 → 渲染 → 按实际长度回退」的循环，
+ * 保证 body + note ≤ capacity（极端小上限由 clampInlineText 最终兜底）。
+ */
+function planSkimPreview({ mediaType, segments, pages, capacity, heuristic }) {
+  const model = buildSkimModel(mediaType, segments);
+  if (!model) return null;
+  const pageOrder = Array.isArray(pages) && pages.length > 0
+    ? [...pages]
+    : [...new Set(segments.map((segment) => segment.page ?? segment.index))].sort((a, b) => a - b);
+  const stats = new Map(model.pages.map((entry) => [entry.page, entry]));
+  let target = Math.max(1, capacity - PREVIEW_NOTE_RESERVE);
+  let fallback = null;
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const cap = Math.max(1, Math.min(Math.floor(target / 4), PREVIEW_UNIT_MAX_CHARS));
+    const units = model.units.map((unit) => {
+      const { text, truncated } = capUnitText(unit.text, cap);
+      return { ...unit, renderText: text, unitTruncated: truncated };
+    });
+    const headings = units.filter((unit) => unit.kind === 'heading');
+    const byPage = new Map();
+    for (const unit of units) {
+      if (!byPage.has(unit.page)) byPage.set(unit.page, []);
+      byPage.get(unit.page).push(unit);
+    }
+
+    const selection = chooseSkimSelection({ units, headings, byPage, pageOrder, stats, target });
+    const bodyText = renderSkimBody({ selected: selection.selected, stats, pageOrder });
+    const represented = new Set(selection.selected.map((unit) => unit.page));
+    const preview = {
+      mode: 'skim',
+      units: selection.selected.length,
+      // 与 .20 同口径：分母是请求范围内的句子总数
+      totalUnits: model.sentenceTotal,
+      skimUnits: units.length,
+      headingsTotal: headings.length,
+      headingsInlined: selection.selected.filter((unit) => unit.kind === 'heading').length,
+      sampled: selection.sampled,
+      headingsSampled: selection.headingsSampled,
+      notRepresented: pageOrder.filter((page) => !represented.has(page)),
+    };
+    const note = buildSkimNote({
+      preview,
+      pages: pageOrder,
+      cap,
+      anyTruncated: selection.selected.some((unit) => unit.unitTruncated),
+      heuristic,
+    });
+    const needed = (bodyText ? bodyText.length + 1 : 0) + (note ? note.length + 1 : 0);
+    const result = { mode: 'skim', bodyText, units: selection.selected, preview, note };
+    if (needed <= capacity) return result;
+    fallback = result;
+    if (target <= 1) break;
+    target = Math.max(1, target - (needed - capacity) - 40);
+  }
+  return fallback;
+}
+
+/** 升序索引里等距取 m 个（含首尾）；m >= n 时全取 */
+function evenlySpacedIndices(n, m) {
+  if (m >= n) return Array.from({ length: n }, (_, i) => i);
+  if (m <= 1) return [0];
+  const picked = new Set();
+  for (let i = 0; i < m; i += 1) picked.add(Math.round((i * (n - 1)) / (m - 1)));
+  return [...picked].sort((a, b) => a - b);
+}
+
+/** 升序页码 → 压缩区间 ["2-6", "8"] */
+function compressPageRanges(numbers) {
+  const sorted = [...new Set(numbers)].sort((a, b) => a - b);
+  if (sorted.length === 0) return [];
+  const ranges = [];
+  let start = sorted[0];
+  let prev = sorted[0];
+  for (let i = 1; i < sorted.length; i += 1) {
+    if (sorted[i] === prev + 1) {
+      prev = sorted[i];
+      continue;
+    }
+    ranges.push(start === prev ? `${start}` : `${start}-${prev}`);
+    start = sorted[i];
+    prev = sorted[i];
+  }
+  ranges.push(start === prev ? `${start}` : `${start}-${prev}`);
+  return ranges;
+}
+
+/** 压缩区间串；太长时只列前几段，其余写成 "+ N more ranges"（9z5.20 要求） */
+function formatRangeList(numbers, maxChars = PREVIEW_RANGE_LIST_MAX_CHARS) {
+  const ranges = compressPageRanges(numbers);
+  let out = '';
+  for (let i = 0; i < ranges.length; i += 1) {
+    const piece = `${out ? ', ' : ''}${ranges[i]}`;
+    if (out && out.length + piece.length > maxChars) {
+      return `${out}, + ${ranges.length - i} more ranges`;
+    }
+    out += piece;
+  }
+  return out;
+}
+
+function pagesLabel(pages) {
+  if (!Array.isArray(pages) || pages.length === 0) return 'the requested pages';
+  if (pages.length === 1) return `page ${pages[0]}`;
+  return `pages ${formatPageRangeLabel(pages)}`;
+}
+
+/** tier 1 才允许说「完整」；非 tier 1 必须说清抽样与未覆盖范围 */
+function buildCompletenessNote({ mediaType, pages }) {
+  if (mediaType === 'document') return `note: complete text of ${pagesLabel(pages)} (nothing omitted).`;
+  return 'note: complete text of this window (nothing omitted).';
+}
+
+function buildPreviewNote({ mediaType, preview, pages, window, cap, anyTruncated }) {
+  const tail = anyTruncated ? `; units longer than ${cap} chars end with …[+N chars]` : '';
+  if (mediaType === 'document') {
+    const coverage = preview.notRepresented.length > 0
+      ? `not represented: ${formatRangeList(preview.notRepresented)}`
+      : 'every requested page is represented';
+    return `preview: sampled ${preview.units} of ${preview.totalUnits} sentences across ${pagesLabel(pages)}; ${coverage}${tail}.`;
+  }
+  const windowLabel = window
+    ? `${fixed2(window.startSec)}-${fixed2(window.endSec)} s`
+    : 'this window';
+  const coverage = preview.units >= 2 ? '; first and last are included' : '';
+  return `preview: sampled ${preview.units} of ${preview.totalUnits} segments across ${windowLabel}${coverage}${tail}.`;
+}
+
+/** 文档抽样：先保证「每页至少一个单元」；预算不够就等距选页并列出未覆盖页 */
+function selectDocumentUnits(units, requestedPages, target) {
+  const cap = Math.max(1, Math.min(Math.floor(target / 4), PREVIEW_UNIT_MAX_CHARS));
+  const capped = units.map((unit) => {
+    const { text, truncated } = capUnitText(unit.text, cap);
+    return { ...unit, renderText: text, unitTruncated: truncated };
+  });
+
+  const byPage = new Map();
+  for (const unit of capped) {
+    if (unit.page === null || unit.page === undefined) continue;
+    if (!byPage.has(unit.page)) byPage.set(unit.page, []);
+    byPage.get(unit.page).push(unit);
+  }
+  const requested = Array.isArray(requestedPages) && requestedPages.length > 0
+    ? requestedPages
+    : [...byPage.keys()].sort((a, b) => a - b);
+  const pagesWithUnits = requested.filter((page) => (byPage.get(page)?.length ?? 0) > 0);
+  if (pagesWithUnits.length === 0) {
+    return { units: [], cap, notRepresented: [], anyTruncated: false };
+  }
+
+  const pageCost = (page) => {
+    const first = byPage.get(page)[0];
+    return 10 + String(page).length + first.renderText.length + 4 + 1;
+  };
+  const costForPageCount = (m) => evenlySpacedIndices(pagesWithUnits.length, m)
+    .reduce((sum, index) => sum + pageCost(pagesWithUnits[index]), 0);
+
+  let pageCount = 1;
+  if (costForPageCount(pagesWithUnits.length) <= target) {
+    pageCount = pagesWithUnits.length;
+  } else {
+    let lo = 1;
+    let hi = pagesWithUnits.length;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (costForPageCount(mid) <= target) lo = mid;
+      else hi = mid - 1;
+    }
+    pageCount = lo;
+  }
+
+  const selectedPages = evenlySpacedIndices(pagesWithUnits.length, pageCount)
+    .map((index) => pagesWithUnits[index]);
+  const selectedOrders = new Set();
+  const cursors = new Map();
+  let spent = costForPageCount(pageCount);
+  for (const page of selectedPages) {
+    selectedOrders.add(byPage.get(page)[0].order);
+    cursors.set(page, 1);
+  }
+
+  // 剩余预算按「每页第 r 个单元」逐轮补充，保持页内均匀，直到预算用完
+  let progressed = true;
+  while (progressed) {
+    progressed = false;
+    for (const page of selectedPages) {
+      const list = byPage.get(page);
+      let cursor = cursors.get(page) ?? 0;
+      while (cursor < list.length) {
+        const delta = list[cursor].renderText.length + 4;
+        if (spent + delta > target) break;
+        selectedOrders.add(list[cursor].order);
+        spent += delta;
+        cursor += 1;
+        progressed = true;
+      }
+      cursors.set(page, cursor);
+    }
+  }
+
+  const selected = capped.filter((unit) => selectedOrders.has(unit.order));
+  const represented = new Set(selected.map((unit) => unit.page));
+  return {
+    units: selected,
+    cap,
+    // 包括「整页没有文字」的页：它们同样没有出现在预览里（agent 可以据此去 zoom 看画面）
+    notRepresented: requested.filter((page) => !represented.has(page)),
+    anyTruncated: selected.some((unit) => unit.unitTruncated),
+  };
+}
+
+/** 视频/录音抽样：等距选 m 个单元（含首尾），剩余预算按顺序补齐 */
+function selectTimeUnits(units, target) {
+  const cap = Math.max(1, Math.min(Math.floor(target / 4), PREVIEW_UNIT_MAX_CHARS));
+  const capped = units.map((unit) => {
+    const { text, truncated } = capUnitText(unit.text, cap);
+    return { ...unit, renderText: text, unitTruncated: truncated };
+  });
+  const n = capped.length;
+  if (n === 0) return { units: [], cap, notRepresented: [], anyTruncated: false };
+
+  // 只做成本估算：真实长度由调用方渲染后再核（见 planOverviewPreview 的重试）
+  const unitCost = (unit) => unit.renderText.length + 32;
+  const costForCount = (m) => evenlySpacedIndices(n, m)
+    .reduce((sum, index) => sum + unitCost(capped[index]) + 3, 0);
+
+  let count = 1;
+  if (costForCount(n) <= target) {
+    count = n;
+  } else {
+    let lo = 1;
+    let hi = n;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (costForCount(mid) <= target) lo = mid;
+      else hi = mid - 1;
+    }
+    count = lo;
+  }
+
+  const selected = new Set(evenlySpacedIndices(n, count));
+  let spent = costForCount(count);
+  for (let index = 0; index < n; index += 1) {
+    if (selected.has(index)) continue;
+    const cost = unitCost(capped[index]) + 3;
+    if (spent + cost > target) continue;
+    selected.add(index);
+    spent += cost;
+  }
+  const picked = [...selected].sort((a, b) => a - b).map((index) => capped[index]);
+  return {
+    units: picked,
+    cap,
+    notRepresented: [],
+    anyTruncated: picked.some((unit) => unit.unitTruncated),
+  };
+}
+
+/**
+ * 预览装配：tier 1 whole 放得下就全量；放不下时文档先试 tier 2 skim（有 blocks 才试），
+ * 最后才是 tier 3 均匀抽样。视频/录音没有 skim，直接从 whole 到抽样（与 .20 一致）。
+ * capacity = 上限减去 header / 固定 notes / full text 行之后的正文余量。
+ */
+function planOverviewPreview({
+  mediaType, segments, pages, window, textOnly, capacity, skimHeuristic = false, allowSkim = true,
+}) {
+  const units = buildPreviewUnits(mediaType, segments);
+  const totalUnits = units.length;
+  // 没有任何可内联的文字（扫描件、无字幕的视频……）：预览是空的，不编也不抽样
+  if (totalUnits === 0) {
+    return {
+      mode: 'whole',
+      bodyText: '',
+      units: [],
+      preview: { mode: 'whole', units: 0, totalUnits: 0, notRepresented: [] },
+      note: null,
+    };
+  }
+  const wholeUnits = units.map((unit) => ({ ...unit, renderText: unit.text, unitTruncated: false }));
+  const wholeBody = renderPreviewBody({ mediaType, units: wholeUnits, textOnly });
+  const wholeNote = buildCompletenessNote({ mediaType, pages });
+  const wholeNeeded = (wholeBody ? wholeBody.length + 1 : 0) + (wholeNote ? wholeNote.length + 1 : 0);
+  if (wholeNeeded <= capacity) {
+    return {
+      mode: 'whole',
+      bodyText: wholeBody,
+      units: wholeUnits,
+      preview: { mode: 'whole', units: totalUnits, totalUnits, notRepresented: [] },
+      note: wholeNote,
+    };
+  }
+
+  // tier 2：文档 + 契约 v2 blocks。没有 blocks 时 planSkimPreview 返回 null，走 .20 的抽样。
+  // 有**内置**目录时仍可走 skim（目录 + 段首句互补）；目录本身是从 heading 生成的
+  // 时候跳过 skim：heading 已经全在目录里，再列一遍只是浪费预算（9z5.33）。
+  const skim = allowSkim
+    ? planSkimPreview({
+      mediaType,
+      segments,
+      pages,
+      capacity,
+      heuristic: skimHeuristic,
+    })
+    : null;
+  if (skim) return skim;
+
+  // 先给说明预留空间，再把余量交给正文；渲染后按实际长度回退重试。
+  let target = Math.max(1, capacity - PREVIEW_NOTE_RESERVE);
+  let fallback = null;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const selection = mediaType === 'document'
+      ? selectDocumentUnits(units, pages, target)
+      : selectTimeUnits(units, target);
+    const bodyText = renderPreviewBody({ mediaType, units: selection.units, textOnly });
+    const preview = {
+      mode: 'sampled',
+      units: selection.units.length,
+      totalUnits,
+      notRepresented: selection.notRepresented,
+    };
+    const note = buildPreviewNote({
+      mediaType,
+      preview,
+      pages,
+      window,
+      cap: selection.cap,
+      anyTruncated: selection.anyTruncated,
+    });
+    const needed = (bodyText ? bodyText.length + 1 : 0) + (note ? note.length + 1 : 0);
+    const result = { mode: 'sampled', bodyText, units: selection.units, preview, note };
+    if (needed <= capacity) return result;
+    fallback = result;
+    if (target <= 1) break;
+    target = Math.max(1, target - (needed - capacity) - 40);
+  }
+  // 上限小到连说明都放不下：交给 clampInlineText 收尾，保证硬性质
+  return fallback ?? {
+    mode: 'sampled',
+    bodyText: '',
+    units: [],
+    preview: { mode: 'sampled', units: 0, totalUnits, notRepresented: [] },
+    note: null,
+  };
+}
+
+/* ---------------- overview 的目录装配（9z5.33） ----------------
+ *
+ * 顺序：内置目录（PDF 书签 / 章节）优先；文档没有书签时才从契约 v2 blocks 的
+ * heading 生成（>= 5 条）。视频/录音**不生成**：没有章节就返回 available=false
+ * 与一句人话原因，view:"outline" 时把原因当正文返回。
+ */
+const GENERATED_OUTLINE_MIN_HEADINGS = 5;
+function buildBuiltInOverviewOutline(mediaType, probeOutline) {
+  if (!probeOutline || typeof probeOutline !== 'object' || !probeOutline.available) return null;
+  const entries = Array.isArray(probeOutline.entries) ? probeOutline.entries : [];
+  if (entries.length === 0) return null;
+  return {
+    available: true,
+    source: probeOutline.source ?? (mediaType === 'document' ? 'pdf-bookmarks' : 'chapters'),
+    generated: false,
+    total: entries.length,
+    entries,
+    reason: null,
+  };
+}
+
+/** 从契约 v2 blocks 的 heading 生成目录；少于 5 条不算目录（9z5.33 拍板）。 */
+function buildGeneratedOverviewOutline(mediaType, segments) {
+  if (mediaType !== 'document') return null;
+  const entries = [];
+  for (const segment of Array.isArray(segments) ? segments : []) {
+    const page = segment?.page ?? segment?.index ?? null;
+    for (const block of Array.isArray(segment?.blocks) ? segment.blocks : []) {
+      if (block?.type !== 'heading') continue;
+      const title = String(block.text ?? '').trim();
+      if (!title) continue;
+      const level = Number.isInteger(block.level) && block.level > 0 ? Math.min(block.level, 6) : 1;
+      entries.push({ level, title, page });
+    }
+  }
+  if (entries.length < GENERATED_OUTLINE_MIN_HEADINGS) return null;
+  return {
+    available: true,
+    source: 'headings',
+    generated: true,
+    total: entries.length,
+    entries,
+    reason: null,
+  };
+}
+
+function buildOverviewOutline({ mediaType, probeOutline, segments }) {
+  const builtIn = buildBuiltInOverviewOutline(mediaType, probeOutline);
+  if (builtIn) return builtIn;
+  const generated = buildGeneratedOverviewOutline(mediaType, segments);
+  if (generated) return generated;
+  const reason = mediaType === 'document'
+    ? `this document has no PDF bookmarks (${probeOutline?.reason ?? 'no outline found'}) and fewer than ${GENERATED_OUTLINE_MIN_HEADINGS} headings in the requested pages`
+    : (probeOutline?.reason ?? 'this file has no chapters (no chapter metadata in the container)');
+  return {
+    available: false,
+    source: null,
+    generated: false,
+    total: 0,
+    entries: [],
+    reason,
+  };
+}
+
+/** view:"outline" 但没有目录时的正文（视频/录音必须明确说「没有章节」，不生成内容）。 */
+function noOutlineMessage(outline, mediaType) {
+  const reason = String(outline?.reason ?? '').trim().replace(/\.$/, '');
+  if (mediaType === 'document') {
+    return `outline: none — ${reason || 'no bookmarks and fewer than 5 headings'}. `
+      + 'This server does not invent an outline from unstructured text. Use view:"auto" or view:"text" '
+      + 'to read the text preview, or read content.md and write your own outline.';
+  }
+  return `outline: none — no chapters: ${reason || 'this file has no chapters (no chapter metadata in the container)'}. `
+    + 'This server never generates an outline for video or audio (it does not call an LLM). '
+    + 'Read media_overview({ path }) or a start/end window, then write your own outline from the '
+    + 'time-aligned text and the storyboard grids.';
+}
+
+/** 最后一道保险：任何情况下 text 长度 <= 上限（极端小上限时截断并标注） */
+function clampInlineText(text, limit) {
+  if (typeof text !== 'string' || text.length <= limit) return text;
+  if (limit <= 0) return '';
+  let keep = Math.max(0, limit - 20);
+  let marker = `…[+${text.length - keep} chars]`;
+  while (keep > 0 && keep + marker.length > limit) {
+    keep = Math.max(0, keep - (keep + marker.length - limit));
+    marker = `…[+${Math.max(0, text.length - keep)} chars]`;
+  }
+  return keep > 0 ? `${text.slice(0, keep)}${marker}` : text.slice(0, limit);
+}
+
+/** 预览单元 → structuredContent.segments：只放**实际内联**的单元 */
+function unitsToInlineSegments(units, mediaType) {
+  return units.map((unit) => {
+    if (mediaType === 'document') {
+      return {
+        index: unit.order + 1,
+        startMs: null,
+        endMs: null,
+        startSec: null,
+        endSec: null,
+        text: unit.renderText,
+        source: unit.source,
+        origin: unit.origin,
+        textOrigin: unit.textOrigin ?? null,
+        page: unit.page,
+        speaker: unit.segment?.speaker ?? null,
+      };
+    }
+    return { ...unit.segment, text: unit.renderText };
+  });
 }
 
 function formatOverviewSegmentLine(segment, mediaType, textOnly = false) {
@@ -626,6 +1545,178 @@ function formatOverviewSegmentLine(segment, mediaType, textOnly = false) {
   return `${padLabel(label)}] ${time}(${segment.source})  ${quoteBySource(segment.text, segment.source)}`.trimEnd();
 }
 
+/**
+ * probe 文本里的文字层行（9z5.21）：三态 yes | no | unknown。
+ *
+ * `hasTextLayer = null` 是「本机没有文字抽取器，判不出来」，不能渲染成 no；
+ * 后者会让 agent 以为这份 PDF 只能靠 OCR。
+ */
+function formatTextLayerLine(result) {
+  const layer = result.capabilities?.textLayer ?? {};
+  const checked = Array.isArray(layer.checkedPages) ? layer.checkedPages : [];
+  const sampled = checked.length > 0 ? checked.join(', ') : null;
+  // 9z5.31：有文字层不代表文字是对的。劣质 OCR 写进去的文字层会优先提示
+  // 「看起来不可靠 + 怎么强制重新识别」，而不是让 agent 直接引用。
+  if (layer.reliable === false && layer.warning) {
+    return `text layer: ${layer.warning}`;
+  }
+  if (result.hasTextLayer === null || result.hasTextLayer === undefined) {
+    return `text layer: unknown — ${layer.reason ?? 'the PDF text layer could not be checked.'}`;
+  }
+  if (result.hasTextLayer === false) {
+    return `text layer: no${sampled ? ` (checked pages ${sampled})` : ''}.`;
+  }
+  if (Number.isInteger(layer.textPage)) {
+    return `text layer: yes (sampled pages ${sampled ?? layer.textPage}; first text on page ${layer.textPage}).`;
+  }
+  return 'text layer: yes.';
+}
+
+/* ---------------- 内置目录（9z5.33） ----------------
+ *
+ * PDF 书签（outline）与视频/录音章节是文件自带的真实元数据，是 overview 最好
+ * 的起点。probe 文本最多展示 2 层 / 60 条，其余写 "+N more"；完整目录进
+ * structuredContent.outline（overview 还进 manifest.json）。
+ *
+ * 文档没有书签时，overview 可以从契约 v2 blocks 的 heading 生成目录（>= 5 条
+ * 才算），并标注 "generated from headings"。视频/录音**不生成**目录：没有章节
+ * 就是没有，server 不调 LLM。
+ */
+const PROBE_OUTLINE_MAX_DEPTH = 2;
+const PROBE_OUTLINE_MAX_ENTRIES = 60;
+
+function isPdfPath(filePath) {
+  return /\.pdf$/i.test(String(filePath ?? ''));
+}
+
+function clampOutlineTitle(title, max = 120) {
+  const text = String(title ?? '').replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/** 书签 / 标题 / 章节条目 → 一行文本（层级只影响缩进） */
+function formatOutlineEntry(entry, mediaType) {
+  const level = Math.max(0, Math.min(Number(entry?.level) || 1, 6) - 1);
+  const indent = '  '.repeat(level);
+  if (mediaType === 'document') {
+    const page = Number.isInteger(entry?.page) ? `page ${entry.page}` : 'page ?';
+    const label = entry.label && entry.label !== String(entry.page) ? ` (label "${entry.label}")` : '';
+    return `${indent}- ${clampOutlineTitle(entry?.title)}  — ${page}${label}`;
+  }
+  const start = formatTimestamp(entry?.startMs);
+  const end = entry?.endMs === null || entry?.endMs === undefined ? '' : `-${formatTimestamp(entry.endMs)}`;
+  return `${indent}- ${clampOutlineTitle(entry?.title)}  ${start}${end}`;
+}
+
+/** 目录标题：probe 与 overview 的说法不同（probe 不写 manifest，overview 要指路） */
+function outlineHeader(outline, mediaType, target, total) {
+  const single = total === 1;
+  const unit = mediaType === 'document'
+    ? (single ? 'entry' : 'entries')
+    : (single ? 'chapter' : 'chapters');
+  if (target === 'probe') {
+    if (outline.generated) return `outline: generated from headings — ${total} ${unit} — use the outline to pick a range`;
+    return `outline: ${total} ${mediaType === 'document' ? `PDF bookmark${single ? '' : 's'}` : unit} — use the outline to pick a range`;
+  }
+  if (outline.generated) {
+    return `outline: generated from headings — ${total} ${unit} (best-effort: built from block structure; full outline in structuredContent.outline and manifest.json)`;
+  }
+  return `outline: ${total} ${mediaType === 'document' ? `PDF bookmark${single ? '' : 's'}` : unit} — full outline in structuredContent.outline and manifest.json`;
+}
+
+/** 文档目录的示例页码范围：第一条有页码的书签往后 4 页（不超过总页数） */
+function outlinePageArg(outline, pageCount) {
+  const entry = (outline?.entries ?? []).find((item) => Number.isInteger(item?.page));
+  if (!entry) return null;
+  const start = entry.page;
+  const end = Number.isInteger(pageCount) && pageCount >= start ? Math.min(pageCount, start + 4) : start + 4;
+  return end > start ? `${start}-${end}` : String(start);
+}
+
+/** 视频/录音目录的示例时间范围：第一章的起点到终点（没有终点时给 5 分钟） */
+function outlineTimeArg(outline) {
+  const entry = (outline?.entries ?? []).find((item) => Number.isFinite(item?.startMs));
+  if (!entry) return { start: 0, end: 300 };
+  const start = Number((entry.startMs / 1000).toFixed(2));
+  const endMs = Number.isFinite(entry.endMs) ? entry.endMs : entry.startMs + 300_000;
+  return { start, end: Number((Math.max(endMs, entry.startMs + 1000) / 1000).toFixed(2)) };
+}
+
+/**
+ * 目录块渲染（带预算）。maxDepth / maxEntries 控展示量，maxChars 控字符预算。
+ * 返回的 inlined 是**真正写进文本**的条目数；total 是目录条目总数。
+ */
+function renderOutlineBlock(outline, {
+  mediaType, pageCount = null, target = 'overview', maxDepth = Infinity, maxEntries = Infinity, maxChars = Infinity,
+}) {
+  const entries = Array.isArray(outline?.entries) ? outline.entries : [];
+  const total = Number.isInteger(outline?.total) ? outline.total : entries.length;
+  const header = outlineHeader(outline, mediaType, target, total);
+  let footer = '';
+  if (target === 'overview') {
+    if (mediaType === 'document') {
+      const arg = outlinePageArg(outline, pageCount);
+      if (arg) footer = `hint: pick a range with pages, e.g. media_overview({ path, pages: "${arg}" }).`;
+    } else if (entries.length > 0) {
+      const arg = outlineTimeArg(outline);
+      footer = `hint: pick a range with start/end, e.g. media_overview({ path, start: ${arg.start}, end: ${arg.end} }).`;
+    }
+  }
+
+  const lines = [];
+  let used = header.length;
+  let inlined = 0;
+  for (const entry of entries) {
+    if (Number(entry?.level) > maxDepth) continue;
+    if (inlined >= maxEntries) break;
+    const line = formatOutlineEntry(entry, mediaType);
+    if (used + 1 + line.length > maxChars) break;
+    lines.push(line);
+    used += 1 + line.length;
+    inlined += 1;
+  }
+
+  const hidden = Math.max(0, total - inlined);
+  if (hidden > 0) {
+    const more = target === 'probe'
+      ? `  +${hidden} more (full outline in structuredContent.outline)`
+      : `  +${hidden} more entries (full outline in structuredContent.outline and manifest.json)`;
+    if (used + 1 + more.length <= maxChars || lines.length === 0) {
+      lines.push(more);
+      used += 1 + more.length;
+    }
+  } else if (inlined === 0 && total > 0 && target === 'overview') {
+    lines.push('  (no entry fits the inline budget; read the full outline in structuredContent.outline / manifest.json)');
+  }
+
+  let text = [header, ...lines].join('\n');
+  if (footer && text.length + 1 + footer.length <= maxChars) {
+    text += `\n${footer}`;
+  }
+  return { text, inlined, total, hidden };
+}
+
+/** probe 文本里的目录行：有目录就列，没有就明说（PDF / 章节）。 */
+function formatProbeOutline(result) {
+  const outline = result.outline;
+  if (!outline || typeof outline !== 'object') return [];
+  if (outline.available) {
+    const block = renderOutlineBlock(outline, {
+      mediaType: result.mediaType,
+      pageCount: result.pageCount,
+      target: 'probe',
+      maxDepth: PROBE_OUTLINE_MAX_DEPTH,
+      maxEntries: PROBE_OUTLINE_MAX_ENTRIES,
+    });
+    return block.text.split('\n');
+  }
+  if (result.mediaType === 'document') {
+    if (!isPdfPath(result.path)) return [];
+    return [`outline: none — ${outline.reason ?? 'this PDF has no bookmarks.'}`];
+  }
+  return [`chapters: none — ${outline.reason ?? 'this file has no chapters.'}`];
+}
+
 function formatProbeText(result) {
   const mediaType = result.mediaType;
   const lines = [];
@@ -633,7 +1724,10 @@ function formatProbeText(result) {
 
   if (mediaType === 'document') {
     attrs.push(`pages="${result.pageCount ?? '-'}"`);
-    attrs.push(`textLayer="${result.hasTextLayer ? 'yes' : 'no'}"`);
+    const textLayer = result.hasTextLayer === null || result.hasTextLayer === undefined
+      ? 'unknown'
+      : (result.hasTextLayer ? 'yes' : 'no');
+    attrs.push(`textLayer="${textLayer}"`);
   } else {
     attrs.push(`duration="${fixed2(result.durationSec) ?? '-'}"`);
     attrs.push(`durationMs="${result.durationMs ?? '-'}"`);
@@ -672,21 +1766,44 @@ function formatProbeText(result) {
   }
 
   const ocr = caps.ocr ?? {};
+  const typeset = caps.typeset ?? {};
   if (mediaType !== 'document') {
     lines.push('ocr: not applicable to this media type.');
-  } else if (ocr.available) {
-    lines.push(`ocr: available — provider "${ocr.provider ?? 'unknown'}".`);
+    lines.push('typeset: not applicable to this media type.');
   } else {
-    lines.push(`ocr: unavailable — ${ocr.reason ?? 'no document parser is configured.'}`);
+    // 9z5.21：拆成「文字层状态 + 两个角色各自是否可用 + 实际会走的来源」，
+    // 不再出现「ocr: unavailable」与「transcript source: ocr」自相矛盾的两行。
+    lines.push(formatTextLayerLine(result));
+    if (ocr.available) {
+      lines.push(`ocr provider: ${ocr.provider ?? 'unknown'}.`);
+    } else {
+      lines.push(`ocr provider: none${ocr.reason ? ` — ${ocr.reason}` : '.'}`);
+    }
+    if (typeset.available) {
+      lines.push(`typeset provider: ${typeset.provider ?? 'unknown'}.`);
+    } else {
+      lines.push(`typeset provider: none${typeset.reason ? ` — ${typeset.reason}` : '.'}`);
+    }
   }
 
   lines.push(`transcript source: ${caps.transcriptSource ?? 'none'}${caps.transcriptPath ? ` (${caps.transcriptPath})` : ''}`);
   if (caps.transcriptReason) {
     lines.push(`transcript reason: ${caps.transcriptReason}`);
   }
+  // 9z5.33：内置目录（PDF 书签 / 章节）——most valuable next-step hint for long media。
+  lines.push(...formatProbeOutline(result));
 
   const recommended = result.recommended ?? {};
-  if (recommended.note) {
+  if (result.outline?.available) {
+    // 有目录时先教 agent 用目录收窄范围（pages / start,end 两种写法）。
+    if (mediaType === 'document') {
+      const arg = outlinePageArg(result.outline, result.pageCount) ?? '1-10';
+      lines.push(`How to read: use the outline to pick a range, e.g. media_overview({ path, pages: "${arg}" }).`);
+    } else {
+      const arg = outlineTimeArg(result.outline);
+      lines.push(`How to read: use the outline to pick a range, e.g. media_overview({ path, start: ${arg.start}, end: ${arg.end} }).`);
+    }
+  } else if (recommended.note) {
     lines.push(recommended.note);
   } else if (result.durationSec !== null && result.durationSec !== undefined) {
     const minutes = Math.round(result.durationSec / 60);
@@ -697,8 +1814,12 @@ function formatProbeText(result) {
   return lines.join('\n');
 }
 
+/** 字幕来源的措辞：字幕通常来自作者，但也可能是自动生成的（9z5.26：不作「可安全引用」的绝对承诺） */
+const SUBTITLE_SOURCE_NOTE = 'note: source is subtitle — from a subtitle file/track; usually the author\'s words, but may be auto-generated: check names and numbers against the frame.';
+
 function formatOverviewText({
-  mediaType, base, window, pages, durationSec, segments, transcript, imageDescriptors, textOnly, budget, hasAudio,
+  mediaType, base, window, pages, pageCount = null, durationSec, segments, transcript, imageDescriptors, textOnly, budget, hasAudio,
+  fullTextNote = null, continuationNote = null, warnings = [], view = 'auto', outline = null,
 }) {
   const lines = [];
   const attrs = [`path="${base.path}"`, `type="${mediaType}"`];
@@ -711,8 +1832,11 @@ function formatOverviewText({
       attrs.push(`image="${imageDescriptors.map((d) => `${d.width}x${d.height}`).join(' ')}"`);
       attrs.push(`tokens="~${budget.estimatedTokens}"`);
     }
-    attrs.push(`text="${transcript.provider ?? 'none'}"`);
+    // 9z5.21：删除误导的 text="<provider>"（它其实是 provider id，且原生文字层没有
+    // provider），改为只列本次真正处理过返回页的角色（后端按逐页 textOrigin 判定）。
     attrs.push(`source="${transcript.source}"`);
+    if (transcript.ocrProvider) attrs.push(`ocrProvider="${transcript.ocrProvider}"`);
+    if (transcript.typesetProvider) attrs.push(`typesetProvider="${transcript.typesetProvider}"`);
   } else {
     if (window) {
       attrs.push(`window="${fixed2(window.startSec)}-${fixed2(window.endSec ?? durationSec ?? 0)}"`);
@@ -739,37 +1863,151 @@ function formatOverviewText({
     lines.push(`transcript: NONE (${transcript.reason ?? 'no transcript source is available for this file'})`);
   }
 
-  const bodyLines = segments.map((segment) => formatOverviewSegmentLine(segment, mediaType, textOnly));
-  const truncated = truncateLines(lines, bodyLines, budget.maxInlineChars);
-  const notes = [];
+  const bodyNotes = [];
   if (imageDescriptors.length > 0) {
-    notes.push(`cost: ${imageDescriptors.length} image(s) x ~${budget.perImageTokens ?? '-'} = ~${budget.estimatedTokens} vision tokens · transcript from ${transcript.source}${transcript.file ? ` (${transcript.file})` : ''}`);
+    bodyNotes.push(`cost: ${imageDescriptors.length} image(s) x ~${budget.perImageTokens ?? '-'} = ~${budget.estimatedTokens} vision tokens · transcript from ${transcript.source}${transcript.file ? ` (${transcript.file})` : ''}`);
   }
   if (mediaType === 'video') {
     if (textOnly) {
-      notes.push('note: text-only mode (images: 0) — no storyboard grid was rendered and no frame was decoded; the list below is the transcript of this window.');
-      notes.push('note: to see the picture, call media_zoom({ path, at }) for a single frame.');
+      // 不再无条件宣称「下面是这个窗口的转写」——抽样时这句话是错的。
+      bodyNotes.push('note: text-only mode (images: 0) — no storyboard grid was rendered and no frame was decoded.');
+      bodyNotes.push('note: to see the picture, call media_zoom({ path, at }) for a single frame.');
     } else {
-      notes.push('note: the grids are for locating. To read text on screen, media_zoom({ path, at }) and read the cropped single frame.');
+      bodyNotes.push('note: the grids are for locating. To read text on screen, media_zoom({ path, at }) and read the cropped single frame.');
     }
     if (transcript.source === 'asr') {
-      notes.push('note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not quote these lines as the speaker\'s exact words.');
+      bodyNotes.push('note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not quote these lines as the speaker\'s exact words.');
+    } else if (transcript.source === 'subtitle') {
+      bodyNotes.push(SUBTITLE_SOURCE_NOTE);
     }
   } else if (mediaType === 'audio') {
     if (transcript.source === 'asr') {
-      notes.push('note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not quote these lines as the speaker\'s exact words.');
+      bodyNotes.push('note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not quote these lines as the speaker\'s exact words.');
     } else if (transcript.source === 'subtitle') {
-      notes.push('note: source is subtitle — the author\'s own words, safe to quote.');
+      bodyNotes.push(SUBTITLE_SOURCE_NOTE);
     }
   } else if (mediaType === 'document') {
     if (textOnly) {
-      notes.push('note: text-only mode (images: 0) — no page thumbnail was rendered; the list below is the text of every requested page.');
+      bodyNotes.push('note: text-only mode (images: 0) — no page thumbnail was rendered.');
     }
-    notes.push('note: page text comes from OCR of the rendered pages — verify names and numbers against the page image via media_zoom({ path, page }).');
+    // 9z5.21：按实际来源给 note，不再无条件宣称「page text 来自 OCR」。
+    if (transcript.source === 'text') {
+      bodyNotes.push('note: page text comes from the native text layer (or the plain-text file) — characters are exact and may be quoted.');
+    } else if (transcript.source === 'mixed') {
+      bodyNotes.push('note: page sources differ — read the tag on each page (text = character-exact native text, ocr = machine recognition).');
+    }
+    if (segments.some((segment) => segment.source === 'ocr')) {
+      bodyNotes.push('note: some page text comes from OCR — names, numbers and jargon may be misread; verify them against the page image via media_zoom({ path, page }).');
+    }
   }
-  if (budget.warning) notes.push(`budget: ${budget.warning}`);
-  const text = [truncated.text, ...notes].filter(Boolean).join('\n');
-  return { text, truncated: truncated.truncated, keptCount: truncated.keptCount };
+  if (warnings.includes(ROLLING_SUBTITLE_WARNING)) bodyNotes.push(ROLLING_SUBTITLE_WARNING);
+  if (budget.warning) bodyNotes.push(`budget: ${budget.warning}`);
+
+  // 9z5.33：view:"outline" 只出目录、不内联正文；把这件事说清楚，并计入预算。
+  const viewMode = view === 'outline' || view === 'text' ? view : 'auto';
+  if (viewMode === 'outline') {
+    bodyNotes.push('note: view="outline" — only the outline is inlined; no page text or transcript is included. '
+      + 'Use view:"text" (or omit view) for the text preview, or read content.md for the full text.');
+  }
+
+  // 全文落盘路径 / 续读提示也进 text content（9z5.22），并计入内联上限。
+  const headText = lines.join('\n');
+  const tailNotes = [fullTextNote, continuationNote].filter(Boolean);
+  const limit = inlineCharLimit(budget.maxInlineChars);
+  const fixedLength = headText.length
+    + [...bodyNotes, ...tailNotes].reduce((sum, note) => sum + note.length + 1, 0);
+  const capacity = limit - fixedLength - 1;
+
+  // skim 的结构来自契约 v2 blocks：builtin（或没有 typeset provider 的原生文字层）
+  // 是启发式，note 里必须标 best-effort；外部 typeset provider 的 blocks 才算结构。
+  const skimHeuristic = !transcript.typesetProvider || transcript.typesetProvider === 'builtin';
+  const hasOutline = Boolean(outline?.available);
+  const outlineSource = hasOutline ? (outline.source ?? 'unknown') : 'none';
+  let plan;
+
+  if (viewMode === 'outline') {
+    // 只出目录：没有目录时给明确的「没有」说明，绝不生成视频/录音目录。
+    const block = hasOutline
+      ? renderOutlineBlock(outline, { mediaType, pageCount, target: 'overview', maxChars: Math.max(1, capacity) })
+      : { text: noOutlineMessage(outline, mediaType), inlined: 0, total: 0 };
+    plan = {
+      mode: 'outline',
+      bodyText: block.text,
+      units: [],
+      preview: {
+        mode: 'outline',
+        units: 0,
+        totalUnits: 0,
+        notRepresented: [],
+        outlineSource,
+        outlineInlined: block.inlined,
+        outlineTotal: block.total,
+      },
+      note: null,
+    };
+  } else {
+    // tier 1 先试：请求范围整体放得下就给全文（即使有目录也不插队）。
+    const firstPlan = planOverviewPreview({
+      mediaType,
+      segments,
+      pages,
+      window,
+      textOnly,
+      capacity,
+      skimHeuristic,
+    });
+    if (viewMode === 'auto' && hasOutline && firstPlan.preview.mode !== 'whole') {
+      // 放不下且有目录：目录先占预算（最多一半），余量再交给 skim / 抽样。
+      const block = renderOutlineBlock(outline, {
+        mediaType,
+        pageCount,
+        target: 'overview',
+        maxChars: Math.max(1, Math.floor(capacity * 0.5)),
+      });
+      const remaining = Math.max(1, capacity - (block.text.length + 1));
+      const textPlan = planOverviewPreview({
+        mediaType,
+        segments,
+        pages,
+        window,
+        textOnly,
+        capacity: remaining,
+        skimHeuristic,
+        // 目录本身就是 heading 生成时，skim 再列一遍 heading 只是浪费预算。
+        allowSkim: !outline.generated,
+      });
+      plan = {
+        ...textPlan,
+        bodyText: [block.text, textPlan.bodyText].filter(Boolean).join('\n'),
+        preview: {
+          ...textPlan.preview,
+          outlineSource,
+          outlineInlined: block.inlined,
+          outlineTotal: block.total,
+        },
+      };
+    } else {
+      plan = {
+        ...firstPlan,
+        preview: {
+          ...firstPlan.preview,
+          ...(hasOutline
+            ? { outlineSource, outlineInlined: 0, outlineTotal: outline.total ?? 0 }
+            : {}),
+        },
+      };
+    }
+  }
+
+  const notes = [plan.note, ...bodyNotes, ...tailNotes].filter(Boolean);
+  const text = [headText, plan.bodyText, ...notes].filter(Boolean).join('\n');
+  return {
+    // 最后一道保险：任何输入下 text 长度都不超过 MMGREP_MAX_TEXT_INLINE_CHARS
+    text: clampInlineText(text, limit),
+    truncated: plan.preview.mode !== 'whole',
+    inlineSegments: unitsToInlineSegments(plan.units, mediaType),
+    preview: plan.preview,
+  };
 }
 
 function cellSizeLabel(imageDescriptors) {
@@ -825,27 +2063,122 @@ function formatZoomText({ base, mediaType, target, image, cropLabel }) {
   return `${header}\n${body}`;
 }
 
-function formatLocateText({ query, matches, totalSegments, mediaType }) {
+/* ------------------------------------------------------------------ *
+ * 文档 locate 的输出计划（ticket 9z5.23）
+ *
+ * 文档的 segment 粒度就是整页，命中即整页：直接回吐等于把命中的页复述一遍
+ * （实测一次调用 12 KB+）。文档侧的定位指标改成「页码 + 命中次数 + 命中附近的片段」：
+ *   - hits   —— 这一页命中几次（精确短语；没有精确命中就退回 token 覆盖，标 fuzzy）
+ *   - snippet—— 首个命中 ±150 字符，对齐词边界，折叠换行与排版空白
+ * 视频 / 录音不变：仍是 score（0..1）+ 时间戳 + 整段原文。
+ * ------------------------------------------------------------------ */
+
+/** 文档 locate 的总输出预算（约 3 KB）：超了就少展示几页，其余折叠成一行 */
+const DOC_LOCATE_TEXT_BUDGET = 3072;
+
+/** 向后端要的候选页上限（后端 locate 的 max 上限也是 20）；排序后再按用户的 max 截断 */
+const DOC_LOCATE_CANDIDATE_MAX = 20;
+
+const DOC_LOCATE_FOOTER = 'Feed any of these pages to media_zoom({ path, page }) — no need to re-read the whole file.';
+
+/** 文档命中行：`page 11  hits=3  (text)  「…片段…」`（没有 score：文档侧不用分数） */
+function documentMatchLine(match) {
+  const flags = [match.fuzzy ? 'fuzzy' : null, match.source ?? null].filter(Boolean).join(', ');
+  return `  page ${match.page}  hits=${match.hits}${flags ? ` (${flags})` : ''}  「${match.snippet}」`;
+}
+
+/** 没展示的命中页折成一行：`  3 more pages match: 3, 9, 14`（页码升序） */
+function documentMorePagesLine(morePages) {
+  const pages = morePages
+    .map((match) => match.page)
+    .sort((a, b) => (a ?? 0) - (b ?? 0))
+    .join(', ');
+  return `  ${morePages.length} more pages match: ${pages}`;
+}
+
+/**
+ * 决定展示哪几页：先按 hits 排序（已排好），再受用户的 max 与总预算（约 3 KB）约束。
+ * 返回 { matches, morePages }：morePages 是命中了但没展示的页。
+ */
+function planDocumentLocate({ query, matches, totalSegments, max }) {
+  const capped = matches.slice(0, max);
+  const overflow = matches.slice(max);
+  const render = (shown) => {
+    const hidden = capped.slice(shown.length).concat(overflow);
+    const lines = [`matches for "${query}" (${shown.length} of ${totalSegments} pages):`];
+    for (const match of shown) lines.push(documentMatchLine(match));
+    if (hidden.length > 0) lines.push(documentMorePagesLine(hidden));
+    lines.push(DOC_LOCATE_FOOTER);
+    return { hidden, text: lines.join('\n') };
+  };
+
+  let best = null;
+  for (let shown = 0; shown <= capped.length; shown += 1) {
+    const candidate = render(capped.slice(0, shown));
+    if (Buffer.byteLength(candidate.text, 'utf8') > DOC_LOCATE_TEXT_BUDGET) continue;
+    best = { matches: capped.slice(0, shown), morePages: candidate.hidden };
+  }
+  if (best) return best;
+
+  // 连一行都放不下（片段异常长）：至少展示第一页，片段按预算裁短
+  const first = capped[0];
+  if (!first) return { matches: [], morePages: overflow };
+  const overhead = Buffer.byteLength(`matches for "${query}" (1 of ${totalSegments} pages):\n${DOC_LOCATE_FOOTER}`, 'utf8');
+  const room = Math.max(0, DOC_LOCATE_TEXT_BUDGET - overhead - 64);
+  return {
+    matches: [{ ...first, snippet: trimToBytes(first.snippet, room) }],
+    morePages: capped.slice(1).concat(overflow),
+  };
+}
+
+/** 按 UTF-8 字节裁字符串 */
+function trimToBytes(text, maxBytes) {
+  if (maxBytes <= 0) return '';
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  let out = '';
+  let bytes = 0;
+  for (const ch of text) {
+    const size = Buffer.byteLength(ch, 'utf8');
+    if (bytes + size > maxBytes) break;
+    out += ch;
+    bytes += size;
+  }
+  return out;
+}
+
+function formatLocateText({ query, matches, totalSegments, mediaType, morePages = null }) {
   const header = `matches for "${query}" (${matches.length} of ${totalSegments} ${mediaType === 'document' ? 'pages' : 'segments'}):`;
   if (matches.length === 0) {
     return `no line matched "${query}" among ${totalSegments} ${mediaType === 'document' ? 'page texts' : 'transcript segments'}. `
       + 'Try shorter keywords, or a phrase that appears verbatim.';
   }
   const lines = [header];
+  if (mediaType === 'document') {
+    for (const match of matches) {
+      lines.push(documentMatchLine(match));
+    }
+    if (morePages && morePages.length > 0) {
+      lines.push(documentMorePagesLine(morePages));
+    }
+    lines.push(DOC_LOCATE_FOOTER);
+    return lines.join('\n');
+  }
   for (const match of matches) {
     const position = match.page !== null && match.page !== undefined
       ? `page ${match.page}`
       : rangeLabel(match.startMs, match.endMs);
     lines.push(`  ${position}  (${Number(match.score ?? 0).toFixed(2)})  ${quoteBySource(match.text, match.source)}`);
   }
-  lines.push(mediaType === 'document'
-    ? 'Feed any of these pages to media_zoom({ path, page }) — no need to re-read the whole file.'
-    : 'Feed any of these windows to media_zoom({ path, start, end }) — no need to re-read the whole file.');
+  lines.push('Feed any of these windows to media_zoom({ path, start, end }) — no need to re-read the whole file.');
   return lines.join('\n');
 }
 
-/** 续读提示（契约 §5.3 的 continuation） */
-function buildContinuation({ mediaType, window, durationMs, pages, pageCount, truncated, lastSegment }) {
+/**
+ * 续读提示（契约 §5.3 的 continuation）：只表达「请求范围之外还有内容」。
+ * 抽样（9z5.20）之后不存在「内联到哪就从哪续」的概念了，所以不再用 lastSegment
+ * 推算下一个起点；文档仍按页码翻页。
+ */
+function buildContinuation({ mediaType, window, durationMs, pages, pageCount }) {
   if (mediaType === 'document') {
     if (!Array.isArray(pages) || pages.length === 0 || pageCount === null || pageCount === undefined) return null;
     const lastPage = pages[pages.length - 1];
@@ -858,14 +2191,9 @@ function buildContinuation({ mediaType, window, durationMs, pages, pageCount, tr
     };
   }
   const duration = numberOrNull(durationMs);
-  let nextStartMs = null;
-  if (truncated && lastSegment) {
-    nextStartMs = lastSegment.endMs ?? lastSegment.startMs;
-  } else if (window && window.endMs !== null && window.endMs !== undefined) {
-    if (duration === null || window.endMs < duration) nextStartMs = window.endMs;
-  }
-  if (nextStartMs === null) return null;
-  if (duration !== null && nextStartMs >= duration) return null;
+  if (!window || window.endMs === null || window.endMs === undefined) return null;
+  if (duration !== null && window.endMs >= duration) return null;
+  const nextStartMs = window.endMs;
   return {
     nextStartMs,
     nextStartSec: nextStartMs / 1000,
@@ -929,12 +2257,14 @@ function asrProviderUsable(runtime) {
   return Boolean(config.apiKey) || isLoopback(config.baseUrl);
 }
 
-/** 文档解析 provider 是否真的可用 */
-function docProviderUsable(runtime) {
-  const provider = runtime?.docProvider;
+/** 文档 provider 的某个角色（ocr / typeset）是否真的可用 */
+function docRoleProviderUsable(runtime, role) {
+  const provider = runtime?.[`${role}Provider`];
   if (!provider) return false;
-  const config = runtime?.config?.doc;
+  const config = runtime?.config?.[role];
   if (!config) return true;
+  // builtin / none 没有凭据；只有外部 provider 才需要 key（回环地址免 key）。
+  if (!providerEnv('doc', config.provider)) return true;
   return Boolean(config.apiKey) || isLoopback(config.baseUrl);
 }
 
@@ -945,12 +2275,14 @@ function normalizeProbeResult(result, base, call) {
   const audioHealth = result.audioHealth ?? null;
   const capabilities = result.capabilities ?? {};
   const asrConfigured = asrProviderUsable(call.runtime);
-  const docConfigured = docProviderUsable(call.runtime);
+  const ocrConfigured = docRoleProviderUsable(call.runtime, 'ocr');
+  const typesetConfigured = docRoleProviderUsable(call.runtime, 'typeset');
   const asrAvailable = asrConfigured
     && mediaType !== 'document'
     && hasAudio
     && (audioHealth === null || audioHealth.effective !== false);
-  const ocrAvailable = docConfigured && mediaType === 'document';
+  const ocrAvailable = ocrConfigured && mediaType === 'document';
+  const typesetAvailable = typesetConfigured && mediaType === 'document';
 
   const defaults = {
     mediaType,
@@ -973,6 +2305,8 @@ function normalizeProbeResult(result, base, call) {
     audioHealth,
     pageCount: null,
     hasTextLayer: null,
+    // 9z5.33：内置目录（PDF 书签 / 章节）。后端给了值优先；没有就是 null（例如 stub 后端）。
+    outline: null,
     subtitleTracks: [],
     audioTracks: [],
     capabilities: {
@@ -983,8 +2317,13 @@ function normalizeProbeResult(result, base, call) {
       },
       ocr: {
         available: ocrAvailable,
-        provider: ocrAvailable ? (call.runtime?.docProvider?.id ?? null) : null,
+        provider: ocrAvailable ? (call.runtime?.ocrProvider?.id ?? null) : null,
         reason: ocrAvailable ? null : ocrUnavailableReason(mediaType, call),
+      },
+      typeset: {
+        available: typesetAvailable,
+        provider: typesetAvailable ? (call.runtime?.typesetProvider?.id ?? null) : null,
+        reason: typesetAvailable ? null : typesetUnavailableReason(mediaType, call),
       },
       transcriptSource: result.capabilities?.transcriptSource ?? 'none',
       transcriptOrigin: result.capabilities?.transcriptOrigin ?? 'none',
@@ -1006,6 +2345,7 @@ function normalizeProbeResult(result, base, call) {
       ...capabilities,
       asr: { ...defaults.capabilities.asr, ...(capabilities.asr ?? {}) },
       ocr: { ...defaults.capabilities.ocr, ...(capabilities.ocr ?? {}) },
+      typeset: { ...defaults.capabilities.typeset, ...(capabilities.typeset ?? {}) },
     },
     recommended: { ...defaults.recommended, ...(result.recommended ?? {}) },
   };
@@ -1028,10 +2368,23 @@ function asrUnavailableReason({ mediaType, hasAudio, audioHealth, call }) {
 
 function ocrUnavailableReason(mediaType, call) {
   if (mediaType !== 'document') return 'ocr is not applicable to this media type.';
-  if (call.runtime?.providerErrors?.doc) return call.runtime.providerErrors.doc;
-  if (!call.runtime?.docProvider) return 'MMGREP_DOC_PROVIDER is "none".';
-  const config = call.runtime?.config?.doc;
-  if (config && !config.apiKey && !isLoopback(config.baseUrl)) {
+  if (call.runtime?.providerErrors?.ocr) return call.runtime.providerErrors.ocr;
+  if (!call.runtime?.ocrProvider) return 'MMGREP_OCR_PROVIDER is "none". Pages without a text layer are returned as page images only.';
+  const config = call.runtime?.config?.ocr;
+  if (config && providerEnv('doc', config.provider) && !config.apiKey && !isLoopback(config.baseUrl)) {
+    return `${providerApiKeyEnv('doc', config.provider)} is not set for provider "${config.provider}".`;
+  }
+  return null;
+}
+
+function typesetUnavailableReason(mediaType, call) {
+  if (mediaType !== 'document') return 'typeset is not applicable to this media type.';
+  if (call.runtime?.providerErrors?.typeset) return call.runtime.providerErrors.typeset;
+  if (!call.runtime?.typesetProvider) {
+    return 'MMGREP_TYPESET_PROVIDER is "none". Pages with a text layer use the raw extracted text.';
+  }
+  const config = call.runtime?.config?.typeset;
+  if (config && providerEnv('doc', config.provider) && !config.apiKey && !isLoopback(config.baseUrl)) {
     return `${providerApiKeyEnv('doc', config.provider)} is not set for provider "${config.provider}".`;
   }
   return null;
@@ -1091,6 +2444,8 @@ async function handleOverview(args, call) {
     pageCount,
     durationSec,
     envelope: Boolean(args.envelope),
+    // 9z5.31：文档 ocr:"force" → 后端 ocrMode；video/audio 已被 checkApplicability 拒绝。
+    ocrMode: mediaType === 'document' ? (args.ocr ?? 'auto') : undefined,
     ...(plan ? { cells: plan.produced.cells, images: plan.produced.images, maxEdge: plan.produced.maxEdge } : {}),
   };
 
@@ -1099,6 +2454,15 @@ async function handleOverview(args, call) {
   await call.onProgress({ stage: 'rendering', used: `${Array.isArray(result.images) ? result.images.length : 0} image(s)` });
 
   const segments = normalizeSegmentsSafe(result.segments);
+  // 9z5.33：目录在落盘与格式化之前装配：manifest.json 要拿到**完整**目录，
+  // text 只内联预算内的部分。内置目录来自 probe（PDF 书签 / 章节），文档没有
+  // 书签时才从 blocks 的 heading 生成（>= 5 条）。
+  const view = args.view === 'outline' || args.view === 'text' ? args.view : 'auto';
+  const outline = buildOverviewOutline({
+    mediaType,
+    probeOutline: probe.outline,
+    segments,
+  });
   const rawImages = Array.isArray(result.images) ? result.images : [];
   const { blocks, descriptors } = plan
     ? collectImages(rawImages, plan, call.config)
@@ -1124,7 +2488,23 @@ async function handleOverview(args, call) {
     descriptors,
     budget,
     warnings: [...(Array.isArray(result.warnings) ? result.warnings : [])],
+    outline,
     durationSec,
+    pageCount,
+  });
+  // 落盘成功与否都要在 text content 里说明（.22）：只放 structuredContent 的话，
+  // 依赖文本通道的宿主永远看不到路径。
+  const fullTextNote = exported.ok
+    ? exported.note
+    : `full text: NOT written — ${exported.reason}`;
+
+  // 续读提示只依赖请求范围（不再依赖内联截断到哪），所以可以在格式化之前算好，
+  // 并作为固定 notes 计入内联上限。
+  const continuation = buildContinuation({
+    mediaType,
+    window,
+    durationMs: numberOrNull(probe.durationMs) ?? (durationSec !== null ? Math.round(durationSec * 1000) : null),
+    pages,
     pageCount,
   });
 
@@ -1133,34 +2513,30 @@ async function handleOverview(args, call) {
     base,
     window,
     pages,
+    pageCount,
     durationSec,
     segments,
     transcript,
     imageDescriptors: descriptors,
     textOnly,
+    warnings: Array.isArray(result.warnings) ? result.warnings : [],
     budget: {
       ...budget,
       maxInlineChars: call.config?.text?.maxInlineChars ?? DEFAULT_MAX_TEXT_INLINE_CHARS,
       perImageTokens: plan?.perImageTokens ?? null,
     },
     hasAudio: probe.hasAudio ?? mediaType !== 'document',
-  });
-
-  // 内联清单只包含前 N 条，结构化返回与文本保持一致（contract §5.3：节选）
-  const inlineSegments = segments.slice(0, text.keptCount);
-  const continuation = buildContinuation({
-    mediaType,
-    window,
-    durationMs: numberOrNull(probe.durationMs) ?? (durationSec !== null ? Math.round(durationSec * 1000) : null),
-    pages,
-    pageCount,
-    truncated: text.truncated,
-    lastSegment: inlineSegments[inlineSegments.length - 1] ?? null,
+    fullTextNote,
+    continuationNote: continuation?.note ?? null,
+    view,
+    outline,
   });
 
   const structuredContent = {
     mediaType,
     path: base.path,
+    view,
+    outline,
     window: {
       startMs: window?.startMs ?? null,
       endMs: window?.endMs ?? null,
@@ -1170,16 +2546,22 @@ async function handleOverview(args, call) {
       clipped: window?.clipped ?? false,
     },
     images: descriptors,
-    segments: inlineSegments,
+    // 只放**实际内联**的单元（抽样后就是被抽到的那些；全文在 content.md / segments.jsonl）
+    segments: text.inlineSegments,
     transcript,
     pages: mediaType === 'document' ? buildPageTexts(segments) : null,
-    fullText: {
-      dir: exported.outDir,
-      contentMd: exported.contentPath,
-      segmentsJsonl: exported.segmentsPath,
-      manifestJson: exported.manifestPath,
-    },
+    fullText: exported.ok
+      ? {
+        dir: exported.outDir,
+        contentMd: exported.contentPath,
+        segmentsJsonl: exported.segmentsPath,
+        manifestJson: exported.manifestPath,
+      }
+      : null,
+    fullTextReason: exported.ok ? null : exported.reason,
     truncated: text.truncated,
+    // 预览是 whole（全量）还是 sampled（抽样），以及覆盖了哪些页
+    preview: text.preview,
     continuation,
     budget,
   };
@@ -1238,7 +2620,9 @@ export function cangjieMediaType(mediaType, filePath) {
 }
 
 /** 全文落盘：契约 §9 的 content.md / segments.jsonl / manifest.json */
-async function persistOverview({ call, base, mediaType, segments, transcript, window, pages, descriptors, budget, warnings, durationSec, pageCount }) {
+async function persistOverview({
+  call, base, mediaType, segments, transcript, window, pages, descriptors, budget, warnings, outline, durationSec, pageCount,
+}) {
   const { cache, logger } = call;
   let sha256 = null;
   if (cache?.contentKeyForFile) {
@@ -1253,6 +2637,7 @@ async function persistOverview({ call, base, mediaType, segments, transcript, wi
 
   const key = `sha256:${sha256}`;
   let outDir;
+  let fallbackDir = false;
   if (cache?.prepareDir) {
     try {
       outDir = await cache.prepareDir(key);
@@ -1260,47 +2645,60 @@ async function persistOverview({ call, base, mediaType, segments, transcript, wi
       logger?.warn?.(`could not prepare the cache directory: ${error?.message ?? error}`);
     }
   }
-  if (!outDir) outDir = path.join(os.tmpdir(), 'multimediagrep', sha256);
+  if (!outDir) {
+    outDir = path.join(os.tmpdir(), 'multimediagrep', sha256);
+    fallbackDir = true;
+  }
 
-  const exported = await exportAnalysis({
-    outDir,
-    source: {
-      path: base.path,
-      mediaType,
-      sizeBytes: base.sizeBytes,
-      modifiedMs: base.modifiedMs,
-      sha256,
-      durationSec,
-      pageCount,
-    },
-    mediaType: cangjieMediaType(mediaType, base.path),
-    segments,
-    transcript: {
-      source: transcript.source,
-      origin: transcript.origin,
-      language: transcript.language,
+  let exported;
+  try {
+    exported = await exportAnalysis({
+      outDir,
+      source: {
+        path: base.path,
+        mediaType,
+        sizeBytes: base.sizeBytes,
+        modifiedMs: base.modifiedMs,
+        sha256,
+        durationSec,
+        pageCount,
+      },
+      mediaType: cangjieMediaType(mediaType, base.path),
+      segments,
+      transcript: {
+        source: transcript.source,
+        origin: transcript.origin,
+        language: transcript.language,
+        provider: transcript.provider,
+        model: transcript.model,
+        file: transcript.file,
+      },
+      overview: {
+        images: descriptors.map((d) => ({
+          index: d.index,
+          width: d.width,
+          height: d.height,
+          cells: d.cells,
+          mimeType: d.mimeType,
+          bytes: d.bytes,
+          estimatedTokens: d.estimatedTokens,
+        })),
+        estimatedTokens: budget.estimatedTokens,
+      },
+      window: window ? { startMs: window.startMs, endMs: window.endMs } : null,
+      pages,
+      outline,
       provider: transcript.provider,
-      model: transcript.model,
-      file: transcript.file,
-    },
-    overview: {
-      images: descriptors.map((d) => ({
-        index: d.index,
-        width: d.width,
-        height: d.height,
-        cells: d.cells,
-        mimeType: d.mimeType,
-        bytes: d.bytes,
-        estimatedTokens: d.estimatedTokens,
-      })),
-      estimatedTokens: budget.estimatedTokens,
-    },
-    window: window ? { startMs: window.startMs, endMs: window.endMs } : null,
-    pages,
-    provider: transcript.provider,
-    warnings,
-    tool: 'media_overview',
-  });
+      warnings,
+      tool: 'media_overview',
+    });
+  } catch (error) {
+    // 落盘失败不能让整个 overview 调用失败：inline 预览仍然有用，
+    // 但必须在 text content 里把「没写成 + 原因」说清楚（.22）。
+    const reason = error?.message ?? String(error);
+    logger?.warn?.(`could not write the full text export: ${reason}`);
+    return { ok: false, reason };
+  }
 
   if (cache?.register) {
     try {
@@ -1309,7 +2707,15 @@ async function persistOverview({ call, base, mediaType, segments, transcript, wi
       logger?.debug?.(`could not register the export entry in the cache: ${error?.message ?? error}`);
     }
   }
-  return exported;
+  const noteSuffix = fallbackDir
+    ? '; the cache directory was unavailable, so this copy went to the OS temp directory and may be cleaned up'
+    : '';
+  return {
+    ok: true,
+    ...exported,
+    fallbackDir,
+    note: `full text: ${exported.contentPath} (segments.jsonl, manifest.json in the same directory${noteSuffix})`,
+  };
 }
 
 /** 没有 cache 模块时的兜底哈希（流式，不把整个视频读进内存） */
@@ -1496,7 +2902,8 @@ async function handleLocate(args, call) {
   const input = {
     ...baseInput({ ...base, mediaType }),
     query: args.query,
-    max,
+    // 文档：向后端多要几页候选，才能按 hits 排序后再按用户的 max 截断
+    max: mediaType === 'document' ? DOC_LOCATE_CANDIDATE_MAX : max,
     subtitle: args.subtitle ?? null,
     transcript: mediaType === 'document' ? undefined : (args.transcript ?? 'auto'),
     startMs: window?.startMs ?? null,
@@ -1508,10 +2915,17 @@ async function handleLocate(args, call) {
     pageCount,
     durationSec,
     includeFrame: Boolean(args.includeFrame),
+    // 9z5.31：文档 ocr:"force" → 后端 ocrMode（locate 也要能搜重新识别出来的文字）。
+    ocrMode: mediaType === 'document' ? (args.ocr ?? 'auto') : undefined,
   };
 
   const result = (await call.dispatcher.call(mediaType, 'locate', input, call.backendCtx)) ?? {};
-  const matches = normalizeMatches(result.matches, pageCount);
+  const rawMatches = normalizeMatches(result.matches, pageCount);
+  // 文档分支：整页命中 → 页码 + 命中次数 + 命中附近的片段（score 在文档侧没有意义）
+  const documentMatches = mediaType === 'document'
+    ? buildDocumentMatches(rawMatches, args.query)
+    : null;
+  const matches = documentMatches ?? rawMatches;
   const transcriptSource = result.transcript?.source ?? matches[0]?.source ?? 'none';
   const transcriptOrigin = result.transcript?.origin ?? matches[0]?.origin ?? 'none';
   const totalSegments = Number.isInteger(result.totalSegments) ? result.totalSegments : matches.length;
@@ -1538,11 +2952,17 @@ async function handleLocate(args, call) {
     }
   }
 
+  const plan = documentMatches
+    ? planDocumentLocate({ query: args.query, matches: documentMatches, totalSegments, max })
+    : null;
+  const shownMatches = plan ? plan.matches : matches;
+
   const text = formatLocateText({
     query: args.query,
-    matches,
+    matches: shownMatches,
     totalSegments,
     mediaType,
+    morePages: plan ? plan.morePages : null,
   });
 
   const structuredContent = {
@@ -1551,7 +2971,7 @@ async function handleLocate(args, call) {
     query: args.query,
     transcriptSource,
     transcriptOrigin,
-    matches,
+    matches: shownMatches,
     totalSegments,
     searchedWindow: {
       startMs: window?.startMs ?? null,
@@ -1588,9 +3008,51 @@ function normalizeMatches(rawMatches, pageCount) {
       text: String(match?.text ?? ''),
       source: match?.source ?? 'none',
       origin: match?.origin ?? 'none',
+      // 文档：逐页来源细节（契约 v2 的 textOrigin；视频/录音为 null）。
+      textOrigin: match?.textOrigin ?? null,
       page,
     };
   });
+}
+
+/**
+ * 文档分支：把「整页命中」变成「页码 + 命中次数 + 命中附近的片段」。
+ *
+ * - hits：这页命中几次（精确短语；没有精确命中就退回 token 覆盖，标 fuzzy）
+ * - snippet：首个命中 ±150 字符，对齐词边界，折叠换行与排版空白
+ * - 不带 score：文档没有「分数」，同一字段两种语义会打架（9z5.23 / 9z5.25）
+ * - 不带 text：整页正文不再返回（要整页用 media_overview({ pages }) 或 content.md）
+ * 排序：精确命中优先 → 命中次数降序 → 页码升序。
+ */
+function buildDocumentMatches(matches, query) {
+  const out = [];
+  for (const match of matches) {
+    const { hits, fuzzy, index } = countHits(match.text, query);
+    if (hits <= 0) continue;
+    out.push({
+      page: match.page,
+      hits,
+      fuzzy,
+      snippet: buildSnippet(match.text, query, { index, radius: DOC_SNIPPET_RADIUS }),
+      source: match.source,
+      origin: match.origin,
+      textOrigin: match.textOrigin ?? null,
+    });
+  }
+  // 排序：精确命中优先 → 命中次数降序 → 页码升序。
+  // 精确命中优先是必要的：token 覆盖（fuzzy）会把只命中一个常见词的页也算进来，
+  // 那些页的 hits 可能比整句命中的一页还多（“SECOND PAGE” vs 每页都有的 “PAGE”）。
+  out.sort((a, b) => (Number(a.fuzzy) - Number(b.fuzzy))
+    || (b.hits - a.hits)
+    || ((a.page ?? 0) - (b.page ?? 0)));
+  return out.map((match, index) => ({
+    rank: index + 1,
+    startMs: null,
+    endMs: null,
+    startSec: null,
+    endSec: null,
+    ...match,
+  }));
 }
 
 /* ------------------------------------------------------------------ *
@@ -1656,7 +3118,8 @@ export function createCallContext(runtime, extra, toolName) {
     backendCtx: {
       cache: runtime.cache ?? null,
       asrProvider: runtime.asrProvider ?? null,
-      docProvider: runtime.docProvider ?? null,
+      ocrProvider: runtime.ocrProvider ?? null,
+      typesetProvider: runtime.typesetProvider ?? null,
       logger: runtime.logger,
       onProgress,
       signal: extra?.signal ?? null,
@@ -1669,7 +3132,7 @@ export function createCallContext(runtime, extra, toolName) {
  * 把 4 个工具注册到 McpServer。
  *
  * @param {import('@modelcontextprotocol/sdk/server/mcp.js').McpServer} server
- * @param {object} runtime { config, logger, cache, asrProvider, docProvider, backends, dispatcher }
+ * @param {object} runtime { config, logger, cache, asrProvider, ocrProvider, typesetProvider, backends, dispatcher }
  */
 export function registerTools(server, runtime) {
   for (const definition of TOOL_DEFINITIONS) {

@@ -322,6 +322,87 @@ function generateSampleScene(outDir) {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. sample-chapters.mp4 — the scene clip re-muxed with ffmpeg chapters
+//
+// MP4 chapters live in a metadata track. ffmpeg reads them from an ffmetadata
+// text file (`[CHAPTER]` blocks) via `-i metadata.txt -map_chapters 1 -c copy`.
+// The ground truth timestamps line up with the scene cuts, so tests can assert
+// that probe shows the chapter titles with the right timestamps.
+// ---------------------------------------------------------------------------
+
+const CHAPTER_MARKERS = [
+  { title: 'Opening', startMs: 0, endMs: 2000 },
+  { title: 'Build Up', startMs: 2000, endMs: 5000 },
+  { title: 'Main Section', startMs: 5000, endMs: 9000 },
+  { title: 'Wrap Up', startMs: 9000, endMs: 12000 },
+];
+
+function generateSampleChapters(outDir) {
+  const source = path.join(outDir, 'sample-scene.mp4');
+  const tmpDir = path.join(outDir, '.tmp');
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const metadataPath = path.join(tmpDir, 'chapters.ffmetadata');
+  const metadata = [
+    ';FFMETADATA1',
+    ...CHAPTER_MARKERS.flatMap((chapter) => [
+      '[CHAPTER]',
+      'TIMEBASE=1/1000',
+      `START=${chapter.startMs}`,
+      `END=${chapter.endMs}`,
+      `title=${chapter.title}`,
+    ]),
+    '',
+  ].join('\n');
+  fs.writeFileSync(metadataPath, metadata, 'latin1');
+
+  const outFile = path.join(outDir, 'sample-chapters.mp4');
+  ffmpeg([
+    '-y',
+    '-v',
+    'error',
+    '-i',
+    source,
+    '-i',
+    metadataPath,
+    '-map',
+    '0',
+    '-map_metadata',
+    '1',
+    '-map_chapters',
+    '1',
+    '-c',
+    'copy',
+    '-fflags',
+    '+bitexact',
+    '-flags:v',
+    '+bitexact',
+    '-flags:a',
+    '+bitexact',
+    '-movflags',
+    '+faststart',
+    outFile,
+  ]);
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+
+  return {
+    id: 'sample-chapters',
+    kind: 'video',
+    file: 'sample-chapters.mp4',
+    generator: 'fixtures/generate.mjs',
+    derivedFrom: 'sample-scene.mp4',
+    durationMs: 12000,
+    width: VIDEO_WIDTH,
+    height: VIDEO_HEIGHT,
+    fps: FPS,
+    chapters: CHAPTER_MARKERS.map((chapter) => ({
+      title: chapter.title,
+      startMs: chapter.startMs,
+      endMs: chapter.endMs,
+    })),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 2. sample-subtitles.mp4 + sample-subtitles.srt
 // ---------------------------------------------------------------------------
 
@@ -869,6 +950,584 @@ function generateSampleTextPdf(outDir) {
 }
 
 // ---------------------------------------------------------------------------
+// 5c. sample-twocolumn.pdf  (two-column reading order + heuristic blocks)
+//
+// The fixture is synthetic on purpose (no real paper enters the repo):
+//   page 1: full-width title + abstract, then a two-column body;
+//   page 2: two-column section headings ("2. Results", "2.1 ...") and
+//           "Fig. N" / "Table N" captions;
+//   page 3: single-column control with a vector table (must not be reflowed).
+//
+// pdftotext -layout emits page 1/2 body lines as "left text <spaces> right
+// text"; the ground truth records which lines belong to which column so the
+// reflow tests can assert left-then-right order without crossing columns.
+// ---------------------------------------------------------------------------
+
+const TWOCOL_MARGIN_PT = 42;
+const TWOCOL_COLUMN_WIDTH_PT = 240;
+const TWOCOL_GUTTER_PT = 30;
+const TWOCOL_LEFT_X_PT = TWOCOL_MARGIN_PT;
+const TWOCOL_RIGHT_X_PT = TWOCOL_LEFT_X_PT + TWOCOL_COLUMN_WIDTH_PT + TWOCOL_GUTTER_PT;
+const TWOCOL_BODY_SIZE = 9;
+const TWOCOL_LEADING_PT = 12;
+
+const TWOCOL_PAGE1 = {
+  title: 'TWO-COLUMN REFLOW FIXTURE',
+  abstract:
+    'ABSTRACT: This synthetic paper exercises reading-order reflow for the builtin typeset provider.',
+  leftParagraphs: [[
+    'Programmable small RNA-protein complexes such as',
+    'CRISPR-Cas enable a single protein to serve as a',
+    'flexible scaffold for targeting. Despite their',
+    'flexibility, these systems are limited by off-target',
+    'activity and unknown interactions with regulatory',
+    'machinery. Genome mining and protein engineering',
+    'continue to produce smaller variants, but delivery',
+    'remains the dominant barrier for translation.',
+  ]],
+  rightParagraphs: [[
+    'To address these limitations, we developed a',
+    'modular platform that couples engineered guide RNAs',
+    'with a compact effector domain. The resulting',
+    'complexes retain programmable targeting while',
+    'reducing unintended interactions in primary cells.',
+    'In this study we characterize the platform across',
+    'multiple cell types and report improved specificity',
+    'without detectable off-target editing.',
+  ]],
+};
+
+const TWOCOL_PAGE2 = {
+  // null = an empty row on this side; the other column may still have text.
+  leftRows: [
+    '2. Results', null,
+    '2.1 Reflow quality', null,
+    'The reflowed page keeps the left column',
+    'contiguous before the right column begins.',
+    'Each sentence stays inside its own column.',
+    null, null,
+    'Fig. 1. Reading order after gutter reflow.',
+  ],
+  rightRows: [
+    '2.2 Block heuristics', null,
+    'Short numbered lines become headings and',
+    'lines beginning with Fig. or Table become',
+    'captions in the typeset output.',
+    null, null,
+    'Table 1. Heuristic block types.',
+  ],
+  leftParagraphs: [
+    ['The reflowed page keeps the left column', 'contiguous before the right column begins.', 'Each sentence stays inside its own column.'],
+  ],
+  rightParagraphs: [
+    ['Short numbered lines become headings and', 'lines beginning with Fig. or Table become', 'captions in the typeset output.'],
+  ],
+};
+
+const TWOCOL_PAGE3 = {
+  lines: [
+    '3. Conclusion', null,
+    'A single-column page must not be reflowed. The',
+    'table below keeps its layout and cell contents.',
+  ],
+  table: {
+    header: ['KEY', 'VALUE', 'NOTE'],
+    rows: [
+      ['ALPHA', 'ONE', 'FIRST'],
+      ['BETA', 'TWO', 'SECOND'],
+      ['GAMMA', 'THREE', 'THIRD'],
+    ],
+  },
+};
+
+/** One column of text ops; null rows advance the vertical position (blank line). */
+function twoColumnOps(rows, x, topY) {
+  const ops = [];
+  rows.forEach((text, index) => {
+    if (text === null) return;
+    ops.push(pdfTextOp(x, topY - index * TWOCOL_LEADING_PT, text, { font: 'F1', size: TWOCOL_BODY_SIZE }));
+  });
+  return ops;
+}
+
+function twoColumnPageOps(page) {
+  const ops = [];
+  const topY = PDF_HEIGHT - 120;
+  ops.push(...twoColumnOps(page.leftRows, TWOCOL_LEFT_X_PT, topY));
+  ops.push(...twoColumnOps(page.rightRows, TWOCOL_RIGHT_X_PT, topY));
+  return ops;
+}
+
+function generateSampleTwoColumnPdf(outDir) {
+  // Page 1: title + abstract (full width) over a two-column body.
+  const page1Ops = [
+    pdfTextOp(170, PDF_HEIGHT - 60, TWOCOL_PAGE1.title, { font: 'F2', size: 15 }),
+    pdfTextOp(42, PDF_HEIGHT - 88, TWOCOL_PAGE1.abstract, { font: 'F1', size: 9 }),
+  ];
+  const bodyTopY = PDF_HEIGHT - 120;
+  for (const paragraph of TWOCOL_PAGE1.leftParagraphs) {
+    page1Ops.push(...twoColumnOps(paragraph, TWOCOL_LEFT_X_PT, bodyTopY));
+  }
+  for (const paragraph of TWOCOL_PAGE1.rightParagraphs) {
+    page1Ops.push(...twoColumnOps(paragraph, TWOCOL_RIGHT_X_PT, bodyTopY));
+  }
+
+  // Page 2: headings / captions inside the columns.
+  const page2Ops = twoColumnPageOps(TWOCOL_PAGE2);
+
+  // Page 3: single-column control page with a vector table.
+  const page3Ops = [];
+  const page3TopY = PDF_HEIGHT - 72;
+  TWOCOL_PAGE3.lines.forEach((text, index) => {
+    if (text === null) return;
+    page3Ops.push(pdfTextOp(TWOCOL_MARGIN_PT, page3TopY - index * 12, text, { font: 'F1', size: 11 }));
+  });
+  const tableTopY = page3TopY - TWOCOL_PAGE3.lines.length * 12 - 20;
+  const tableColumnWidth = 140;
+  const tableRowHeight = 24;
+  const table = buildTableOps({
+    header: TWOCOL_PAGE3.table.header,
+    rows: TWOCOL_PAGE3.table.rows,
+    originX: TWOCOL_MARGIN_PT,
+    topY: tableTopY,
+    columnWidth: tableColumnWidth,
+    rowHeight: tableRowHeight,
+  });
+  page3Ops.push(...table.ops);
+
+  const pdf = buildPDF({
+    pages: [
+      { kind: 'text', width: PDF_WIDTH, height: PDF_HEIGHT, ops: page1Ops, fonts: ['F1', 'F2'] },
+      { kind: 'text', width: PDF_WIDTH, height: PDF_HEIGHT, ops: page2Ops, fonts: ['F1', 'F2'] },
+      { kind: 'text', width: PDF_WIDTH, height: PDF_HEIGHT, ops: page3Ops, fonts: ['F1', 'F2'] },
+    ],
+  });
+  writeFile(outDir, 'sample-twocolumn.pdf', pdf);
+
+  const page1Left = TWOCOL_PAGE1.leftParagraphs.flat();
+  const page1Right = TWOCOL_PAGE1.rightParagraphs.flat();
+  const page2Blocks = [
+    { type: 'heading', level: 1, text: '2. Results' },
+    { type: 'heading', level: 2, text: '2.1 Reflow quality' },
+    { type: 'paragraph', text: TWOCOL_PAGE2.leftParagraphs[0].join('\n') },
+    { type: 'caption', text: 'Fig. 1. Reading order after gutter reflow.' },
+    { type: 'heading', level: 2, text: '2.2 Block heuristics' },
+    { type: 'paragraph', text: TWOCOL_PAGE2.rightParagraphs[0].join('\n') },
+    { type: 'caption', text: 'Table 1. Heuristic block types.' },
+  ];
+
+  return {
+    id: 'sample-twocolumn-pdf',
+    kind: 'pdf',
+    file: 'sample-twocolumn.pdf',
+    generator: 'fixtures/generate.mjs',
+    pageCount: 3,
+    pageWidthPt: PDF_WIDTH,
+    pageHeightPt: PDF_HEIGHT,
+    hasTextLayer: true,
+    fonts: ['Helvetica', 'Helvetica-Bold'],
+    layout: {
+      marginPt: TWOCOL_MARGIN_PT,
+      columnWidthPt: TWOCOL_COLUMN_WIDTH_PT,
+      gutterPt: TWOCOL_GUTTER_PT,
+      leftColumnXPt: TWOCOL_LEFT_X_PT,
+      rightColumnXPt: TWOCOL_RIGHT_X_PT,
+    },
+    pages: [
+      {
+        page: 1,
+        layout: 'two-column',
+        title: TWOCOL_PAGE1.title,
+        abstract: TWOCOL_PAGE1.abstract,
+        leftLines: page1Left,
+        rightLines: page1Right,
+        leftParagraphs: TWOCOL_PAGE1.leftParagraphs,
+        rightParagraphs: TWOCOL_PAGE1.rightParagraphs,
+        expectedBlocks: [
+          { type: 'heading', level: 1, text: TWOCOL_PAGE1.title },
+          { type: 'paragraph', text: TWOCOL_PAGE1.abstract },
+          { type: 'paragraph', text: page1Left.join('\n') },
+          { type: 'paragraph', text: page1Right.join('\n') },
+        ],
+      },
+      {
+        page: 2,
+        layout: 'two-column',
+        leftRows: TWOCOL_PAGE2.leftRows,
+        rightRows: TWOCOL_PAGE2.rightRows,
+        leftParagraphs: TWOCOL_PAGE2.leftParagraphs,
+        rightParagraphs: TWOCOL_PAGE2.rightParagraphs,
+        headings: [{ level: 1, text: '2. Results' }, { level: 2, text: '2.1 Reflow quality' }, { level: 2, text: '2.2 Block heuristics' }],
+        captions: ['Fig. 1. Reading order after gutter reflow.', 'Table 1. Heuristic block types.'],
+        expectedBlocks: page2Blocks,
+      },
+      {
+        page: 3,
+        layout: 'single-column',
+        lines: TWOCOL_PAGE3.lines.filter((text) => text !== null),
+        headings: [{ level: 1, text: '3. Conclusion' }],
+        table: {
+          page: 3,
+          originXPt: table.originX,
+          topYPt: table.topY,
+          columnWidthPt: table.columnWidth,
+          rowHeightPt: table.rowHeight,
+          columnXPt: table.columnX,
+          rowYPt: table.rowY,
+          header: table.header,
+          rows: table.rows,
+          cells: table.cells,
+        },
+      },
+    ],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 5a2. sample-outline.pdf  (PDF bookmarks + printed page labels)
+//      sample-headings.pdf (no bookmarks, >= 5 headings -> generated outline)
+//
+// 9z5.33 的内置目录 fixture：
+//   sample-outline.pdf
+//     - 12 pages, ~50 lines each: whole text is far above the 24k inline limit;
+//     - 68 bookmarks in 2 levels (plus 2 level-3 entries) on physical pages 1-12;
+//     - /PageLabels: physical 1-2 = "i","ii"; physical 3-12 = "1".."10".
+//       The outline therefore carries BOTH the physical page and the label.
+//   sample-headings.pdf
+//     - 3 pages, 6 numbered headings separated by blank lines (builtin blocks
+//       turn them into heading blocks), no /Outlines at all.
+// ---------------------------------------------------------------------------
+
+const OUTLINE_PDF_WIDTH = 595;
+const OUTLINE_PDF_HEIGHT = 842;
+const OUTLINE_PDF_MARGIN = 56;
+const OUTLINE_PDF_BODY_SIZE = 9;
+const OUTLINE_PDF_LEADING = 12;
+const OUTLINE_PDF_LINES_PER_PAGE = 58;
+
+/** 一句可读的正文行；字符数固定，便于测试估算「超出上限」 */
+function outlineBodyLine(page, line) {
+  const suffix = ` Page ${page} line ${line} keeps the text layer dense enough that the requested range cannot be inlined whole.`;
+  let text = `Synthetic outline fixture sentence ${String(line).padStart(2, '0')}.${suffix}`;
+  while (text.length < 150) text += ' The quick brown fox jumps over the lazy dog.';
+  return text;
+}
+
+function outlineSectionTitle(section) {
+  const titles = ['Introduction', 'Related Work', 'Methods', 'Results', 'Discussion', 'Conclusion'];
+  return `${section}. ${titles[section - 1] ?? 'Section'}`;
+}
+
+/**
+ * 68 bookmarks: 6 top-level sections + 60 level-2 subsections + 2 level-3 entries.
+ * Pages advance in pairs, so every section starts on an odd physical page.
+ */
+function outlineEntries() {
+  const entries = [];
+  for (let section = 1; section <= 6; section += 1) {
+    const firstPage = section * 2 - 1;
+    const children = [];
+    for (let child = 1; child <= 10; child += 1) {
+      const page = Math.min(12, firstPage + (child > 5 ? 1 : 0));
+      const node = {
+        title: `${section}.${child} ${['Setup', 'Data', 'Analysis', 'Limits', 'Notes', 'Checks', 'Figures', 'Tables', 'Details', 'Outlook'][child - 1]}`,
+        page,
+      };
+      if ((section === 3 || section === 5) && child === 5) {
+        node.children = [{ title: `${section}.${child}.1 Deep dive`, page }];
+      }
+      children.push(node);
+    }
+    entries.push({
+      title: outlineSectionTitle(section),
+      page: Math.min(12, firstPage),
+      children,
+    });
+  }
+  return entries;
+}
+
+/** 把嵌套书签拍平（测试 ground truth 用）：level / title / physical page */
+function flattenOutline(entries, level = 1, out = []) {
+  for (const entry of entries) {
+    out.push({ level, title: entry.title, page: entry.page });
+    if (entry.children) flattenOutline(entry.children, level + 1, out);
+  }
+  return out;
+}
+
+const OUTLINE_ENTRIES = outlineEntries();
+const OUTLINE_FLAT = flattenOutline(OUTLINE_ENTRIES);
+const OUTLINE_PAGE_LABELS = [
+  { startPage: 1, style: 'r' },
+  { startPage: 3, style: 'D', start: 1 },
+];
+
+/** 物理页 → 打印标签（与 /PageLabels 的定义一致，写进 ground truth） */
+function expectedPageLabels(pageCount) {
+  const labels = [];
+  for (let page = 1; page <= pageCount; page += 1) {
+    if (page <= 2) {
+      labels.push({ page, label: page === 1 ? 'i' : 'ii' });
+    } else {
+      labels.push({ page, label: String(page - 2) });
+    }
+  }
+  return labels;
+}
+
+function generateSampleOutlinePdf(outDir) {
+  const pages = [];
+  const pageTruth = [];
+  const charsByPage = {};
+  const labelsByPage = new Map(expectedPageLabels(12).map((entry) => [entry.page, entry.label]));
+
+  for (let page = 1; page <= 12; page += 1) {
+    const ops = [];
+    const lines = [];
+    const title = `SECTION ${Math.ceil(page / 2)} — SYNTHETIC OUTLINE FIXTURE`;
+    const titleY = OUTLINE_PDF_HEIGHT - OUTLINE_PDF_MARGIN;
+    ops.push(pdfTextOp(OUTLINE_PDF_MARGIN, titleY, title, { font: 'F2', size: 13 }));
+    lines.push({ text: title, xPt: OUTLINE_PDF_MARGIN, yPt: titleY, font: 'F2', size: 13 });
+    for (let line = 1; line <= OUTLINE_PDF_LINES_PER_PAGE; line += 1) {
+      const text = outlineBodyLine(page, line);
+      const y = titleY - 30 - (line - 1) * OUTLINE_PDF_LEADING;
+      ops.push(pdfTextOp(OUTLINE_PDF_MARGIN, y, text, { font: 'F1', size: OUTLINE_PDF_BODY_SIZE }));
+      lines.push({ text, xPt: OUTLINE_PDF_MARGIN, yPt: y, font: 'F1', size: OUTLINE_PDF_BODY_SIZE });
+    }
+    charsByPage[page] = lines.reduce((sum, entry) => sum + entry.text.length + 1, 0);
+    pages.push({
+      kind: 'text',
+      width: OUTLINE_PDF_WIDTH,
+      height: OUTLINE_PDF_HEIGHT,
+      ops,
+      fonts: ['F1', 'F2'],
+    });
+    pageTruth.push({ page, lines });
+  }
+
+  const pdf = buildPDF({
+    pages,
+    outline: OUTLINE_ENTRIES,
+    pageLabels: OUTLINE_PAGE_LABELS,
+  });
+  writeFile(outDir, 'sample-outline.pdf', pdf);
+
+  return {
+    id: 'sample-outline-pdf',
+    kind: 'pdf',
+    file: 'sample-outline.pdf',
+    generator: 'fixtures/generate.mjs',
+    pageCount: pages.length,
+    pageWidthPt: OUTLINE_PDF_WIDTH,
+    pageHeightPt: OUTLINE_PDF_HEIGHT,
+    hasTextLayer: true,
+    charsByPage,
+    charsTotal: Object.values(charsByPage).reduce((sum, value) => sum + value, 0),
+    pageLabels: expectedPageLabels(12),
+    outline: {
+      source: 'pdf-bookmarks',
+      total: OUTLINE_FLAT.length,
+      entries: OUTLINE_FLAT.map((entry) => ({ ...entry, label: labelsByPage.get(entry.page) ?? null })),
+    },
+    pages: pageTruth,
+  };
+}
+
+// -- sample-headings.pdf ----------------------------------------------------
+
+const HEADINGS_PDF_PAGES = [
+  {
+    page: 1,
+    blocks: [
+      { kind: 'heading', text: '1. Introduction' },
+      { kind: 'paragraph', text: 'This synthetic heading fixture exists to exercise the outline generated from block headings. It has no PDF bookmarks at all.' },
+      { kind: 'heading', text: '1.1 Scope' },
+      { kind: 'paragraph', text: 'The heading heuristic recognises short numbered lines when they are separated from body paragraphs by a blank line.' },
+      { kind: 'heading', text: '1.2 Motivation' },
+      { kind: 'paragraph', text: 'A document with at least five headings can expose an outline even when its author never added bookmarks.' },
+    ],
+  },
+  {
+    page: 2,
+    blocks: [
+      { kind: 'heading', text: '2. Methods' },
+      { kind: 'paragraph', text: 'Every heading in this page is a single short numbered line; body paragraphs follow after a vertical gap.' },
+      { kind: 'heading', text: '2.1 Sampling' },
+      { kind: 'paragraph', text: 'Sampling paragraphs stay out of the generated outline; only heading blocks become entries.' },
+    ],
+  },
+  {
+    page: 3,
+    blocks: [
+      { kind: 'heading', text: '3. Results' },
+      { kind: 'paragraph', text: 'The generated outline is labelled "outline: generated from headings" so the agent knows it came from block structure, not from the file metadata.' },
+      { kind: 'heading', text: '3.1 Summary' },
+      { kind: 'paragraph', text: 'Six headings in total is above the five-heading threshold for generating an outline.' },
+    ],
+  },
+];
+
+function generateSampleHeadingsPdf(outDir) {
+  const pages = [];
+  const pageTruth = [];
+  const headings = [];
+
+  for (const spec of HEADINGS_PDF_PAGES) {
+    const ops = [];
+    const lines = [];
+    let y = PDF_HEIGHT - PDF_MARGIN;
+    for (const block of spec.blocks) {
+      if (block.kind === 'heading') {
+        ops.push(pdfTextOp(PDF_MARGIN, y, block.text, { font: 'F2', size: 15 }));
+        lines.push({ text: block.text, xPt: PDF_MARGIN, yPt: y, font: 'F2', size: 15 });
+        headings.push({ page: spec.page, level: block.text.split(/\s+/)[0].split('.').length, text: block.text });
+        y -= 36;
+      } else {
+        // Split long paragraphs into two lines so pdftotext keeps them separate
+        // from the next heading (the blank gap above/below is what matters).
+        const words = block.text.split(' ');
+        const first = words.slice(0, Math.ceil(words.length / 2)).join(' ');
+        const second = words.slice(Math.ceil(words.length / 2)).join(' ');
+        for (const text of [first, second]) {
+          ops.push(pdfTextOp(PDF_MARGIN, y, text, { font: 'F1', size: 11 }));
+          lines.push({ text, xPt: PDF_MARGIN, yPt: y, font: 'F1', size: 11 });
+          y -= 16;
+        }
+        y -= 20; // blank line -> pdftotext paragraph break
+      }
+    }
+    pages.push({ kind: 'text', width: PDF_WIDTH, height: PDF_HEIGHT, ops, fonts: ['F1', 'F2'] });
+    pageTruth.push({ page: spec.page, lines });
+  }
+
+  const pdf = buildPDF({ pages });
+  writeFile(outDir, 'sample-headings.pdf', pdf);
+
+  return {
+    id: 'sample-headings-pdf',
+    kind: 'pdf',
+    file: 'sample-headings.pdf',
+    generator: 'fixtures/generate.mjs',
+    pageCount: pages.length,
+    pageWidthPt: PDF_WIDTH,
+    pageHeightPt: PDF_HEIGHT,
+    hasTextLayer: true,
+    bookmarks: 0,
+    headings,
+    pages: pageTruth,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 5b. sample-longpage.pdf  (one page far above the 24k-char inline limit)
+//
+// 预览管线（9z5.20）必须能处理「单页正文超过内联上限」：不能把整页丢掉，
+// 也不能再宣称「下面是每一页的全文」。这个 fixture 把三种情况放在一份文件里：
+//   page 4：约 25k 字符，切成很多完整句子（抽样）
+//   page 6：一个没有句末标点的长单元（硬截断 …[+N chars]）
+// 其余页面是短页，用来验证 pages:"4-6" 时三页都出现。
+// 页面用大尺寸（1000x1400 pt）写，字号保持可读，不靠挤小字堆字符数。
+// ---------------------------------------------------------------------------
+
+const LONGPAGE_WIDTH = 1000;
+const LONGPAGE_HEIGHT = 1400;
+const LONGPAGE_MARGIN = 50;
+const LONGPAGE_TITLE_SIZE = 16;
+const LONGPAGE_BODY_SIZE = 7;
+const LONGPAGE_LEADING = 10;
+const LONGPAGE_TITLE_OFFSET = 40;
+
+const LONG_WORDS = [
+  'alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel',
+  'india', 'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar', 'papa',
+  'quebec', 'romeo', 'sierra', 'tango', 'uniform', 'victor', 'whiskey', 'xray',
+  'yankee', 'zulu',
+];
+
+/** 一条完整句子（<= ~206 字符），保证抽样单元不会都被硬截断 */
+function longPageSentence(index) {
+  let text = `Sentence ${String(index).padStart(3, '0')} of the long page fixture. `
+    + 'This line exists so that the inline preview has to sample complete units instead of dropping the page.';
+  let step = 0;
+  while (text.length < 205) {
+    text += ` ${LONG_WORDS[(index + step) % LONG_WORDS.length]}`;
+    step += 1;
+  }
+  return text.endsWith('.') ? text : `${text}.`;
+}
+
+/** 不含 . ! ? ; 的正文行：整个页面会被断句器看成一个超长单元 */
+function longPageUnpunctuatedLine(index) {
+  const parts = [];
+  for (let step = 0; step < 26; step += 1) {
+    parts.push(LONG_WORDS[(index * 7 + step) % LONG_WORDS.length]);
+  }
+  let text = parts.join(' ');
+  while (text.length < 200) text += ` ${LONG_WORDS[(index + text.length) % LONG_WORDS.length]}`;
+  return text;
+}
+
+const LONGPAGE_SENTENCES = Array.from({ length: 125 }, (_, i) => longPageSentence(i + 1));
+const LONGPAGE_UNPUNCTUATED = Array.from({ length: 25 }, (_, i) => longPageUnpunctuatedLine(i + 1));
+
+const LONGPAGE_PAGES = Array.from({ length: 6 }, (_, i) => {
+  const page = i + 1;
+  if (page === 4) return { page, title: 'PAGE FOUR: LONG BODY FOR INLINE PREVIEW', lines: LONGPAGE_SENTENCES };
+  if (page === 6) return { page, title: 'PAGE SIX UNPUNCTUATED BODY', lines: LONGPAGE_UNPUNCTUATED };
+  return {
+    page,
+    title: `PAGE ${page} OF THE LONG-PAGE FIXTURE`,
+    lines: [`PAGE ${page} SHORT LINE ONE.`, `PAGE ${page} SHORT LINE TWO.`, `PAGE ${page} ENDS HERE.`],
+  };
+});
+
+function generateSampleLongPagePdf(outDir) {
+  const pages = [];
+  const pageTruth = [];
+  const charsByPage = {};
+
+  for (const spec of LONGPAGE_PAGES) {
+    const ops = [];
+    const lines = [];
+    const titleY = LONGPAGE_HEIGHT - LONGPAGE_MARGIN;
+    ops.push(pdfTextOp(LONGPAGE_MARGIN, titleY, spec.title, { font: 'F2', size: LONGPAGE_TITLE_SIZE }));
+    lines.push({ text: spec.title, xPt: LONGPAGE_MARGIN, yPt: titleY, font: 'F2', size: LONGPAGE_TITLE_SIZE });
+
+    spec.lines.forEach((text, i) => {
+      const y = titleY - LONGPAGE_TITLE_OFFSET - i * LONGPAGE_LEADING;
+      ops.push(pdfTextOp(LONGPAGE_MARGIN, y, text, { font: 'F1', size: LONGPAGE_BODY_SIZE }));
+      lines.push({ text, xPt: LONGPAGE_MARGIN, yPt: y, font: 'F1', size: LONGPAGE_BODY_SIZE });
+    });
+
+    charsByPage[spec.page] = lines.reduce((sum, line) => sum + line.text.length + 1, 0);
+    pages.push({ kind: 'text', width: LONGPAGE_WIDTH, height: LONGPAGE_HEIGHT, ops, fonts: ['F1', 'F2'] });
+    // 这个 fixture 只关心「页文字总量 / 断句」，不重复写 textOps（ground truth 体积减半）
+    pageTruth.push({ page: spec.page, lines });
+  }
+
+  const pdf = buildPDF({ pages });
+  writeFile(outDir, 'sample-longpage.pdf', pdf);
+
+  return {
+    id: 'sample-longpage-pdf',
+    kind: 'pdf',
+    file: 'sample-longpage.pdf',
+    generator: 'fixtures/generate.mjs',
+    pageCount: pages.length,
+    pageWidthPt: LONGPAGE_WIDTH,
+    pageHeightPt: LONGPAGE_HEIGHT,
+    marginPt: LONGPAGE_MARGIN,
+    hasTextLayer: true,
+    fonts: ['Helvetica', 'Helvetica-Bold'],
+    longPage: 4,
+    unpunctuatedPage: 6,
+    charsByPage,
+    pages: pageTruth,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 6. sample-scanned.pdf  (image-only pages: no text layer)
 // ---------------------------------------------------------------------------
 
@@ -1041,6 +1700,230 @@ function generateSampleImage(outDir) {
 }
 
 // ---------------------------------------------------------------------------
+// sample-mixed.pdf  (page 1 is an image-only cover; pages 2+ have a text layer)
+//
+// 这是「图片封面 + 数字正文」这一最常见形态的回归素材：只看第 1 页会把整份
+// 文档误判成没有文字层。
+// ---------------------------------------------------------------------------
+
+const MIXED_COVER_WIDTH_PX = 1240;
+const MIXED_COVER_HEIGHT_PX = 1754; // A4 at 150 dpi
+
+const MIXED_TEXT_PAGES = [
+  {
+    page: 2,
+    title: 'BODY PAGE ONE',
+    lines: [
+      'PAGE 2 HAS A REAL TEXT LAYER.',
+      'THE COVER PAGE BEFORE IT IS AN IMAGE ONLY.',
+      'A DOC MUST NOT BE CALLED TEXTLESS BECAUSE OF PAGE ONE.',
+    ],
+  },
+  {
+    page: 3,
+    title: 'BODY PAGE TWO',
+    lines: [
+      'THIRD PAGE OF THE MIXED FIXTURE.',
+      'ALPHA BRAVO CHARLIE DELTA.',
+      'ONE TWO THREE FOUR FIVE.',
+    ],
+  },
+  {
+    page: 4,
+    title: 'BODY PAGE THREE',
+    lines: [
+      'LAST PAGE OF THE MIXED FIXTURE.',
+      'THIS PAGE ALSO CARRIES A TEXT LAYER.',
+      'END OF DOCUMENT.',
+    ],
+  },
+];
+
+function generateSampleMixedPdf(outDir) {
+  const tmpDir = path.join(outDir, '.tmp-mixed');
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  // Page 1: image-only cover (an image page carries no /Font resource → no text layer).
+  const coverRaster = new Raster(MIXED_COVER_WIDTH_PX, MIXED_COVER_HEIGHT_PX, [244, 241, 235]);
+  const coverLines = [];
+  const coverTitle = coverRaster.drawText('MIXED FIXTURE COVER', 120, 200, { scale: 6, color: [18, 18, 18] });
+  coverLines.push({ text: 'MIXED FIXTURE COVER', box: coverTitle });
+  const coverNote = coverRaster.drawText('THIS COVER PAGE IS AN IMAGE ONLY.', 120, 320, { scale: 3, color: [30, 30, 30] });
+  coverLines.push({ text: 'THIS COVER PAGE IS AN IMAGE ONLY.', box: coverNote });
+  const coverPng = encodePNG(MIXED_COVER_WIDTH_PX, MIXED_COVER_HEIGHT_PX, coverRaster.toRGB());
+  const coverPngPath = path.join(tmpDir, 'cover.png');
+  const coverJpgPath = path.join(tmpDir, 'cover.jpg');
+  fs.writeFileSync(coverPngPath, coverPng);
+  pngToJPEG(coverPngPath, coverJpgPath, { quality: 2 });
+  const coverJpeg = fs.readFileSync(coverJpgPath);
+
+  const pages = [
+    {
+      kind: 'image',
+      width: PDF_WIDTH,
+      height: PDF_HEIGHT,
+      imageWidth: MIXED_COVER_WIDTH_PX,
+      imageHeight: MIXED_COVER_HEIGHT_PX,
+      jpeg: coverJpeg,
+    },
+  ];
+  const pageTruth = [{ page: 1, lines: coverLines, table: null, hasTextLayer: false }];
+
+  for (const spec of MIXED_TEXT_PAGES) {
+    const ops = [];
+    const textOps = [];
+    const lines = [];
+    const titleY = PDF_HEIGHT - PDF_MARGIN;
+    ops.push(pdfTextOp(PDF_MARGIN, titleY, spec.title, { font: 'F2', size: 16 }));
+    lines.push({ text: spec.title, xPt: PDF_MARGIN, yPt: titleY, font: 'F2', size: 16 });
+    textOps.push({ text: spec.title, xPt: PDF_MARGIN, yPt: titleY });
+
+    spec.lines.forEach((text, i) => {
+      const y = titleY - 30 - i * 20;
+      ops.push(pdfTextOp(PDF_MARGIN, y, text, { font: 'F1', size: 11 }));
+      lines.push({ text, xPt: PDF_MARGIN, yPt: y, font: 'F1', size: 11 });
+      textOps.push({ text, xPt: PDF_MARGIN, yPt: y });
+    });
+
+    pages.push({ kind: 'text', width: PDF_WIDTH, height: PDF_HEIGHT, ops, fonts: ['F1', 'F2'] });
+    pageTruth.push({ page: spec.page, lines, textOps, hasTextLayer: true });
+  }
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+
+  const pdf = buildPDF({ pages });
+  writeFile(outDir, 'sample-mixed.pdf', pdf);
+
+  return {
+    id: 'sample-mixed-pdf',
+    kind: 'pdf',
+    file: 'sample-mixed.pdf',
+    generator: 'fixtures/generate.mjs',
+    pageCount: pages.length,
+    pageWidthPt: PDF_WIDTH,
+    pageHeightPt: PDF_HEIGHT,
+    marginPt: PDF_MARGIN,
+    hasTextLayer: true,
+    coverPage: 1,
+    textLayerPages: MIXED_TEXT_PAGES.map((spec) => spec.page),
+    noTextLayerPages: [1],
+    imageWidthPx: MIXED_COVER_WIDTH_PX,
+    imageHeightPx: MIXED_COVER_HEIGHT_PX,
+    imageFormat: 'jpeg',
+    jpegQuality: 2,
+    pages: pageTruth,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// sample-garbled-text.pdf  (text layer written by a bad OCR tool: 9z5.31)
+//
+// 有文字层，但字符是垃圾：逐页路由会把它当「有文字层」直接使用并标成
+// source=text（可原话引用）。probe 的启发式（U+FFFD / 私用区 / 孤立单字母 /
+// 非词 token）应当把它标成 unreliable，并提示 ocr: "force"。
+// 这里用 WinAnsi 可直接编码的「孤立单字母 + 符号噪声」复现劣质 OCR 的形态
+// （U+FFFD / 私用区无法写进 base-14 Type1 字体的 WinAnsi 编码，改由单测覆盖）。
+// ---------------------------------------------------------------------------
+
+const GARBLED_TEXT_PAGES = [
+  {
+    page: 1,
+    title: 'GARBLED TEXT LAYER FIXTURE',
+    lines: [
+      // 字母之间写双空格：pdftotext -layout 会把它们保留成独立 token，
+      // 更接近「劣质 OCR 一个字一个字往外蹦」的文字层。
+      'q  z  x  k  j  v  b  n  m  w  r  t  p  s  d  f  g  h  l  c',
+      'A  E  I  O  U  B  C  D  F  G  H  J  K  L  M  N  P  R  S  T  V  W  X  Z',
+      'a  b  c  d  e  f  g  h  i  j  k  l  m  n  o  p  q  r  s  t  u  v  w  x  y  z',
+      'Z  X  C  V  B  N  M  Q  W  E  R  T  Y  U  I  O  P  A  S  D  F  G  H  J  K',
+      '### @@ ^^^ &&& *** ((( ))) [[[ ]]]',
+      '~~~ ||| ??? !!! ... ,,, ;;; ::: ///',
+      '@@@ %%% ^^^ &&& *** +++ === --- ___',
+      '### ??? %% @@ !! ** ++ == -- __ __',
+      '<<< >>> (( )) [[ ]] {{ }} ~~ || ?? !!',
+    ],
+  },
+  {
+    page: 2,
+    title: 'PAGE TWO OF THE GARBLED FIXTURE',
+    lines: [
+      'm  n  b  v  c  x  l  k  j  h  g  f  d  s  a  p  o  i  u  y  t  r  e  w  q',
+      'K  J  H  G  F  D  S  A  P  O  I  U  Y  T  R  E  W  Q  Z  X  C  V  B  N  M',
+      '*** ??? !!! ### @@@ ^^^ &&& +++ === --- ___',
+      'x  c  v  b  n  m  z  l  k  j  h  g  f  d  s  a  q  w  e  r  t  y  u  i  o  p',
+      'B  N  M  Q  W  E  R  T  Y  U  I  O  P  A  S  D  F  G  H  J  K  L  Z  X  C',
+      '<<< >>> (( )) [[ ]] {{ }} ~~ || ?? !!',
+      'f  g  h  j  k  l  q  w  e  r  t  y  u  i  o  p  a  s  d  z  x  c  v  b  n  m',
+      'H  J  K  L  F  G  D  S  A  Q  W  E  R  T  Y  U  I  O  P  Z  X  C  V  B  N  M',
+      ';:: ::: ,,, ... ??? !!! (( )) [[ ]] {{ }}',
+    ],
+  },
+  {
+    page: 3,
+    title: 'PAGE THREE OF THE GARBLED FIXTURE',
+    lines: [
+      'v  b  n  m  q  w  e  r  t  y  u  i  o  p  a  s  d  f  g  h  j  k  l  z  x  c',
+      'V  B  N  M  Q  W  E  R  T  Y  U  I  O  P  A  S  D  F  G  H  J  K  L  Z  X  C',
+      '&&& *** ### @@@ ^^^ +++ === --- ___ ~~~ |||',
+      'z  x  c  v  b  n  m  l  k  j  h  g  f  d  s  a  p  o  i  u  y  t  r  e  w  q',
+      'X  C  V  B  N  M  Z  L  K  J  H  G  F  D  S  A  P  O  I  U  Y  T  R  E  W  Q',
+      ';;; ::: ,,, ... ??? !!! (( )) [[ ]] {{ }}',
+      'a  s  d  f  g  h  j  k  l  q  w  e  r  t  y  u  i  o  p  z  x  c  v  b  n  m',
+      'S  D  F  G  H  J  K  L  A  Q  W  E  R  T  Y  U  I  O  P  Z  X  C  V  B  N  M',
+      '### ??? %% @@ !! ** ++ == -- __ __',
+    ],
+  },
+];
+
+function generateSampleGarbledTextPdf(outDir) {
+  const pages = [];
+  const pageTruth = [];
+
+  for (const spec of GARBLED_TEXT_PAGES) {
+    const ops = [];
+    const textOps = [];
+    const lines = [];
+    const titleY = PDF_HEIGHT - PDF_MARGIN;
+    ops.push(pdfTextOp(PDF_MARGIN, titleY, spec.title, { font: 'F2', size: 16 }));
+    lines.push({ text: spec.title, xPt: PDF_MARGIN, yPt: titleY, font: 'F2', size: 16 });
+    textOps.push({ text: spec.title, xPt: PDF_MARGIN, yPt: titleY });
+
+    spec.lines.forEach((text, i) => {
+      const y = titleY - 30 - i * 20;
+      ops.push(pdfTextOp(PDF_MARGIN, y, text, { font: 'F1', size: 11 }));
+      lines.push({ text, xPt: PDF_MARGIN, yPt: y, font: 'F1', size: 11 });
+      textOps.push({ text, xPt: PDF_MARGIN, yPt: y });
+    });
+
+    pages.push({ kind: 'text', width: PDF_WIDTH, height: PDF_HEIGHT, ops, fonts: ['F1', 'F2'] });
+    pageTruth.push({ page: spec.page, lines, textOps });
+  }
+
+  const pdf = buildPDF({ pages });
+  writeFile(outDir, 'sample-garbled-text.pdf', pdf);
+
+  return {
+    id: 'sample-garbled-text-pdf',
+    kind: 'pdf',
+    file: 'sample-garbled-text.pdf',
+    generator: 'fixtures/generate.mjs',
+    pageCount: pages.length,
+    pageWidthPt: PDF_WIDTH,
+    pageHeightPt: PDF_HEIGHT,
+    marginPt: PDF_MARGIN,
+    hasTextLayer: true,
+    textLayerQuality: {
+      expected: 'looks-unreliable',
+      signals: ['isolated-single-letter-tokens', 'non-word-tokens'],
+      note:
+        'The text layer is present but every line is isolated letters and symbol noise, like a bad OCR ' +
+        'pass; media_probe must flag it as unreliable and suggest media_overview({ path, ocr: "force" }).',
+    },
+    pages: pageTruth,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // optional: macOS `say` speech sample (skipped on other platforms)
 // ---------------------------------------------------------------------------
 
@@ -1120,12 +2003,19 @@ async function main() {
 
   const groundTruths = [];
   groundTruths.push(generateSampleScene(outDir));
+  groundTruths.push(generateSampleChapters(outDir));
   groundTruths.push(generateSampleSubtitles(outDir));
   groundTruths.push(generateSampleZoom(outDir));
   groundTruths.push(...generateSampleTone(outDir));
   groundTruths.push(generateSampleTextPdf(outDir));
+  groundTruths.push(generateSampleOutlinePdf(outDir));
+  groundTruths.push(generateSampleHeadingsPdf(outDir));
+  groundTruths.push(generateSampleTwoColumnPdf(outDir));
+  groundTruths.push(generateSampleLongPagePdf(outDir));
   groundTruths.push(generateSampleScannedPdf(outDir));
   groundTruths.push(generateSampleImage(outDir));
+  groundTruths.push(generateSampleMixedPdf(outDir));
+  groundTruths.push(generateSampleGarbledTextPdf(outDir));
   const optional = generateOptionalSpeech(outDir);
   if (optional) groundTruths.push(optional);
 

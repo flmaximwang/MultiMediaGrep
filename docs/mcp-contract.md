@@ -45,9 +45,14 @@ MultiMediaGrep 是一个 **MCP server**：默认走 stdio（由宿主拉起）�
 
 | mediaType | 扩展名（不区分大小写） | 判定依据 |
 |---|---|---|
-| `video` | `mp4` `mov` `mkv` `webm` `avi` `m4v` `mpg` `mpeg` `ts` `flv` `wmv` `3gp` `ogv` | 容器含视频流 |
-| `audio` | `mp3` `wav` `m4a` `aac` `flac` `ogg` `opus` `wma` `aiff` `amr` `m4b` `weba` | 容器含音频流且无视频流 |
-| `document` | `pdf` `docx` `doc` `pptx` `ppt` `xlsx` `xls` `epub` `rtf` `odt` `ods` `txt` `md` `csv` `html` `htm` `png` `jpg` `jpeg` `webp` `tiff` `tif` `bmp` `heic` | 魔数 / 文档解析器可打开 |
+| `video` | `mp4` `m4v` `mov` `mkv` `webm` `avi` `flv` `wmv` `mpg` `mpeg` `mts` `m2ts` `ts` `3gp` | 容器含视频流 |
+| `audio` | `mp3` `wav` `m4a` `aac` `flac` `ogg` `opus` `wma` `aiff` `aif` `amr` `m4b` `weba` | 容器含音频流且无视频流 |
+| `document` | `pdf` `png` `jpg` `jpeg` `webp` `bmp` `gif` `tif` `tiff` `txt` `md` `markdown` `docx` `doc` `pptx` `ppt` `xlsx` `xls` `odt` `odp` `ods` | 魔数（PDF / 图片）或扩展名；Office 只识别、不解析 |
+
+> **Office 文档（`docx` / `doc` / `pptx` / `ppt` / `xlsx` / `xls` / `odt` / `odp` / `ods`）会被判成
+> `document`，但文档后端读不了它**：调用会返回 `UNSUPPORTED_MEDIA_TYPE`，文案里给出
+> `soffice --headless --convert-to pdf <file>` 的下一步。别把它和「扫描件没 OCR」混为一谈。
+> 图片类文档（`png` / `jpg` / …）按**一页文档**处理；多页 TIFF 只读第一页。
 
 后端分派（`mediaType` → 具体实现）：
 
@@ -76,7 +81,7 @@ flowchart TD
   AU3 -. "envelope=true 时" .-> AU4["音频包络 PNG"]
 
   D --> D1["页面栅格化<br/>→ 页图"]
-  D --> D2["文档解析 provider<br/>MMGREP_DOC_PROVIDER = mineru"]
+  D --> D2["文档 provider<br/>MMGREP_OCR_PROVIDER / MMGREP_TYPESET_PROVIDER"]
   D2 --> D3["每页文字"]
 
   V4 --> T["统一 segments 模型<br/>{ startMs, endMs, text, page }"]
@@ -89,29 +94,55 @@ flowchart TD
   AU4 --> OUT
 ```
 
-### 2.2 参数适用性总表
+### 2.2 参数适用性（工具 × 参数 × 媒体）
 
-**规则：不适用的参数必须报错，不能静默忽略。** 静默忽略会让 agent 以为参数生效了，然后在错误的时间窗里读到错误的内容。
+**规则一：不属于该工具的参数由 `inputSchema` 直接拒绝。** 四个工具的 schema 都加了 `.strict()`：多传一个未声明的参数不会被忽略，而是由 MCP 输入校验返回错误（JSON-RPC `-32602`，文案里点名未知字段）。所以「`media_zoom` 能不能传 `view`」这种问题的答案是「不能传」——不是「传了没效果」。
 
-| 参数 | video | audio | document | 不适用时的错误文案（节选） |
-|---|:---:|:---:|:---:|---|
-| `path` | ✅ 必填 | ✅ 必填 | ✅ 必填 | — |
-| `subtitle` | ✅ | ✅ | ❌ | `subtitle is not applicable to document media. Documents have a page text layer, not a transcript.` |
-| `transcript` | ✅ | ✅ | ❌ | `transcript is not applicable to document media.` |
-| `start`（秒） | ✅ | ✅ | ❌ | `start is not applicable to document media. Use "pages" instead (e.g. pages: "3-10,15").` |
-| `end`（秒） | ✅ | ✅ | ❌ | `end is not applicable to document media. Use "pages" instead (e.g. pages: "3-10,15").` |
-| `segment`（秒） | ✅ | ✅ | ❌ | `segment is not applicable to document media.` |
-| `pages` | ❌ | ❌ | ✅ | `pages is not applicable to video media. Use "start" and "end" (seconds) instead.` |
-| `query` | ✅ | ✅ | ✅ | — |
-| `max` | ✅ | ✅ | ✅ | — |
-| `includeFrame` | ✅ | ❌ | ✅ | `includeFrame is not applicable to audio media. There are no frames to show.` |
-| `at`（秒） | ✅ | ❌ | ❌ | `at is not applicable to audio media. media_zoom returns one frame for video and one page image for document; for audio use media_locate to find timestamps.` |
-| `crop` | ✅ | ❌ | ✅ | `crop is not applicable to audio media.` |
-| `page` | ❌ | ❌ | ✅ | `page is not applicable to video media. media_zoom uses "at" (or "start"/"end") for video.` |
-| `cells` | ✅ | ❌ | ✅ | `cells is not applicable to audio media. A recording has no frames; media_overview returns a timestamped transcript instead.` |
-| `images` | ✅ | ✅ 仅 `0` | ✅ | `images is not applicable to audio media.` |
-| `maxEdge` | ✅ | ❌ | ✅ | `maxEdge is not applicable to audio media.` |
-| `envelope` | ❌ | ✅ | ❌ | `envelope is not applicable to video media. It only applies to audio recordings.` |
+**规则二：参数对当前媒体不适用时必须报错，不能静默忽略。** 静默忽略会让 agent 以为参数生效了，然后在错误的时间窗里读到错误的内容。
+
+**每个工具接受哪些参数：**
+
+| 参数 | `media_probe` | `media_overview` | `media_zoom` | `media_locate` | 媒体适用性 |
+|---|:---:|:---:|:---:|:---:|---|
+| `path` | ✅ 必填 | ✅ 必填 | ✅ 必填 | ✅ 必填 | video / audio / document |
+| `subtitle` | ✅ | ✅ | — | ✅ | video / audio（document 报错） |
+| `transcript` | ✅ | ✅ | — | ✅ | video / audio（document 报错） |
+| `start` / `end` | — | ✅ | ✅（video，两个都给） | ✅ | video / audio（document 报错） |
+| `segment` | — | ✅ | — | ✅ | video / audio（document 报错） |
+| `pages` | — | ✅ | — | ✅ | document（video / audio 报错） |
+| `ocr` | — | ✅ | — | ✅ | document（video / audio 报错） |
+| `view` | — | ✅ | — | — | video / audio / document |
+| `cells` | — | ✅ | — | — | video / document（audio 报错） |
+| `images` | — | ✅ | — | — | video / document；audio 只接受 `0` |
+| `maxEdge` | — | ✅ | ✅ | — | video / document（audio 报错） |
+| `envelope` | — | ✅ | — | — | audio（video / document 报错） |
+| `at` | — | — | ✅ | — | video（audio / document 报错） |
+| `page` | — | — | ✅ | — | document（video / audio 报错） |
+| `crop` | — | — | ✅ | — | video / document（audio 报错） |
+| `query` | — | — | — | ✅ 必填 | video / audio / document |
+| `max` | — | — | — | ✅ | video / audio / document |
+| `includeFrame` | — | — | — | ✅ | video / document（audio 报错） |
+
+**媒体不适用时的错误文案（`INVALID_ARGUMENT`，节选）：**
+
+| 参数 | video | audio | document |
+|---|---|---|---|
+| `subtitle` | ✅ | ✅ | `subtitle is not applicable to document media. Documents have a page text layer, not a transcript.` |
+| `transcript` | ✅ | ✅ | `transcript is not applicable to document media.` |
+| `start` / `end` | ✅ | ✅ | `start is not applicable to document media. Use "pages" instead (e.g. pages: "3-10,15").` / 同文的 `end` 版本 |
+| `segment` | ✅ | ✅ | `segment is not applicable to document media.` |
+| `pages` | `pages is not applicable to video media. Use "start" and "end" (seconds) instead.` | `pages is not applicable to audio media. Use "start" and "end" (seconds) instead.` | ✅ |
+| `ocr` | `ocr is not applicable to video media. Only documents have a page text layer or page images to OCR; video and audio use subtitles/transcript instead.` | 同文 `audio` 版本 | ✅ |
+| `includeFrame` | ✅ | `includeFrame is not applicable to audio media. There are no frames to show.` | ✅ |
+| `at` | ✅ | `at is not applicable to audio media. media_zoom returns one frame for video and one page image for document; for audio use media_locate to find timestamps.` | `at is not applicable to document media. media_zoom uses "at" (or "start"/"end") for video.` |
+| `crop` | ✅ | `crop is not applicable to audio media.` | ✅ |
+| `page` | `page is not applicable to video media. media_zoom uses "at" (or "start"/"end") for video.` | `page is not applicable to audio media.` | ✅ |
+| `cells` | ✅ | `cells is not applicable to audio media. A recording has no frames; media_overview returns a timestamped transcript instead.` | ✅ |
+| `images` | ✅ | `images is not applicable to audio media.`（`images: 0` 例外放行） | ✅ |
+| `maxEdge` | ✅ | `maxEdge is not applicable to audio media.` | ✅ |
+| `envelope` | `envelope is not applicable to video media. It only applies to audio recordings.` | ✅ | `envelope is not applicable to document media. It only applies to audio recordings.` |
+
+**`view` 的语义是跨媒体统一的**（只有 `media_overview` 收它）：目录优先 / 只出目录 / 只出文本这三种行为对三种媒体相同。区别只在目录从哪来——PDF 书签、视频/录音章节；两者都没有时文档还能从 heading 生成（≥5 条），视频/录音不生成（server 不调 LLM）。
 
 文档的 `cells` 语义是「每张拼图放几页缩略图」；视频的 `cells` 语义是「每张宫格放几个镜头格」。同一个名字，两种媒体各自解释——这是「按动作命名、跨媒体统一」的核心收益。
 
@@ -221,34 +252,57 @@ flowchart TD
 
 ### 2.5 转写来源与可信度
 
-**每个工具的返回里都带「这段文字 / 这张图是哪来的」。** agent 必须知道自己在读的是作者写的字幕、机器猜的转写，还是根本没有文字——这三者的可信度差一个数量级。
+**每个工具的返回里都带「这段文字 / 这张图是哪来的」。** agent 必须知道自己在读的是字幕文件里的文字、机器猜的转写，还是根本没有文字——这三者的可信度差一个数量级。
 
 `source` 枚举（**可信度口径**）：
 
 | 值 | 含义 | 可信度 | agent 该怎么用 |
 |---|---|---|---|
-| `subtitle` | 作者提供的字幕：外部字幕文件或容器内嵌字幕轨 | **最高** | 可以当原话引用 |
+| `subtitle` | 字幕文件或容器内嵌字幕轨里的文字 | 中高 | 通常是作者原话，但**可能是自动生成的**：专有名词、数字要自己核对画面 |
+| `text` | **原生文字**：PDF 文字层（`origin = "textlayer"`）或 `.txt` / `.md` 文件本身（`origin = "file"`） | **最高（字符级精确）** | **可当原话直接引用**；不需要为了核对字符去 zoom 页面图 |
 | `ocr` | 从画面 / 页面上 OCR 出来的文字 | 中高 | 可引用，但专有名词、数字要自己核对 |
 | `asr` | 语音识别转写 | **最低** | **不可当原话引用**——人名、数字、术语会错 |
 | `visual` | 没有文字来源，只有画面 | — | 只能描述画面，不能转述「说了什么」 |
-| `none` | 该项为空 | — | — |
+| `mixed` | **只用于整份 `transcript`**：返回的页来源不一致（例如封面是 `ocr`、正文是 `text`） | — | 看每页自己的 `source` 标签；不要用 `mixed` 推断单页可信度 |
+| `none` | 该项为空（没有文字，也不谎报来源） | — | — |
 
-`origin` 枚举（**来源渠道口径**）：`file`（外部字幕文件）/ `embedded`（容器内嵌字幕轨）/ `asr` / `ocr` / `none`。
+`origin` 枚举（**来源渠道口径**）：`file`（外部字幕文件 / `.txt` / `.md`）/ `embedded`（容器内嵌字幕轨）/ `textlayer`（PDF 原生文字层）/ `asr` / `ocr` / `none`。
 
-两个字段一起给：`source = "subtitle"` + `origin = "embedded"` = 视频自带的字幕轨；`source = "subtitle"` + `origin = "file"` = 取数层给的字幕文件；`source = "asr"` + `origin = "asr"` = 机器转的。
+两个字段一起给：`source = "subtitle"` + `origin = "embedded"` = 视频自带的字幕轨；`source = "subtitle"` + `origin = "file"` = 取数层给的字幕文件；`source = "asr"` + `origin = "asr"` = 机器转的；`source = "text"` + `origin = "textlayer"` = PDF 原生文字层。
 
-> **硬约束：ASR 转写不得被当作原话引用。** ASR 会把人名、数字、专业术语听错——上游 `dsh-video-storyboard` 专门写了一个 OCR 模块来用画面里的硬字幕校正 ASR 文本，理由就是「画面更可信」。所以凡是 `source = "asr"` 的段落，工具描述与 server instructions 都要提醒 agent 标注不确定。
+**文档的逐页映射（0.2.0 起，破坏性变更）：**
+
+- provider / 抽取层返回 `textOrigin = "textlayer"` → `source = "text"`、`origin = "textlayer"`；
+- `textOrigin = "ocr"` 或 `unknown`（provider 没声明）→ `source = "ocr"`、`origin = "ocr"`（不确定时取保守值）；
+- 页上没有任何文字 → `source = "none"`、`origin = "none"`（扫描件没配 OCR 时**不能**谎报有文本）；
+- 整份 `transcript.source`：所有返回页一致时取该值（含「整份都没文字」→ `none`），不一致 → `mixed`；
+- `.txt` / `.md` 一律 `source = "text"`、`origin = "file"`；
+- `origin` 枚举里没有 `mixed`：`source = "mixed"` 时 `origin` 只表示主要渠道（`textlayer` 优先），逐页口径以 `segments[].origin` 为准。
+
+> `source = "text"` 的段落与 `subtitle` 一样在文本输出里加「」；`asr` 不加（见 §5.4）。
+
+> **硬约束一：ASR 转写不得被当作原话引用。** ASR 会把人名、数字、专业术语听错——上游 `dsh-video-storyboard` 专门写了一个 OCR 模块来用画面里的硬字幕校正 ASR 文本，理由就是「画面更可信」。所以凡是 `source = "asr"` 的段落，工具描述与 server instructions 都要提醒 agent 标注不确定。
+
+> **硬约束二：字幕不保证是作者原创，更不保证「可安全引用」。** 字幕轨与字幕文件同样可能是机器自动生成的（自动字幕 / 滚动式字幕）：里面的人名、数字、术语同样会错。所以工具描述、server instructions 与 overview 的 note 一律用中性措辞——`subtitle — from a subtitle file/track; usually the author's words, but may be auto-generated: check names and numbers against the frame.`，**不作任何绝对的可引用承诺**。cue 之间大面积时间重叠（> 30%）时，overview 与 locate 还要额外给出警告 `rolling/auto-style captions detected — treat like ASR: check names and numbers against the frame.`。
+
+> **定位指标按媒体类型分两套。** 视频 / 录音的 `media_locate` 报 `score`（0–1，越大越像）；
+> 文档的 `media_locate` 报 `hits`（该页命中几次）+ `snippet`（命中附近的片段），**没有 `score`**：
+> 文档的 segment 粒度就是整页，同一个字段两种语义会打架。详见 §7.3.1。
 
 ### 2.6 长任务与进度通知
 
-| 工具 | `timeoutMs` | 是否发 progress notification |
-|---|---|---|
-| `media_probe` | 30,000 | 否（毫秒级返回） |
-| `media_overview` | 600,000 | 是（扫描 / 转写 / 渲染三阶段各报一次） |
-| `media_zoom` | 120,000 | 是 |
-| `media_locate` | 180,000 | 是（仅在需要现场跑 ASR 时） |
+**server 不设每个工具自己的墙钟超时。** 阻塞调用的时长由素材长度、外部 provider 的超时（`MMGREP_ASR_TIMEOUT_MS` / `MMGREP_DOC_TIMEOUT_MS`）与宿主的客户端超时共同决定；HTTP 传输另有一层**整次请求**的 120 s 上限（见 §2.8），超过就先中止在途工具调用、响应尚未开始时回 504。
 
-progress token 形如 `media_overview 3/5 · scanning 0-300s`，让宿主 UI 能显示进度。**进度通知是 best-effort**：宿主不支持 `notifications/progress` 时静默跳过，不影响结果。
+| 工具 | 是否发 progress notification |
+|---|---|
+| `media_probe` | 否（毫秒级返回） |
+| `media_overview` | 是（`scanning` → `transcribing` → `rendering` 三阶段；`images: 0` 时三个阶段照样发，`rendering` 报 0 张图） |
+| `media_zoom` | 否 |
+| `media_locate` | 否 |
+
+> 进度上报是**框架能力**：`createProgressReporter` 对四个工具都可用，但当前只有 `media_overview` 显式调用它。宿主没给 `progressToken`、宿主不支持 `notifications/progress`、或 `MMGREP_PROGRESS_NOTIFICATIONS=false` 时静默跳过，不影响结果。
+
+progress token 形如 `media_overview 3/5 · scanning 0-300s`，让宿主 UI 能显示进度。**进度通知是 best-effort**。
 
 ### 2.7 缓存与落盘约定
 
@@ -258,6 +312,7 @@ progress token 形如 `media_overview 3/5 · scanning 0-300s`，让宿主 UI 能
 | **快速指纹索引** | 另有一份 `fingerprint-index.json`：`sha256(绝对路径 + ':' + size + ':' + mtimeMs)` → 内容 sha256。命中指纹就跳过全文件哈希；不命中就老老实实算内容 hash 并写回索引 |
 | 缓存目录 | `MMGREP_CACHE_DIR`（默认 `~/.cache/multimediagrep`），**绝不写到用户文件旁边** |
 | 容量 | `MMGREP_CACHE_MAX_BYTES`（默认 10 GiB），超出按 LRU 淘汰整条目 |
+| provider 逐页结果缓存 | 文档 provider 的结果按页写入同一缓存树：namespace = `sha256:<源内容 hash>:doc-provider:<role>:<hash(源 hash + provider id + model + ocrMode + role)>`，每页存契约 v2 的 page 对象。同一范围再次调用（overview / locate 共享）不再请求 provider，只把缺失页发出去；工具参数 `ocr: "force"`（= 后端 `ocrMode=force`）单独成键，不覆盖 auto / 文字层结果 |
 | 落盘产物 | `content.md` + `segments.jsonl` + `manifest.json`（三个必备）+ `document.json`（可选，cangjie `SourceDocument Contract v1`） |
 
 细节见 §9。
@@ -298,7 +353,7 @@ HTTP 端点对 `Accept` / `Content-Type` 有要求：请求必须同时接受 `a
 
 **调用顺序建议：`media_probe` → `media_overview` → （必要时）`media_zoom` / `media_locate`。**
 
-**每个工具的返回都带 `source` 字段**（`subtitle` / `ocr` / `asr` / `visual` / `none`）标注内容的来源与可信度，见 §2.5。
+**每个工具的返回都带 `source` 字段**（`subtitle` / `text` / `ocr` / `asr` / `mixed` / `visual` / `none`）标注内容的来源与可信度，见 §2.5。`mixed` 只用于整份 `transcript`（逐页标签不一致），不会出现在单个 segment / match 上。
 
 ---
 
@@ -322,10 +377,22 @@ nothing. Then pick the right next tool:
 - a specific moment or page -> media_zoom for a close-up
 - "where was X said / on which page" -> media_locate for a timestamp or a page number
 
+For documents it also checks whether the text layer looks unreliable — U+FFFD replacement
+characters, private-use characters, isolated single letters, symbol noise — and, when it does,
+points at media_overview({ path, ocr: "force" }) to re-recognize the pages.
+(文档文字层看起来不可靠时会提示，可用 ocr: "force" 强制重新识别)
+
 For audio it also reports a quick health check — average level, speech ratio and silence ratio
 — so you know whether the recording actually contains audible speech before you spend an ASR
 call on it. A recording that is effectively silent is reported as such and is never sent to ASR
 (no hallucinated transcript).
+
+It also reports the file's own outline when it has one: PDF bookmarks (each entry carries the
+PHYSICAL page number — the same 1-based page numbers media_overview accepts — and, when the PDF
+defines page labels, the printed label too, e.g. "xii") and chapter markers in video/audio files
+(title + start/end timestamps). The text output shows at most 2 levels / 60 entries; the full
+outline is in structuredContent.outline. Use it to pick a range instead of reading the whole
+file. (内置目录：PDF 书签带物理页与打印页标签；视频/音频列出章节时间戳。文本最多 2 层 / 60 条)
 
 This server never downloads anything and never calls an LLM: you always pass a local absolute
 path, and it only prepares images and text for your own model to look at.
@@ -364,7 +431,19 @@ path, and it only prepares images and text for your own model to look at.
 | `sampleRateHz` | integer \| null | 采样率 | Hz |
 | `audioHealth` | object \| null | 音频体检结果（video/audio 才有；见 §4.3.1） | — |
 | `pageCount` | integer \| null | 总页数（document） | 页 |
-| `hasTextLayer` | boolean \| null | 是否已有文字层（document） | — |
+| `hasTextLayer` | boolean \| null | 是否已有文字层（document；**采样**首页/中间页/末页的结论，见 §4.3.2；本机没有文字抽取器时为 `null` = 判不出来） | — |
+| `outline` | object \| null | 内置目录（9z5.33）：PDF 书签或视频/录音章节；没有目录时 `available = false` 且 `reason` 写明原因。stub 后端 / 没有目录概念的后端可能为 `null` | — |
+| `outline.available` | boolean | 是否有内置目录 | — |
+| `outline.source` | `"pdf-bookmarks"` \| `"chapters"` \| null | 目录来源 | — |
+| `outline.total` | integer | 完整目录的条目总数（不是 probe 文本展示的条数） | 条 |
+| `outline.entries[]` | array | **完整**目录，不截断（probe 文本最多 2 层 / 60 条） | — |
+| `outline.entries[].title` | string | 条目标题 | — |
+| `outline.entries[].level` | integer | 书签层级，从 1 开始（PDF 书签才有） | — |
+| `outline.entries[].page` | integer \| null | **物理**页码（与 `pages` 参数同一口径；PDF 书签才有） | 页 |
+| `outline.entries[].label` | string \| null | 打印页标签（PDF 定义了 `/PageLabels` 时才有，如 `"xii"`、`"37"`） | — |
+| `outline.entries[].startMs` / `endMs` | integer | 章节起止（video/audio） | ms |
+| `outline.entries[].startSec` / `endSec` | number | 同上，秒 | s |
+| `outline.reason` | string \| null | 没有目录 / 读不了目录的人话原因（如 qpdf 未安装、文件没有章节） | — |
 | `subtitleTracks` | array | 内嵌字幕轨 | — |
 | `subtitleTracks[].index` | integer | 轨道序号 | — |
 | `subtitleTracks[].language` | string \| null | 语言标签（BCP-47，可能为 null） | — |
@@ -375,12 +454,23 @@ path, and it only prepares images and text for your own model to look at.
 | `capabilities.asr.provider` | string \| null | 生效的 ASR provider 名 | — |
 | `capabilities.asr.reason` | string \| null | 不可用时的原因（人话） | — |
 | `capabilities.ocr.available` | boolean | 本文件能否做 OCR | — |
-| `capabilities.ocr.provider` | string \| null | 生效的 OCR provider 名 | — |
+| `capabilities.ocr.provider` | string \| null | 生效的 OCR provider 名（只处理无文字层页） | — |
 | `capabilities.ocr.reason` | string \| null | 不可用时的原因 | — |
-| `capabilities.transcriptSource` | `"subtitle"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 本次探针判定会走哪条转写来源（可信度口径，见 §2.5） | — |
-| `capabilities.transcriptOrigin` | `"file"` \| `"embedded"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道（外部文件 / 内嵌轨 / ASR / OCR） | — |
+| `capabilities.typeset.available` | boolean | 本文件能否做 typeset（有文字层页的阅读顺序 / 结构） | — |
+| `capabilities.typeset.provider` | string \| null | 生效的 typeset provider 名（`builtin` 表示本地内置） | — |
+| `capabilities.typeset.reason` | string \| null | 不可用时的原因 | — |
+| `capabilities.transcriptSource` | `"subtitle"` \| `"text"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"mixed"` \| `"none"` | 本次探针判定会走哪条转写来源（可信度口径，见 §2.5）。文档的 `text` = 原生文字层；`mixed` = 文字层与 OCR 都可用，逐页路由结果可能混合 | — |
+| `capabilities.transcriptOrigin` | `"file"` \| `"embedded"` \| `"textlayer"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道（外部文件 / 内嵌轨 / PDF 文字层 / ASR / OCR）。`transcriptSource = "mixed"` 时给主要渠道（`textlayer` 优先），逐页口径以结果里的 `segments[].origin` 为准 | — |
 | `capabilities.transcriptPath` | string \| null | 若来源是文件，具体是哪个文件 | — |
 | `capabilities.transcriptReason` | string \| null | 文件里有字幕轨、但本次没有用上时的可读原因（如只剩图形字幕轨）；与 `warnings` 中的条目同源 | — |
+| `capabilities.textLayer.checked` | boolean | 是否真的查过文字层（document） | — |
+| `capabilities.textLayer.reason` | string \| null | 判不出来时的原因（本机没装文字抽取器）；与「这份文档没有文字层」不是一回事 | — |
+| `capabilities.textLayer.sampledPages` | integer[] | 计划采样的页码，按采样顺序 | 页 |
+| `capabilities.textLayer.checkedPages` | integer[] | 实际读过的采样页（提前返回时比 `sampledPages` 短） | 页 |
+| `capabilities.textLayer.textPage` | integer \| null | 第一个读到文字的采样页（`null` = 全部采样页都空，或根本没查） | 页 |
+| `capabilities.textLayer.reliable` | boolean \| null | 采样页文本看起来是否可信（9z5.31 启发式：U+FFFD / 私用区 / 孤立单字母 / 非词 token）。`null` = 没样本可判（没有文字层、非 PDF，或本机没装抽取器） | — |
+| `capabilities.textLayer.reasons` | string[] | 判定为不可靠的原因（人话，逐条）；可靠时为空数组 | — |
+| `capabilities.textLayer.warning` | string \| null | 不可靠时的完整提示：`looks unreliable (<原因>) — consider media_overview({ path, ocr: "force" })`；可靠时为 `null` | — |
 | `recommended.mode` | `"single"` \| `"sequence"` | 短素材一次读完 / 长素材分段读 | — |
 | `recommended.segmentSec` | integer | 分段读时的建议窗口长度 | s |
 | `recommended.overviewImages` | integer | 建议的 overview 图片数 | 张 |
@@ -415,30 +505,118 @@ path, and it only prepares images and text for your own model to look at.
 
 `effective = false` 时，`media_overview` / `media_locate` **不会**调用 ASR，而是返回空转写 + 明确原因。agent 应据此改用「只看画面」或要求用户换一份更清楚的录音。
 
+#### 4.3.2 文字层探测（`hasTextLayer` / `capabilities.textLayer`）
+
+文档的「有没有文字层」是**采样**结论，不是逐页保证：
+
+- 采样页 = 首页 / 中间页（`ceil(n/2)`）/ 末页，按这个顺序去重（`n ≤ 2` 时自然退化）。
+- 任一采样页有非空文字 → `hasTextLayer = true`，并在该页**提前结束**采样（`capabilities.textLayer.checkedPages` 只记读到的那几页）。
+- 全部采样页都空 → `hasTextLayer = false`（全篇扫描件仍然是这个结论）。
+- 本机**一个文字抽取器都没装**（pdftotext / mutool）→ `hasTextLayer = null`（= **判不出来**，不是「没有文字层」），`capabilities.textLayer.reason` 写明原因。
+
+为什么不能只看第 1 页：图片封面 / 扫描信笺头 / 期刊 cover page 后面接数字正文，是极常见的 PDF 形态。只看第 1 页会把这种文档误判成「只能靠 OCR」，而 OCR provider 往往根本没配，于是一本能直接抽全文的文档被判死。
+
+**逐页**结论不在这个探针字段上，而在抽取路径上：`media_overview` / `media_locate` 逐页拿文字层（有文字层的页可以按原样引用，没有的才需要 OCR）。
+
+非 PDF 的两个例外：`txt` / `md` 恒为 `hasTextLayer = true`（文件本身就是文字层，`checked = true`，采样页为空数组）；图片类文档恒为 `hasTextLayer = false`（`checked = true`，没有文字层可查）。两者都不会出现 `null`。
+
+**可疑文字层（9z5.31，最小启发式）：**「有文字层」不等于「文字是对的」——有些 PDF 的文字层是早先劣质 OCR 工具写进去的。probe 会对采样到的页文本（第一个命中的采样页）做一次保守检查，命中任一条件就报不可靠：
+
+| 信号 | 阈值 | 为什么 |
+|---|---|---|
+| U+FFFD 替换字符 | ≥ 3 个，或占非空白字符 ≥ 0.2% | 字体 / 编码映射坏掉的典型症状 |
+| 私用区字符（U+E000–U+F8FF） | ≥ 5 个，或占非空白字符 ≥ 0.5% | ToUnicode 映射缺失时的常见产物（正常 PDF 偶有零星图标字符，故不按 1 个就报） |
+| 孤立单字母 token | ≥ 25% 的「有字母或数字的 token」 | 劣质 OCR「一个字一个字往外蹦」；正常论文约 2%–4% |
+| 非词 token（不含字母 / 数字） | ≥ 30% 的 token | 符号噪声；正常论文约 0%–2% |
+
+样本少于 20 个 token 时不按比例判定（避免一两个字符就误报）。判定结果写入 `capabilities.textLayer.reliable / reasons / warning`，文本输出把 `text layer:` 行换成：
+
+```
+text layer: looks unreliable (96% of word tokens are isolated single letters; 34% of tokens contain no letter or digit) — consider media_overview({ path, ocr: "force" })
+```
+
+这只是**提示**，不是断言：agent 看到后应改用 `media_overview({ path, ocr: "force" })`（或对指定页 force），让 OCR provider 重新识别；需要 OCR provider 已配置。
+
+文本输出里的 `textLayer="..."` 属性随探针文案一并调整（见 9z5.21）：`null` 要渲染成 `unknown`，不能渲染成 `no` —— 否则等于在说「这份 PDF 没有文字层」。
+
 ### 4.4 文本输出形态
 
 ```
 <media path="/abs/a.mp4" type="video" duration="600.00" durationMs="600000"
-  size="1920x1080" fps="25.00" container="mov,mp4" video="h264" audio="aac"
-  subtitles="no" pages="-" />
+  size="1920x1080" fps="25.00" codec="h264" audio="present" container="mov,mp4"
+  subtitles="no" />
 asr: unavailable — MMGREP_ASR_PROVIDER is "none". Transcription will be empty.
 ocr: not applicable to this media type.
+typeset: not applicable to this media type.
 transcript source: none
-How to read 10 min: one overview is enough. media_overview({ path, cells: 9, images: 2 })
+chapters: none — this file has no chapters (no chapter metadata in the container).
+One overview is enough. media_overview({ path }) is the next step.
 ```
 
 音频（体检结果也要出现在文本里，因为 agent 要靠它决定下一步）：
 
 ```
 <media path="/abs/a.m4a" type="audio" duration="1845.00" durationMs="1845000"
-  codec="aac" channels="1" samplerate="44100" />
-audio health: too-quiet — mean level -41.2 dBFS, speech ratio 3.1% (needs >= -35 dBFS and >= 5%).
-  This recording has no effective speech: ASR is skipped, the transcript will be EMPTY.
-  Do not describe what was said; ask for a louder copy, or use the visuals only.
-asr: skipped (audio has no effective speech).
+  codec="aac" channels="1" samplerate="44100" audio="present" container="mov,mp4"
+  subtitles="no" />
+audio health: too-quiet — mean level -41.2 dBFS, speech ratio 3.1%
+  The recording is too quiet or almost entirely silent; ASR is skipped to avoid hallucinated lines.
+asr: unavailable — The recording is too quiet or almost entirely silent; ASR is skipped to avoid hallucinated lines.
+ocr: not applicable to this media type.
+typeset: not applicable to this media type.
 transcript source: none
-How to read 30 min: one overview is enough. media_overview({ path })
+chapters: none — this file has no chapters (no chapter metadata in the container).
+No usable speech detected; only metadata and waveform are available.
 ```
+
+文档（0.2.0 起分行给出文字层 / 两个 provider 角色 / 实际来源，不再有互相矛盾的两行）：
+
+```
+<media path="/abs/a.pdf" type="document" pages="28" textLayer="yes" container="pdf" subtitles="no" />
+asr: not applicable to this media type.
+text layer: yes (sampled pages 1, 14; first text on page 1).
+ocr provider: none — No OCR provider is configured (MMGREP_OCR_PROVIDER is "none"). Pages without a text layer are returned as page images only.
+typeset provider: builtin.
+transcript source: text
+outline: none — this PDF has no bookmarks (no outline).
+One overview shows page thumbnails and page text. Use media_zoom({ path, page }) to read a page closely.
+```
+
+文字层看起来是坏的时候（9z5.31），`text layer:` 行换成带下一步动作的形式：
+
+```
+text layer: looks unreliable (96% of word tokens are isolated single letters; 34% of tokens contain no letter or digit) — consider media_overview({ path, ocr: "force" })
+```
+
+- `text layer:` 与 `textLayer` 属性都是三态：`yes` / `no` / `unknown`（本机没有文字抽取器，**判不出来**，不是「没有文字层」）；`textLayer` 属性仍按「有没有文字层」给 `yes`，可疑结论只在分行里表达。
+- `capabilities.textLayer.reliable = false` 时 agent 应改用 `ocr: "force"` 重新识别（见 §5.2 / §7.2）；可靠时 `reliable = true`、`warning = null`。
+- `ocr provider:` / `typeset provider:` 分别说明两个角色；`none` 时附原因。
+- `transcript source:` 是实际会走的来源：`text`（原生文字层 / 纯文本）、`ocr`（只有 OCR）、`mixed`（文字层与 OCR 都可用，逐页路由可能混合）、`none`。
+- 旧输出里「OCR 不可用」与「文字来源是 OCR」同时出现的那种自相矛盾的说法不会再出现：provider 行描述角色可用性，`transcript source:` 描述实际文字来源，二者不是一回事。
+
+**内置目录（9z5.33）**——PDF 书签 / 视频章节存在时，probe 在 `transcript` 行之后列出目录：
+
+```
+outline: 24 PDF bookmarks — use the outline to pick a range
+- Engineered human Argonaute 2 for targeted C-to-U RNA base editing  — page 1
+  - Loop-inducing gRNAs enable RNA editing by AGO2–APOBEC3A (A3A) fusions  — page 2 (label "ii")
+  ...
+  +N more (full outline in structuredContent.outline)
+How to read: use the outline to pick a range, e.g. media_overview({ path, pages: "1-5" }).
+```
+
+视频 / 录音的章节用时间戳，提示改成 `start` / `end`：
+
+```
+outline: 4 chapters — use the outline to pick a range
+- Opening  00:00.000-00:02.000
+- Build Up  00:02.000-00:05.000
+How to read: use the outline to pick a range, e.g. media_overview({ path, start: 0, end: 2 }).
+```
+
+- 文本最多 **2 层 / 60 条**，其余写 `+N more`；完整目录永远在 `structuredContent.outline`（overview 还写进 `manifest.json`）。
+- PDF 条目给**物理页码**（`pages` 参数接受的就是物理页）；PDF 定义了 `/PageLabels` 时再给打印标签：`— page 4 (label "ii")`。读取用 qpdf（`pdftotext` / `pdfinfo` 读不了 outline）；qpdf 未安装时输出 `outline: none — PDF bookmarks cannot be read: qpdf is not installed (...)`，不会静默省略。
+- 没有书签的 PDF 输出 `outline: none — this PDF has no bookmarks (no outline).`；视频/录音没有章节时输出 `chapters: none — ...`。
 
 ### 4.5 错误行为
 
@@ -461,17 +639,27 @@ Build an overview of a local media file so you can read it without guessing.
 
 What you get depends on the media:
 - video    : one or more numbered storyboard grids (each cell carries its cell number) plus a
-             time-aligned text index of every cell
+             time-aligned text index of the cells
 - audio    : a timestamped transcript, segment by segment
-- document : a grid of page thumbnails plus the text of each page, when a document parser is
-             configured
+- document : a grid of page thumbnails plus page text, when a document parser is configured
+
+For DOCUMENTS, ocr: "auto" (default) uses the PDF text layer where one exists and calls the OCR
+provider only for pages without one; ocr: "force" re-recognizes every requested page with the
+OCR provider, even pages that already have a text layer, and tags them (ocr). Use force when
+media_probe says "text layer: looks unreliable" or when the extracted text is visibly garbled.
+Forced results are cached separately from auto. (文档：ocr: "force" = 强制重新 OCR / 重新识别文字层)
+
+Pass images: 0 for a text-only, zero-pixel overview: no grid is rendered and no frame is
+decoded (a video costs no ffmpeg work at all), so you get only the transcript — or the page
+text for a document — and the reported budget is all zeros. Use it when you only need the words.
 
 TEXT SOURCE ORDER — subtitles first, ASR only as a fallback:
 1. a subtitle you select explicitly (external subtitle file, track index or language code),
 2. the subtitle track embedded in the container,
 3. a subtitle file with the same base name in the same directory (a.srt next to a.mp4),
 4. ASR — only when none of the above exists and an ASR provider is configured.
-Every segment is tagged with its source. subtitle = the author's own words, safe to quote.
+Every segment is tagged with its source. subtitle = from a subtitle file/track; usually the
+author's words, but may be auto-generated: check names and numbers against the frame.
 asr = machine transcription: names, numbers and jargon are often wrong, so do NOT quote an ASR
 segment verbatim and do not present it as the speaker's exact words. visual = there is no text
 at all, only the picture.
@@ -480,13 +668,46 @@ The storyboard grid is for FINDING things, not for reading them: cells are small
 inside a cell is usually unreadable. To read text on screen, call media_zoom on that moment
 and read the cropped single frame.
 
-The full text is NOT inlined. It is written to disk and the returned paths point at it:
-content.md (readable), segments.jsonl (one segment per line, machine-readable), manifest.json
-(what was produced and how). Read those files section by section and summarise them in
-chunks yourself — do not ask for the same range again just to get more inline text.
+The full text is NOT inlined. It is written to disk, and the text of the result ends with a line
+like "full text: /abs/path/content.md (segments.jsonl, manifest.json in the same directory)".
+That absolute path is what you read: content.md is the readable full text, segments.jsonl has
+one segment per line, manifest.json records what was produced and how. Read those files section
+by section and summarise them in chunks yourself — do not ask for the same range again just to
+get more inline text. If the export could not be written, the line reads
+"full text: NOT written — <reason>" instead.
+
+The inline text is a PREVIEW with three tiers. (1) WHOLE: the requested range fits, and the
+result says "complete text ... nothing omitted". (2) SKIM (documents only, when the document
+parser exposes block structure): every heading plus the first complete sentence of each
+paragraph, tables as "[table: caption]", with captions/footnotes/equations left out; each page
+is labelled like "[page 4 · skim: 12 of 210 sentences]". A skim built from the built-in heuristic
+blocks is best-effort — section structure may be wrong; read content.md for the authoritative
+text. (3) SAMPLED: complete units — document sentences, video/audio transcript segments — are
+sampled evenly, with a line like "preview: sampled 84 of 312 sentences across pages 1-28; not
+represented: 2-6, 8-12". In a skim that still does not fit, all headings are kept and sentences
+are sampled; only when even the headings do not fit are the headings sampled. Sampling never
+drops a whole page silently: pages that could not be represented are listed, and a single
+over-long unit is truncated with a trailing "…[+N chars]". Read content.md when you need the
+complete text.
+
+VIEW — the view parameter controls the inline text (default "auto"). Many files carry a real
+outline: PDF bookmarks, or chapter markers in video/audio. (1) "auto": if the requested range
+fits, you get the full text; if it does not fit and the file has an outline, the outline comes
+first (page numbers for PDFs, timestamps for chapters) and the rest of the budget goes to the
+text preview; if there is no outline, you get the normal skim/sampled preview. A document
+without bookmarks gets an outline GENERATED FROM ITS HEADINGS when the range has at least 5
+headings, labelled "outline: generated from headings" (best-effort). (2) "outline": return only
+the outline — generated from headings for a document without bookmarks; for video/audio without
+chapters you get an explicit "no chapters" message and NOTHING is generated, because this server
+never invents an outline from content. In that case read the overview (or a start/end window)
+and write your own outline from the time-aligned text and storyboard grids. (3) "text": ignore
+the outline and force the text pipeline. The full outline is always in structuredContent.outline
+and, for an overview that writes an export, in manifest.json.
+(目录：view:auto 放不下时先出目录；view:outline 只出目录；view:text 只出文本。视频/音频没有章节时不生成目录)
 
 Always call media_probe first: it tells you how long the file is, whether a subtitle source
-exists, and which transcript source applies, for free. Long media must be narrowed with
+exists, which transcript source applies, and whether the file carries a built-in outline
+(PDF bookmarks / chapters), for free. Long media must be narrowed with
 start/end (video, audio) or pages (document) — one giant grid of a two-hour film gives you
 illegible cells and spoils the ending. Follow the continuation hint in the result to page
 through the rest.
@@ -503,6 +724,8 @@ through the rest.
 | `end` | number | ❌ | 媒体末尾 | video, audio | 终点（秒，浮点） |
 | `segment` | integer | ❌ | `300` | video, audio | 只给 `start` 不给 `end` 时的窗口长度（秒，30–3600） |
 | `pages` | string | ❌ | 全文 | document | 页码范围，如 `"3-10,15"` |
+| `ocr` | `"auto"` \| `"force"` | ❌ | `"auto"` | document | 页文字的获取方式。`"auto"`：有文字层就用文字层，只有没文字层的页走 OCR；`"force"`：请求的页**无论有没有文字层**都交给 OCR provider 重新识别，结果 `textOrigin = "ocr"`、页标 `(ocr)`，并单独缓存（不覆盖 auto 结果）。用在 probe 说 `text layer: looks unreliable` 时。需要已配置 OCR provider（`MMGREP_OCR_PROVIDER`），否则报 `PROVIDER_NOT_CONFIGURED`；纯文本 `.txt` / `.md` 没有页图，force 会报 `INVALID_ARGUMENT`；video / audio 传它报 `INVALID_ARGUMENT` |
+| `view` | `"auto"` \| `"outline"` \| `"text"` | ❌ | `"auto"` | 全部 | 内联文字的内容。`"auto"`：请求范围放得下就给全文；放不下且有目录（内置 PDF 书签 / 章节，或文档 blocks 里 ≥5 个 heading）时先出目录，余量给文本预览；没有目录时走 skim / 抽样。`"outline"`：只出目录（文档无书签时从 heading 生成；视频/录音无章节时只给「无章节」说明，不生成内容）。`"text"`：忽略目录，强制走文本管线。完整目录始终在 `structuredContent.outline` 与 `manifest.json` |
 | `cells` | integer | ❌ | video `9` / document `6` | video, document | 每张拼图的格数（video=镜头格，document=页缩略图），1–16 |
 | `images` | integer | ❌ | `2` | video, document, audio（仅 `0`） | 返回几张拼图，`0`–`4`；`0` = 零像素纯文本模式（不出图，只回文字，`budget` 全零） |
 | `maxEdge` | integer | ❌ | `1280` | video, document | 单张图最长边（px），上限 1600 |
@@ -517,6 +740,8 @@ through the rest.
 |---|---|---|---|
 | `mediaType` | string | 媒体类型 | — |
 | `path` | string | 绝对路径 | — |
+| `view` | `"auto"` \| `"outline"` \| `"text"` | 本次调用的 `view`（缺省为 `auto`） | — |
+| `outline` | object | 本次的完整目录（PDF 书签 / 章节 / 从 heading 生成）；`available=false` 时 `entries=[]` 且 `reason` 说明原因。字段同 §4.3 的 `outline`，另加 `generated`（是否由 heading 生成） | — |
 | `window.startMs` / `window.endMs` | integer | 本次覆盖的时间窗 | ms |
 | `window.startSec` / `window.endSec` | number | 同上，秒 | s |
 | `window.pages` | integer[] \| null | 本次覆盖的页码（document） | 页 |
@@ -529,27 +754,41 @@ through the rest.
 | `images[].bytes` | integer | 编码后字节数 | byte |
 | `images[].estimatedTokens` | integer | 这张图的 token 估算 | token |
 | `images[].source` | `"visual"` | 图内容恒为画面（宫格图里没有任何可引用的文字） | — |
-| `segments[]` | array | 内联的段落/格清单（**节选**，非全文） | — |
-| `segments[].index` | integer | 序号（1-based） | — |
+| `segments[]` | array | 实际内联的单元清单（**节选**：文档 = 句子，视频/录音 = 转写段落） | — |
+| `segments[].index` | integer | 序号（1-based；文档为句子在全文单元列表里的位置，`preview.mode = "skim"` 时为 skim 单元序号） | — |
 | `segments[].startMs` / `endMs` | integer \| null | 时间范围（document 为 null） | ms |
 | `segments[].startSec` / `endSec` | number \| null | 同上，秒 | s |
 | `segments[].text` | string | 该段文字（可能为 ""，表示无台词） | — |
-| `segments[].source` | `"subtitle"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 这段文字的来源与可信度（见 §2.5） | — |
-| `segments[].origin` | `"file"` \| `"embedded"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道 | — |
+| `segments[].source` | `"subtitle"` \| `"text"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 这段文字的来源与可信度（见 §2.5）。文档逐页：原生文字层 = `text`，OCR / 未声明 = `ocr`，无文字 = `none` | — |
+| `segments[].origin` | `"file"` \| `"embedded"` \| `"textlayer"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道（文档：`textlayer` = PDF 文字层，`file` = `.txt` / `.md`） | — |
+| `segments[].textOrigin` | `"textlayer"` \| `"ocr"` \| `"unknown"` \| null | 文档 provider / 抽取层对**这一页**的声明（`source` 就是按它映射的）；视频 / 录音为 null | — |
 | `segments[].page` | integer \| null | 页码（document） | 页 |
-| `transcript.source` | `"subtitle"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 整份转写的来源与可信度 | — |
-| `transcript.origin` | `"file"` \| `"embedded"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道 | — |
+| `transcript.source` | `"subtitle"` \| `"text"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"mixed"` \| `"none"` | 整份转写的来源与可信度。文档 `mixed` = 返回页的逐页标签不一致，看每页的 `source` | — |
+| `transcript.origin` | `"file"` \| `"embedded"` \| `"textlayer"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道。`transcript.source = "mixed"` 时只表示主要渠道（`textlayer` 优先），逐页以 `segments[].origin` 为准 | — |
 | `transcript.language` | string \| null | 语言 | — |
 | `transcript.segmentCount` | integer | 总段落数（全文，不是节选数） | 条 |
-| `transcript.provider` / `transcript.model` | string \| null | ASR provider 与模型 | — |
+| `transcript.provider` / `transcript.model` | string \| null | 本次实际用到的解析 provider 与模型（没有外部 provider 时为 null；两个角色都用同一 provider 时只出现一次） | — |
+| `transcript.ocrProvider` | string \| null | 本次实际处理过返回页的 OCR 角色 provider（document；没用到时为 null） | — |
+| `transcript.typesetProvider` | string \| null | 本次实际处理过返回页的 typeset 角色 provider（document；`builtin` = 本地内置；没用到时为 null） | — |
 | `transcript.reason` | string \| null | 没有转写时的人话原因（`source = "none"` 时给出） | — |
 | `pages[]` | array \| null | document 的每页文字（`{page, text, truncated}`） | — |
 | `fullText.dir` | string | 全文落盘目录 | — |
 | `fullText.contentMd` | string | `content.md` 绝对路径 | — |
 | `fullText.segmentsJsonl` | string | `segments.jsonl` 绝对路径 | — |
 | `fullText.manifestJson` | string | `manifest.json` 绝对路径 | — |
-| `fullText.documentJson` | string \| null | `document.json` 绝对路径（cangjie 契约产物；不产出时为 null） | — |
-| `truncated` | boolean | 内联清单是否被截断 | — |
+| `fullTextReason` | string \| null | 全文落盘失败的人话原因（`fullText = null` 时给出） | — |
+| `truncated` | boolean | 内联清单是否是预览（`whole` 以外的 skim / sampled / outline 都是预览，不是全文） | — |
+| `preview.mode` | `"whole"` \| `"skim"` \| `"sampled"` \| `"outline"` | `whole` = 请求范围整体内联（完整）；`skim` = 文档按契约 v2 blocks 速读（全部 heading + 段首句）；`sampled` = 完整单元等距抽样；`outline` = `view:"outline"` 只出目录（没有目录时给「无目录 / 无章节」说明） | — |
+| `preview.units` | integer | 实际内联的单元数（skim 模式下 heading / 段首句 / 表格占位各算一个；其它模式文档 = 句子，视频/录音 = 转写段落） | 条 |
+| `preview.totalUnits` | integer | 请求范围内的句子总数（文档；skim 与 sampled 同口径，逐页标注里的 N 也是它）。视频/录音为转写段落总数 | 条 |
+| `preview.skimUnits` | integer | skim 模式下可用的 skim 单元总数（heading + 段首句 + 表格占位）；其它模式不出现 | 条 |
+| `preview.headingsTotal` / `preview.headingsInlined` | integer | skim 模式下 heading 总数 / 实际内联的 heading 数；两者不等说明连 heading 都放不下、被等距抽样 | 条 |
+| `preview.sampled` | boolean | skim 模式下是否有 skim 单元被抽样掉；其它模式不出现 | — |
+| `preview.headingsSampled` | boolean | skim 模式下是否对 heading 本身做了抽样（只有全部 heading 都放不下时才为 `true`） | — |
+| `preview.notRepresented` | integer[] | 没有被内联任何单元的页码（文档；其它媒体为空数组） | 页 |
+| `preview.outlineSource` | `"pdf-bookmarks"` \| `"chapters"` \| `"headings"` \| `"none"` | 本次目录来源（有目录时出现） | — |
+| `preview.outlineInlined` | integer | 实际写进内联文本的目录条目数（目录放不下时小于总数；`view:"outline"` 时也受上限约束） | 条 |
+| `preview.outlineTotal` | integer | 目录条目总数（完整目录在 `structuredContent.outline`） | 条 |
 | `continuation` | object \| null | 续读提示 | — |
 | `continuation.nextStartMs` / `nextStartSec` | integer / number | 下一段起点（video/audio） | ms / s |
 | `continuation.nextPage` | integer | 下一批起始页（document） | 页 |
@@ -559,6 +798,14 @@ through the rest.
 | `budget.estimatedTokens` | integer | 本次总图片 token 估算（`images: 0` 时是 0） | token |
 | `budget.limit` | integer | 本次调用的图片 token 上限 | token |
 | `budget.warning` | string \| null | 超软预算时的降级建议 | — |
+
+`document.json`（cangjie 契约的可选件，见 §9.4）**不在 `structuredContent.fullText` 里**：它与 `content.md` 写在同一目录，按 `fullText.dir` + `/document.json` 读取即可（overview 默认会写它）。
+
+**全文路径必须同时出现在 `content[0].text` 里。** text 末尾固定有一行
+`full text: <content.md 绝对路径> (segments.jsonl, manifest.json in the same directory)`；
+落盘失败时这一行是 `full text: NOT written — <reason>`，同时 `structuredContent.fullText = null`
+且 `fullTextReason` 给出原因（调用本身仍然成功）。续读提示 `continuation.note` 也出现在 text
+末尾——只靠 `structuredContent` 的宿主否则永远看不到它们。
 
 ### 5.4 三种媒体的文本清单形态
 
@@ -571,9 +818,12 @@ through the rest.
 [cell 1  ] 00:00.000-00:33.333  (subtitle)  「……」
 [cell 2  ] 00:33.333-01:06.667  (subtitle)  「……」
 ...
-cost: 2 image(s) x ~1229 = ~2458 vision tokens · transcript from subtitle file (0 s)
+cost: 2 image(s) x ~1229 = ~2458 vision tokens · transcript from subtitle (/abs/a.zh.srt)
 note: the grids are for locating. To read text on screen, media_zoom({ path, at }) and read
       the cropped single frame.
+note: source is subtitle — from a subtitle file/track; usually the author's words, but may be
+      auto-generated: check names and numbers against the frame.
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
 
 **零像素纯文本模式（`images: 0`）**——没有宫格就没有格位，段落按转写行列出：
@@ -584,9 +834,11 @@ note: the grids are for locating. To read text on screen, media_zoom({ path, at 
 [seg 1   ] 00:00.000-00:03.120  (subtitle)  「……」
 [seg 2   ] 00:03.120-00:07.480  (subtitle)  「……」
 ...
-note: text-only mode (images: 0) — no storyboard grid was rendered and no frame was decoded;
-      the list below is the transcript of this window.
+note: text-only mode (images: 0) — no storyboard grid was rendered and no frame was decoded.
 note: to see the picture, call media_zoom({ path, at }) for a single frame.
+note: source is subtitle — from a subtitle file/track; usually the author's words, but may be
+      auto-generated: check names and numbers against the frame.
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
 
 **录音（audio）**——按段落：
@@ -598,40 +850,133 @@ note: to see the picture, call media_zoom({ path, at }) for a single frame.
 [seg 2   ] 00:04.120-00:09.480  (asr)  「……」
 note: source is asr — machine transcription. Names, numbers and jargon may be wrong; do not
       quote these lines as the speaker's exact words.
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
 
-**文档（document）**——按页：
+**文档（document）**——按页。header 不再有 `text` 属性，改为 `source` + 本次实际处理返回页的角色：
 
 ```
 <overview path="/abs/a.pdf" type="document" pages="1-12" grid="12 pages x 2 image(s)"
-  image="1280x720" tokens="~2458" text="mineru" source="ocr" />
+  image="1280x720" tokens="~2458" source="text" typesetProvider="builtin" />
+[page 1  ] (text)  「……」
+[page 2  ] (text)  「……」 「……」
+preview: sampled 84 of 312 sentences across pages 1-12; not represented: 8-12.
+note: page text comes from the native text layer (or the plain-text file) — characters are exact and may be quoted.
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
+```
+
+逐页来源不一致时（封面是扫描图、正文是文字层），整份是 `source="mixed"`，只有真正 OCR 过的页标 `(ocr)`：
+
+```
+<overview path="/abs/a.pdf" type="document" pages="1-4" source="mixed"
+  ocrProvider="mineru" typesetProvider="builtin" />
+[page 1  ] (ocr)  「……」
+[page 2  ] (text)  「……」
+...
+note: page sources differ — read the tag on each page (text = character-exact native text, ocr = machine recognition).
+note: some page text comes from OCR — names, numbers and jargon may be misread; verify them
+      against the page image via media_zoom({ path, page }).
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
+```
+
+文字层不可靠、agent 用 `ocr: "force"` 重新识别后（请求页全部是 `(ocr)`；header 的 `source="ocr"`，`ocrProvider` 指向实际做识别的 provider）：
+
+```
+<overview path="/abs/a.pdf" type="document" pages="1-12" source="ocr" ocrProvider="mineru" />
 [page 1  ] (ocr)  「……」
 [page 2  ] (ocr)  「……」
-note: page text comes from OCR of the rendered pages — verify names and numbers against the
-      page image via media_zoom({ path, page }).
+note: some page text comes from OCR — names, numbers and jargon may be misread; verify them
+      against the page image via media_zoom({ path, page }).
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
+```
+
+OCR 的核对 note **只在真的有 OCR 页时出现**，不再无条件写给所有文档。请求范围整体放得下时是 tier 1，允许宣称完整（且只有此时可以）：
+
+```
+[page 1  ] (text)  「……」
+[page 2  ] (text)  「……」
+note: complete text of pages 1-2 (nothing omitted).
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
+```
+
+**目录优先（9z5.33）**——放不下且有目录时，`view:"auto"` 先给目录，余量才给文本；`view:"outline"` 只给目录：
+
+```
+<overview path="/abs/book.pdf" type="document" pages="1-28" source="text" typesetProvider="builtin" />
+outline: 24 PDF bookmarks — full outline in structuredContent.outline and manifest.json
+- Engineered human Argonaute 2 ...  — page 1
+  - Loop-inducing gRNAs ...  — page 2
+  ...
+hint: pick a range with pages, e.g. media_overview({ path, pages: "1-5" }).
+[page 1  ] (text)  「……」
+...
+preview: skim — 84 of 620 sentences inlined across pages 1-28; all 24 headings kept; not represented: 21-28. Skim = headings + first sentence per paragraph (tables as [table: caption]).
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
+```
+
+目录块本身也受内联预算约束：放不下时按 `maxChars` 截断，并在末尾写
+`+N more entries (full outline in structuredContent.outline and manifest.json)`；连一条都放不下时
+写 `(no entry fits the inline budget; read the full outline in structuredContent.outline / manifest.json)`。
+**「完整 / 没有省略」的 note 只在 tier 1（whole）出现**——有目录 + 预览的组合永远不会说「complete」。
+
+- 有目录时 `preview.outlineSource` / `outlineInlined` / `outlineTotal` 说明目录内联了多少条。
+- 文档目录来自 heading 时头部标 `outline: generated from headings`（best-effort；builtin 启发式 blocks 可能把结构判错）。
+- 视频/录音有章节时用 `start`/`end` 提示；没有章节时 `view:"outline"` 只回一句「no chapters」，**不生成**任何目录内容。
+- `view:"text"` 跳过目录；`view:"auto"` 在请求范围整体放得下时也给全文（tier 1 优先于目录）。
+
+**文档预览的三层（9z5.32）**：whole（整体放得下）→ skim（契约 v2 blocks 可用时）→ sampled（没有 blocks 的旧路径，或 skim 也放不下时）。视频 / 录音**没有** skim，直接 whole → sampled。
+
+skim 的内容是全部 heading + 每个段落的第一个完整句（复用 .20 的断句函数）；table 只留
+`[table: <caption>]`（没有 caption 时只写 `[table]`），caption / footnote / equation 不进
+速读视图。每页标注 `[page N · skim: X of Y sentences]`：X 是这页实际内联的 skim 单元数
+（heading 也算一个），Y 是这页全文的句子数。builtin 启发式 blocks 生成的 skim 会在 note 里
+标 best-effort：
+
+```
+[page 4 · skim: 38 of 210 sentences] (text)  ## 2. Methods 「This section describes the assay.」 [table: Table 2 | Results]
+preview: skim — 38 of 210 sentences inlined across pages 1-12; all 12 headings kept; every requested page is represented. Skim = headings + first sentence per paragraph (tables as [table: caption]). Skim was built from heuristic blocks (best-effort): section structure may be wrong.
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
+```
+
+skim 自己仍放不下时：**heading 全部保留**，段首句按页等距抽样（`preview.sampled = true`，
+`preview.headingsInlined = preview.headingsTotal`）；只有连 heading 都放不下时才对 heading
+本身等距抽样（`preview.headingsSampled = true`）。没有 blocks 的旧路径不做 skim，行为与
+.20 一致：
+
+```
+[page 1  ] (text)  「……」
+preview: sampled 84 of 312 sentences across pages 1-12; not represented: 8-12.
+full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
 
 ### 5.5 降级形态（没有 ASR / OCR 时）
 
 | 情形 | 降级行为 | agent 能看到什么 |
 |---|---|---|
-| video，有**字幕**（文件或内嵌轨） | 用字幕，`transcript.source = "subtitle"`，**不跑 ASR** | 画面 + 作者原话（可引用） |
+| video，有**字幕**（文件或内嵌轨） | 用字幕，`transcript.source = "subtitle"`，**不跑 ASR** | 画面 + 字幕文字（通常是作者原话，但可能是自动生成的，专名数字要核对画面） |
 | video，无字幕但有音轨，`MMGREP_ASR_PROVIDER=none` | 照常出宫格图；`transcript.source = "none"`；每格 `text` 为空；清单末尾给出原因 | 只有画面。不能编造台词 |
 | video，无音轨 | 同上，原因写「no audio track」 | 只有画面 |
 | audio，**体检结论 too-quiet / silent** | **不跑 ASR**（避免幻觉段落）；`transcript.source = "none"`；说明写明「no effective speech」 | 什么都没有，只有一句说明 + 原因 |
-| audio，有字幕但无 ASR | 用字幕，`transcript.source = "subtitle"` | 画面 + 原话 |
-| document，`MMGREP_DOC_PROVIDER=none` | 照常出页缩略图宫格；`pages[].text` 为空；`transcript.source = "none"` | 只有页面缩略图 |
+| audio，有字幕但无 ASR | 用字幕，`transcript.source = "subtitle"` | 画面 + 字幕文字（同上，核对专名与数字） |
+| document，**有文字层** | 不再把所有页标成 `ocr`：文字层页 `source = "text"`、`origin = "textlayer"`（字符精确，可引用）；`transcript.source = "text"`（有 OCR 角色参与时可能是 `mixed`） | 页面缩略图 + 文字层正文；无需为核对字符去 zoom |
+| document，图片封面 + 数字正文 | 封面无文字（没配 OCR 时 `source = "none"`，配置 OCR 后为 `ocr`）；正文 `source = "text"`；整份 `transcript.source = "mixed"` | 每页行首标签 `(text)` / `(ocr)` / 不出现（无文字页）；按标签决定是否核对 |
+| document，文字层像劣质 OCR 且**没有** OCR provider | probe 报 `text layer: looks unreliable (...)`；`media_overview({ ocr: "force" })` 报 `PROVIDER_NOT_CONFIGURED`（不静默退回坏文字层） | probe 的提示 + 错误 hint；可以先看页图，或配置 OCR provider 后重试 |
+| document，文字层像劣质 OCR 且**配置了** OCR provider | `ocr: "force"` 重新识别请求页，逐页 `(ocr)`；auto 仍按原文字层（结果分开缓存） | 重新识别后的页文字 + 页图；专名数字仍建议核对 |
+| document，`MMGREP_OCR_PROVIDER=none` 且无文字层 | 照常出页缩略图宫格；`pages[].text` 为空；`transcript.source = "none"` | 只有页面缩略图 |
 | document，扫描件且 OCR 未配置 | 同上，且 `capabilities.ocr.available = false` | 只有页面缩略图；需要读字就 `media_zoom` 单页放大 |
 
 **关键原则一：宁可明说「没有文字」，也不要把 `transcript.source` 写成 `none` 却让文本清单看起来像有内容。** 清单里每格没有台词时，格后面明确留空并给一行 `transcript: NONE (…reason…)`。
 
-**关键原则二：字幕优先，ASR 只作兜底。** 只要有字幕（外部文件或内嵌轨），就**不**跑 ASR——字幕是作者写的，又准又免费；ASR 慢、贵、还会听错人名和数字。上游 `dsh-video-storyboard` 也是这个顺序（`transcript: "auto"` = 优先内嵌字幕轨，否则才 ASR）。
+**关键原则二：字幕优先，ASR 只作兜底。** 只要有字幕（外部文件或内嵌轨），就**不**跑 ASR——字幕通常比 ASR 准，又免费；ASR 慢、贵、还会听错人名和数字。上游 `dsh-video-storyboard` 也是这个顺序（`transcript: "auto"` = 优先内嵌字幕轨，否则才 ASR）。注意「字幕优先」说的是**成本与速度**，不是**可信度的绝对保证**：自动生成的字幕同样走这条路，专名与数字仍要核对画面（见 §2.5）。
 
 **关键原则三：宫格图只用来「找位置」，不用来「读文字」。** 宫格的一格通常只有几百像素，里面的字基本看不清。要读画面上的字，必须 `media_zoom` 裁出单帧再看。
 
 ### 5.6 错误行为
 
 - `path` 校验见 §2.4；范围校验见 §2.4。
+- `ocr` 用在 video / audio 上 → `INVALID_ARGUMENT`（见 §2.2）。
+- `ocr: "force"` 用在 `.txt` / `.md` 上 → `INVALID_ARGUMENT`（纯文本本身没有页图可重新识别，文件就是文字层）。
+- `ocr: "force"` 但没有可用的 OCR provider（没配、或配了但缺 key / 回环地址之外没有 key）→ `PROVIDER_NOT_CONFIGURED`，hint 指向 `MMGREP_OCR_PROVIDER` / `MMGREP_MINERU_API_KEY`（HTTP 模式可用 `x-mmgrep-ocr-provider` 头）。这是**唯一**一种「文档 overview 直接失败」的 provider 情形：force 是明确指令，不能静默退回坏文字层。auto 模式下 provider 失败只降级：有文字层的页照常返回，其余页给页图 + 警告。
 - `cells` / `images` 越界 → `BUDGET_EXCEEDED`（见 §10）。
 - 需要转写但完全无来源，且调用方要求了转写 → 不报错（出画面 + 说明）。只有 `media_locate` 这种「非要有转写不可」的工具才报 `NO_TRANSCRIPT`。
 
@@ -737,6 +1082,18 @@ Use it when you know roughly what was said but not when ("where does it mention 
 you need to know which page a phrase is on. Matching ignores punctuation, spacing and case,
 and works for both Chinese and English. Long phrases match better than single characters.
 
+For a video or recording, each match is a time window with a match score (0..1) and the
+matched line. For a document, each match is a page: the page number, how many times the
+query appears on that page (hits), and a short snippet around the first hit — never the
+whole page. Pages that matched but did not fit are listed as "N more pages match: ...".
+Read a full page with media_overview({ path, pages }).
+
+For DOCUMENTS, ocr: "auto" (default) searches the PDF text layer where one exists and OCRs only
+pages without one; ocr: "force" re-recognizes every requested page with the OCR provider first,
+even pages that already have a text layer, and tags those matches (ocr). Use force when
+media_probe says "text layer: looks unreliable". Forced results are cached separately from auto.
+(文档：ocr: "force" = 强制重新 OCR / 重新识别文字层)
+
 Text only by default — no image, no pixels spent. Add includeFrame: true to also get the
 picture at the best match (one image, roughly 1,900 vision tokens).
 
@@ -761,7 +1118,11 @@ speaker's exact words.
 | `start` / `end` | number | ❌ | 全媒体 | video, audio | 只在这个时间窗里找 |
 | `segment` | integer | ❌ | `300` | video, audio | 只给 `start` 不给 `end` 时的窗口长度 |
 | `pages` | string | ❌ | 全文 | document | 只在这些页里找 |
-| `includeFrame` | boolean | ❌ | `false` | video, document | 是否附带最佳匹配处的画面 |
+| `ocr` | `"auto"` \| `"force"` | ❌ | `"auto"` | document | 同 `media_overview`：`"force"` 先让 OCR provider 重新识别请求页（有文字层也重识别），再在这些文字里定位；命中行标 `(ocr)`。需要已配置 OCR provider，否则报 `PROVIDER_NOT_CONFIGURED`；video / audio 传它报 `INVALID_ARGUMENT` |
+| `includeFrame` | boolean | ❌ | `false` | video, document | 是否附带最佳匹配处的画面。视频给最佳时间窗的一帧；文档给最佳命中页的**页图**（页码看 `matches[0].page`；纯文本 `.txt` / `.md` 没有页图，只给 warning）。audio 传它报 `INVALID_ARGUMENT` |
+
+> **没有 `includePageText` 这种参数。** 文档命中页的正文不会整页返回（见 §7.3.1）；需要整页文字时用
+> `media_overview({ path, pages })` 或缓存里的 `content.md`。文本定位的默认输出是「页码 + 命中次数 + 片段」。
 
 ### 7.3 返回结构
 
@@ -770,18 +1131,22 @@ speaker's exact words.
 | `mediaType` | string | 媒体类型 | — |
 | `path` | string | 绝对路径 | — |
 | `query` | string | 原始查询串 | — |
-| `transcriptSource` | `"subtitle"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 用的哪份转写（可信度口径，见 §2.5） | — |
-| `transcriptOrigin` | `"file"` \| `"embedded"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道 | — |
-| `matches[]` | array | 匹配列表，按分数降序 | — |
+| `transcriptSource` | `"subtitle"` \| `"text"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"mixed"` \| `"none"` | 用的哪份转写（可信度口径，见 §2.5）。文档可能是 `text` / `ocr` / `mixed` | — |
+| `transcriptOrigin` | `"file"` \| `"embedded"` \| `"textlayer"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道（文档：`textlayer` = PDF 文字层） | — |
+| `matches[]` | array | 匹配列表（视频/录音按分数降序；文档按 §7.3.1 排序） | — |
 | `matches[].rank` | integer | 名次（1-based） | — |
-| `matches[].score` | number | 匹配分数（0–1，越大越像） | — |
+| `matches[].score` | number | 匹配分数（0–1，越大越像）——**仅视频 / 录音**，文档没有这个字段 | — |
+| `matches[].hits` | integer | 该页命中次数——**仅文档**（精确短语计数） | 次 |
+| `matches[].snippet` | string | 命中附近的片段——**仅文档**（首个命中 ±150 字符，对齐词边界） | — |
+| `matches[].fuzzy` | boolean | 是否退化成 token 覆盖（没有整句命中）——**仅文档** | — |
 | `matches[].startMs` / `endMs` | integer \| null | 时间范围（document 为 null） | ms |
 | `matches[].startSec` / `endSec` | number \| null | 同上，秒 | s |
-| `matches[].text` | string | 命中的原文 | — |
-| `matches[].source` | `"subtitle"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 这段文字的来源与可信度（见 §2.5） | — |
-| `matches[].origin` | `"file"` \| `"embedded"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道 | — |
+| `matches[].text` | string | 命中的原文（**文档不返回整页正文**，用 `snippet`） | — |
+| `matches[].source` | `"subtitle"` \| `"text"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"none"` | 这段文字的来源与可信度（见 §2.5）；文档逐页映射（`text` / `ocr`） | — |
+| `matches[].origin` | `"file"` \| `"embedded"` \| `"textlayer"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道 | — |
+| `matches[].textOrigin` | `"textlayer"` \| `"ocr"` \| `"unknown"` \| null | 文档 provider / 抽取层对这一页的声明（`source` 按它映射）；视频 / 录音为 null | — |
 | `matches[].page` | integer \| null | 页码（document） | 页 |
-| `totalSegments` | integer | 搜索范围内的段落总数 | 条 |
+| `totalSegments` | integer | 搜索范围内的段落总数（document = 页数） | 条 |
 | `searchedWindow.startMs` / `endMs` | integer \| null | 搜索范围 | ms |
 | `searchedWindow.pages` | integer[] \| null | 搜索页码 | 页 |
 | `frame` | object \| null | `includeFrame: true` 时的画面 | — |
@@ -790,7 +1155,28 @@ speaker's exact words.
 | `frame.estimatedTokens` | integer | token 估算 | token |
 | `text` | string | 人类/模型可读说明 | — |
 
+#### 7.3.1 文档的定位口径（与视频 / 录音不同）
+
+文档后端的 segment 粒度就是「一整页」：命中即整页，把整页回吐等于复述全文（一次调用可吐 12 KB+）。
+所以文档侧不用 `score`，改用**命中次数 + 片段**：
+
+| 项 | 口径 |
+|---|---|
+| `hits` | 该页的命中次数：精确短语（归一化 + 紧凑化后逐字匹配）出现次数；没有精确命中时退回 token 覆盖，`hits` = 命中 token 的出现次数，并置 `fuzzy = true` |
+| `snippet` | 原文里首个命中 ±150 字符，对齐到词边界，折叠换行与排版空白；被截断处用 `…` 标记 |
+| `source` | 该页文字的来源：`text`（原生文字层，字符精确）/ `ocr`（机器识别）。文本行写成 `page 11  hits=3 (text) 「…」`；`fuzzy` 命中写成 `(fuzzy, ocr)` |
+| 排序 | **精确命中优先** → `hits` 降序 → 页码升序（token 覆盖会把只命中一个常见词的页也算进来，精确命中必须压过它们） |
+| 整页正文 | **不再返回**。要整页用 `media_overview({ path, pages })` 或缓存里的 `content.md` |
+| 输出预算 | 文本输出约 3 KB 上限：超了就少展示几页，其余折叠成一行 `N more pages match: 3, 9, 14`（页码升序）。被折叠的页**不算丢失**，文本里写明了页码 |
+| `ocr` | `"force"` 时先重新识别请求页再定位；命中行的 `source` / `origin` / `textOrigin` 都是 `ocr`，文本行写 `(ocr)`。force 结果走独立缓存，和 auto / 文字层结果互不覆盖 |
+| 候选窗口 | 一次 locate 最多向后端要 20 页候选（后端上限）：`N more pages match` 列的是**已知命中但没展示**的页；想看更后面的页，用 `pages` 缩小范围再查 |
+
+> 视频 / 录音的 `score`（0–1）与文档的 `hits` 是两种粒度下的两种指标：前者比「像不像」，
+> 后者比「命中几次」。同一字段两种语义会打架，所以文档侧**删掉** `score`，不要两套都留。
+
 ### 7.4 文本输出形态
+
+视频 / 录音：
 
 ```
 matches for "柏氏矢量" (2 of 128 segments):
@@ -799,11 +1185,26 @@ matches for "柏氏矢量" (2 of 128 segments):
 Feed any of these windows to media_zoom({ path, start, end }) — no need to re-read the whole file.
 ```
 
+文档（一行一页：页码 + 命中次数 + 来源标签 + 命中附近的片段，没有分数）：
+
+```
+matches for "deimmunization" (2 of 28 pages):
+  page 11  hits=3 (text)  「…workflow for artificial intelligence-directed deimmunization.…」
+  page 4  hits=1 (ocr)  「…the chimera was deimmunized by injection of…」
+  2 more pages match: 7, 19
+Feed any of these pages to media_zoom({ path, page }) — no need to re-read the whole file.
+```
+
+`(text)` 的片段来自原生文字层，字符精确；`(ocr)` 的片段经过字符识别，专名与数字建议 `media_zoom` 核对。
+
 ### 7.5 错误行为
 
 - 无 `query` → `INVALID_ARGUMENT: query is required.`
-- **无任何转写来源** → `NO_TRANSCRIPT`，文案：
+- `ocr: "force"` 但没有可用的 OCR provider → `PROVIDER_NOT_CONFIGURED`（与 overview 同一套 hint）；`ocr: "force"` 用在 `.txt` / `.md` 上 → `INVALID_ARGUMENT`；video / audio 传 `ocr` → `INVALID_ARGUMENT`。
+- **媒体没有可用文字** → `NO_TRANSCRIPT`（视频 / 录音：无字幕且无 ASR；文档：无文字层且无 OCR）。视频 / 录音的原文案：
   `no transcript available for this file and no ASR provider is configured (MMGREP_ASR_PROVIDER="none"). Pass subtitle with a local .srt/.vtt file, a track index, or a language code, or configure an ASR provider. For visuals only, use media_overview instead.`
+  文档的原文案以 `cannot search this document: ` 开头，后面接具体原因（`no text layer and no OCR provider is configured.` / `no page text is available.` 等），hint 指向 OCR 配置。
+- 文档的 OCR / typeset 角色**配置了但不可用**（缺 key、provider 初始化失败）→ `PROVIDER_NOT_CONFIGURED` / `PROVIDER_FAILED`，文案以 `cannot search this document: ` 开头——不像 overview 那样降级，因为 locate 必须要有文字可搜。
 - `includeFrame: true` 但媒体是 audio → `includeFrame is not applicable to audio media. There are no frames to show.`
 - 一条都没匹配上 → **不是错误**：`matches` 为空数组，文本里写 `no line matched "xxx" among 128 transcript segments. Try shorter keywords, or a phrase that appears verbatim.`
 
@@ -860,7 +1261,7 @@ media_overview({ path, images: 0, transcript: "subtitle", subtitle: "zh" })
 | `segments[].startMs` / `endMs` | integer | 时间范围 | ms |
 | `segments[].startSec` / `endSec` | number | 同上，秒 | s |
 | `segments[].text` | string | 字幕正文（已剥 markup） | — |
-| `segments[].source` | `"subtitle"` | 字幕恒为 `subtitle`（作者提供，可当原话引用） | — |
+| `segments[].source` | `"subtitle"` | 字幕恒为 `subtitle`（来自字幕文件 / 内嵌轨，可能是自动生成的） | — |
 | `segments[].origin` | `"file"` \| `"embedded"` | 来源渠道 | — |
 | `warnings[]` | array | 字幕来源相关警告（见 §8.5） | — |
 
@@ -875,7 +1276,7 @@ media_overview({ path, images: 0, transcript: "subtitle", subtitle: "zh" })
 [seg 2   ] 00:03.000-00:06.000  (subtitle)  「……」
 ```
 
-字幕是**作者提供的文本**，可信度最高，可以当原话引用；这一点与 ASR 转写不同（见 §2.5）。
+字幕文本通常来自作者，但也可能是机器自动生成的：专有名词与数字要核对画面（见 §2.5）。cue 之间大面积时间重叠时（> 30%），overview 与 locate 还会给出警告 `rolling/auto-style captions detected — treat like ASR: check names and numbers against the frame.`。
 
 ### 8.5 字幕来源的判定顺序（写死）
 
@@ -947,7 +1348,7 @@ media_overview({ path, images: 0, transcript: "subtitle", subtitle: "zh" })
 
 ## 9. 全文落盘格式
 
-`media_overview` 会把**全文**写到缓存目录，返回绝对路径。**全文不内联返回**；内联的只有受长度上限约束的节选。
+`media_overview` 会把**全文**写到缓存目录，返回绝对路径。**全文不内联返回**；内联的只有受长度上限约束的节选。绝对路径同时写进 `content[0].text` 末尾的 `full text:` 行（见 §5.3）——只读 text content 的宿主也拿得到；落盘失败时该行是 `full text: NOT written — <reason>`，调用本身不失败。
 
 落盘产物有 **4 个**：`content.md`（人读）、`segments.jsonl`（程序读）、`manifest.json`（本次导出的元信息），以及 **可选件** `document.json`（cangjie `SourceDocument Contract v1` 适配层，下游不需要 cangjie 时可以完全不看它）。
 
@@ -992,6 +1393,11 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
     .meta-<stem>.json             条目记录（LRU 与清理的依据）
 ```
 
+文档 provider 的逐页结果也挂在这棵树里（namespace 含 provider / model / ocrMode / role，
+每页一个 JSON），与全文产物共用同一套内容哈希、LRU 与容量上限；见 §2.7。
+同一 provider 担两个角色且 `ocrMode=auto` 时，缺失的 typeset / OCR 页合并成**一次**
+`role: "both"` 请求，按返回的 `textOrigin` 分配后再按每页实际路由到的角色落缓存。
+
 ### 9.1 `content.md`
 
 给人读的 Markdown全文。视频/录音按段落分段，文档按页分节。
@@ -1020,19 +1426,21 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
 **一行一个 JSON 对象**（不是数组），便于流式读取：
 
 ```json
-{"index":1,"startMs":0,"endMs":4120,"startSec":0,"endSec":4.12,"text":"第一句。","page":null,"speaker":null}
-{"index":2,"startMs":4120,"endMs":9480,"startSec":4.12,"endSec":9.48,"text":"第二句。","page":null,"speaker":null}
-{"index":1,"startMs":null,"endMs":null,"startSec":null,"endSec":null,"text":"第 1 页正文","page":1,"speaker":null}
+{"index":1,"startMs":0,"endMs":4120,"startSec":0,"endSec":4.12,"text":"第一句。","page":null,"speaker":null,"source":"asr","origin":"asr"}
+{"index":2,"startMs":4120,"endMs":9480,"startSec":4.12,"endSec":9.48,"text":"第二句。","page":null,"speaker":null,"source":"asr","origin":"asr"}
+{"index":1,"startMs":null,"endMs":null,"startSec":null,"endSec":null,"text":"第 1 页正文","page":1,"speaker":null,"source":"text","origin":"textlayer"}
 ```
 
-字段：`index`（1-based）、`startMs`/`endMs`（integer ms，document 为 null）、`startSec`/`endSec`（number，document 为 null）、`text`、`page`（document 专用）、`speaker`（有说话人分离时填，否则 null）。
+字段：`index`（1-based）、`startMs`/`endMs`（integer ms，document 为 null）、`startSec`/`endSec`（number，document 为 null）、`text`、`page`（document 专用）、`speaker`（本版恒为 `null`：说话人分离还没有接到 segments，字段先占位），以及 `source` / `origin`（§2.5 的枚举；文档逐页可能是 `source = "text"` + `origin = "textlayer"`（PDF 文字层）、`source = "text"` + `origin = "file"`（`.txt` / `.md`）、`source = "ocr"` + `origin = "ocr"`，或 `none`）。`contentHash` 是归一化文本的哈希（扩展字段）。
+
+> **`textOrigin` 不落盘。** 契约 v2 的逐页声明（`textlayer` / `ocr` / `unknown`）在工具返回的 `segments[]` / `matches[]` 里可见，但 `segments.jsonl` 只持久化映射后的 `source` / `origin`——下游要判断「这页是否原生文字层」，读 `source = "text"` + `origin = "textlayer"` 即可，信息没有丢。
 
 ### 9.3 `manifest.json`
 
 ```json
 {
   "version": 1,
-  "generator": { "name": "multimediagrep", "version": "0.1.0" },
+  "generator": { "name": "multimediagrep", "version": "<server version>" },
   "tool": "media_overview",
   "generatedAtMs": 1793508753000,
   "source": {
@@ -1044,9 +1452,18 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
   },
   "window": { "startMs": 0, "endMs": 600000, "startSec": 0, "endSec": 600 },
   "pages": null,
+  "outline": {
+    "available": true,
+    "source": "chapters",
+    "generated": false,
+    "total": 1,
+    "entries": [
+      { "title": "Opening", "startMs": 0, "endMs": 2000, "startSec": 0, "endSec": 2 }
+    ],
+    "reason": null
+  },
   "transcript": {
     "source": "asr",
-    "origin": "asr",
     "provider": "elevenlabs",
     "model": "scribe_v1",
     "language": "zh",
@@ -1055,11 +1472,8 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
   },
   "overview": {
     "images": [
-      { "index": 1, "file": "images/overview-1.png", "width": 1280, "height": 720, "cells": 9, "estimatedTokens": 1229 },
-      { "index": 2, "file": "images/overview-2.png", "width": 1280, "height": 720, "cells": 9, "estimatedTokens": 1229 }
-    ],
-    "cells": [
-      { "index": 1, "sheet": 1, "row": 1, "col": 1, "fromMs": 0, "endMs": 33333, "fromSec": 0, "endSec": 33.333 }
+      { "index": 1, "width": 1280, "height": 720, "cells": 9, "mimeType": "image/png", "bytes": 178204, "estimatedTokens": 1229 },
+      { "index": 2, "width": 1280, "height": 720, "cells": 9, "mimeType": "image/png", "bytes": 178204, "estimatedTokens": 1229 }
     ],
     "estimatedTokens": 2458
   },
@@ -1068,24 +1482,23 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
     "version_id": "sha256:ab12…cd",
     "element_count": 128
   },
-  "counts": {
-    "segments": 128,
-    "elements": 128,
-    "images": 2,
-    "pages": null
-  },
-  "provider": null,
+  "counts": { "segment": 128 },
+  "provider": "elevenlabs",
   "warnings": []
 }
 ```
 
 | 字段 | 含义 |
 |---|---|
-| `generator.name` / `generator.version` | 产出方（`multimediagrep` / `0.1.0`），下游据此判断字段含义是否兼容 |
+| `generator.name` / `generator.version` | 产出方（`multimediagrep` / 当前 server 版本），下游据此判断字段含义是否兼容 |
 | `document.source_id` | 稳定来源 ID（见 §9.4），**文件改名不变** |
 | `document.version_id` | 内容版本 ID = `sha256:<hex>`，**内容变了就变** |
 | `document.element_count` | `document.json` 里的 element 数量 |
-| `counts` | 各类产物计数：`segments`（转写段落）、`elements`（document.json 元素）、`images`（图片数）、`pages`（页数，document 才有） |
+| `counts` | 产物计数，按 segment 的粒度归类：`segment`（没有页码的段落：视频 / 录音）与 `page`（有页码的段落：文档）。两者不会同时出现 |
+| `outline` | **完整**内置目录（PDF 书签 / 视频章节），字段与 §5.3 `structuredContent.outline` 相同；从 heading 生成的目录也写在这里（`source: "headings"`、`generated: true`）。没有目录时是 `available: false` 的对象，`reason` 说明原因 |
+| `overview.images[]` | 每张图的描述（`index` / `width` / `height` / `cells` / `mimeType` / `bytes` / `estimatedTokens`），**不含像素、也不含文件名**——像素只在 `content` 的 image block 里，manifest 不引用图片文件 |
+| `transcript` | 转写来源（`source` / `provider` / `model` / `language` / `segmentCount` / `file`）。**没有 `origin` 字段**：渠道口径在 `segments.jsonl` 的逐段 `origin` 上 |
+| `provider` | 实际处理文字的外部 provider（没有时为 `null`） |
 | `source.mediaType` | **真实**来源媒体类型（`video`/`audio`/`document`）。这是本项目自己的口径，与 cangjie 的 `media_type` 枚举不是一回事（见 §9.4 的偏差说明） |
 | `source.sha256` | 源文件内容哈希，即缓存主键 |
 
@@ -1102,10 +1515,10 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
   "schema_version": 1,
   "source_id": "src-3f2a9c81b40d",
   "version_id": "sha256:ab12cd34ef5678901234567890abcdef1234567890abcdef1234567890abcdef",
-  "title": "a.mp4",
+  "title": "a",
   "media_type": "video",
   "language": ["zh"],
-  "parser": "multimediagrep@0.1.0",
+  "parser": "multimediagrep@<server version>",
   "elements": [
     {
       "element_id": "el-000001",
@@ -1132,10 +1545,10 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
 | `schema_version` | integer | 恒为 `1`（契约里是 `const`） |
 | `source_id` | string | **稳定 ID：文件改名不得变成新来源**。取**文件名**的 sha256 前 12 位（形如 `src-3f2a9c81b40d`；不含目录）——所以把 `a.mp4` 改名成 `b.mp4` 仍然是同一个 `source_id`，版本差异由 `version_id` 区分 |
 | `version_id` | string | `sha256:<hex>`，由**文件内容**确定性计算。内容变了它就变 |
-| `title` | string | 展示用标题（默认取文件名） |
+| `title` | string | 展示用标题（默认取文件名去扩展名，如 `a.mp4` → `a`） |
 | `media_type` | string | cangjie 契约枚举：`markdown` / `txt` / `pdf` / `html` / `epub` / `docx` / `pptx` / `xlsx` / `subtitle` / `audio` / `video` |
-| `language` | string[] | 语言列表（BCP-47），探测不到时给 `[]` |
-| `parser` | string | `名称@版本`，本项目固定 `multimediagrep@0.1.0` |
+| `language` | string[] | 语言列表（BCP-47）。本版只有 `media_overview` 传值；探测不到时给占位 `["und"]`，不会是空数组 |
+| `parser` | string | `名称@版本`，本项目为 `multimediagrep@<server version>`（与 `package.json` 同版本） |
 | `elements` | object[] | 元素列表，见下 |
 
 **element 字段**
@@ -1145,14 +1558,14 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
 | `element_id` | string | `el-000001` 形式的六位序号（1-based） |
 | `type` | string | 契约枚举：`heading` / `paragraph` / `list` / `table` / `image` / `formula` / `transcript` / `frame` / `code` |
 | `text` | string | 元素文本 |
-| `heading_path` | string[] | 所属标题层级路径（无标题上下文时为 `[]`） |
+| `heading_path` | string[] | 所属标题层级路径。本版恒为 `[]`（保留字段，尚未从 heading 回填） |
 | `page` | integer \| null | 页码（document 专用） |
 | `time_start_ms` / `time_end_ms` | integer \| null | 时间范围（video / audio 专用） |
-| `bbox` | number[] \| null | 4 元组 `[x, y, width, height]`，同一坐标空间（像素） |
-| `asset_ref` | string \| null | 关联资产（图片 / 帧图）的相对路径 |
-| `confidence` | number \| null | 置信度 0–1（OCR / ASR 给，字幕给 1.0） |
+| `bbox` | number[] \| null | 4 元组 `[x, y, width, height]`。本版恒为 `null`（页面级坐标不在 v1 范围） |
+| `asset_ref` | string \| null | 关联资产（图片 / 帧图）的相对路径。本版恒为 `null` |
+| `confidence` | number \| null | 置信度 0–1。本版恒为 `null`（provider 尚未回传可信度） |
 | `content_hash` | string | `sha256:<hex>`，由**归一化后的文本**（去首尾空白 + 折叠内部空白）确定性计算 |
-| `source` | string | **我们额外加的字段**：文字来源与可信度，取 §2.5 的枚举 `subtitle` / `ocr` / `asr` / `visual` / `none` |
+| `source` | string | **我们额外加的字段**：文字来源与可信度，取 §2.5 的枚举 `subtitle` / `text` / `ocr` / `asr` / `visual` / `none`（element 粒度不会出现 `mixed`；`mixed` 只用于整份 `transcript`） |
 
 > `source` 不在 cangjie 契约里，但契约没有禁止 `additionalProperties`，所以加它是合法的。它的价值：cangjie 的 element 没有「这段字是作者写的还是机器猜的」的概念，而下游蒸馏器需要这个区分（ASR 不可当原话引用）。
 
@@ -1161,7 +1574,7 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
 | 本项目的产物 | element `type` | 填充的字段 |
 |---|---|---|
 | 字幕 / ASR 段落 | `transcript` | `text`、`time_start_ms`、`time_end_ms`、`source`（`subtitle`/`asr`）、`confidence` |
-| 文档页文字 | `paragraph` | `text`、`page`、`heading_path`、`source`（`ocr`） |
+| 文档页文字 | `paragraph` | `text`、`page`、`heading_path`、`source`（`text` = 原生文字层 / 纯文本；`ocr` = 机器识别；`none` = 无文字页） |
 | 画面帧 | `frame` | `asset_ref`（帧图路径）、`time_start_ms`、`source` = `visual` |
 
 **已知偏差（必须知道）**：cangjie 的 `media_type` 枚举里**没有 `image`**。所以**图片类文档**（`png` / `jpg` / `webp` / `tiff` / `heic` …）在 `document.json` 里映射成 **`pdf`**（页面式文档）——这是为了让 `media_type` 落在契约枚举内。**真实来源类型记在 `manifest.json` 的 `source.mediaType`**（那里本项目用自己的口径，`document` 表示图片类文档）。下游若要区分「真 PDF」和「一堆图片」，读 manifest，不要读 `document.json` 的 `media_type`。
@@ -1274,54 +1687,20 @@ estimatedTokens    = max(gridTokens, pixelTokens)
 
 ## 11. 用法指引与 server instructions
 
-### 11.1 给 agent 的用法指引（英文，可直接放进每个工具描述的尾部）
+### 11.1 给 agent 的用法指引（内嵌在工具描述里）
 
-```
-How to read a file with MultiMediaGrep:
+0.2.0 起不再维护第三份独立的用法指引文本。给 agent 的指引只有两个权威来源，且都逐字来自本契约：
 
-1. media_probe FIRST. It is cheap (no image tokens) and tells you the duration or page count,
-   which tracks exist, and whether transcription (ASR) and OCR are available. Never guess a
-   file's length. For audio it also reports a health check (level, speech ratio, silence
-   ratio): if the recording has no effective speech, the transcript will be EMPTY on purpose
-   — say so rather than inventing what was said.
-2. media_overview is the main read. Video: numbered storyboard grids + a time-aligned text
-   index. Audio: a timestamped transcript. Document: page thumbnails + per-page text.
-   The complete text is written to disk (content.md / segments.jsonl / manifest.json) and the
-   paths come back with the result — read those files section by section and summarise them in
-   chunks yourself. Do not call again just to get more inline text.
-3. media_zoom only for the parts that matter. One frame of a video (at, or a start/end window)
-   or one page of a document, optionally cropped. It is the most expensive call per image.
-4. media_locate answers "where was this said / on which page". Text only by default; add
-   includeFrame: true if you also need to see the frame.
+1. **四个工具描述**（§4.1 / §5.1 / §6.1 / §7.1）：每个工具自己该在什么时候用、参数怎么传、结果怎么读，都写在描述里。
+2. **server instructions**（§11.2）：通过 MCP `initialize` 的 `instructions` 字段下发，讲清 probe → overview → zoom → locate 的顺序与全局纪律。
 
-TEXT SOURCE ORDER — subtitles first, ASR only as a fallback:
-an external subtitle file you pass in, then the subtitle track embedded in the container, then a
-subtitle file with the same base name in the same directory, then ASR as the last resort.
-Every segment is tagged with its source. "subtitle" is the author's own words and is safe to
-quote. "asr" is machine transcription: names, numbers and jargon are often wrong, so NEVER
-quote an ASR segment as the speaker's exact words, and never present it as a verbatim
-quotation. "visual" means there is no text at all — describe the picture, do not transcribe it.
+两者都由 `src/server/tools.js` / `src/server/server-instructions.js` 逐字复制，改契约等于改代码。几条不变的硬约束（描述与 instructions 里都能找到对应句子）：
 
-READING PICTURES:
-the storyboard grid is for FINDING things, not reading them — a cell is only a few hundred
-pixels wide, so text inside it is unreadable. To read text on screen, zoom: media_zoom on that
-moment, then read the cropped single frame.
-
-Rules that save you tokens:
-- Long media: narrow first with start/end (video, audio) or pages (document), then page
-  through using the continuation hint in the result. One giant grid of a long file gives you
-  illegible cells and spoils the ending.
-- Prefer more images with fewer cells over one image with many cells. 2 images x 9 legible
-  cells beats 1 image x 16 tiny ones at the same token order.
-- Zoom only what the overview told you is interesting.
-- If probe says ASR and OCR are both unavailable, you only get the visuals: describe what is
-  on screen, and say plainly that the speech content is unavailable. Never invent it.
-- Timestamps come in two shapes (integer milliseconds *Ms and seconds *Sec); they always mean
-  the same instant. Use whichever is convenient.
-
-Trigger words (中文同样命中): 探媒体 / 视频 / 录音 / 文档 / 转写 / 字幕 / 关键帧 / 放大 /
-提取文字 / 定位 / 截图 / 找画面 / 看看这个文件
-```
+- **只吃本地绝对路径**，不下载、不检索、不碰 cookie；server 不调 LLM，理解由 agent 的模型完成。
+- **文字来源分三档可信度**：`text`（原生文字层 / 纯文本，字符精确，可原样引用）> `subtitle` / `ocr`（可能是机器生成 / 识别，专名数字要核对画面）> `asr`（机器听写，**不可当原话引用**）。`mixed` 只表示整份文档的逐页来源不一致。
+- **全文永远落盘**：`media_overview` 的 text content 末尾有 `full text: <content.md 绝对路径> ...` 一行；内联的只是预览（文本三档 whole / skim / sampled，或 outline 目录视图），读全文要读文件。
+- **宫格图只用来找位置**，读画面上的字必须 `media_zoom` 单帧放大。
+- **长素材先收窄**（`start`/`end` 或 `pages`），再跟着 `continuation` 翻页；`view:"outline"` 可以先拿文件自带的目录（PDF 书签 / 章节）。
 
 ### 11.2 server instructions（可直接粘贴进 MCP server 的 `instructions` 字段）
 
@@ -1332,14 +1711,39 @@ absolute path, and it prepares images and text for your own multimodal model to 
 
 READING ORDER
 1. media_probe first — cheap, no image tokens. Gives duration / page count / tracks and
-   whether transcription (ASR) and OCR are available for this file. For audio it also gives a
-   health check (level, speech ratio): a recording with no effective speech yields an EMPTY
-   transcript by design.
+   whether transcription (ASR), OCR and a native text layer are available for this file. For
+   audio it also gives a health check (level, speech ratio): a recording with no effective
+   speech yields an EMPTY transcript by design.
+   If the probe says "text layer: looks unreliable", the PDF's text layer is probably the
+   output of a bad OCR pass: call media_overview({ path, ocr: "force" }) to re-recognize the
+   requested pages with the OCR provider (this needs MMGREP_OCR_PROVIDER configured). Forced
+   pages are tagged "ocr" and cached separately from the default "auto".
+   The probe also shows the file's own outline when it has one: PDF bookmarks (PHYSICAL page
+   numbers — the same 1-based numbers media_overview accepts — plus the printed page label
+   when the PDF defines one) and chapter markers in video/audio files (title + start/end
+   timestamps). Use it to pick a range instead of reading the whole file.
 2. media_overview — the main read. Video: numbered storyboard grids plus a time-aligned text
-   index. Audio: a timestamped transcript. Document: page thumbnails plus per-page text.
-   The complete text is written to disk (content.md / segments.jsonl / manifest.json) and the
-   paths come back with the result. Read those files section by section and summarise them in
-   chunks yourself — do not re-call the tool just to get more inline text.
+   index. Audio: a timestamped transcript. Document: page thumbnails plus page text.
+   The full text of the requested range is written to disk, and the result text ends with a
+   "full text: /abs/path/content.md ..." line. That absolute path is what you read
+   (segments.jsonl and manifest.json sit in the same directory): read those files section by
+   section and summarise them in chunks yourself — do not re-call the tool just to get more
+   inline text. The inline list is a preview with three tiers: complete when the range fits
+   ("complete text ... nothing omitted"); otherwise a document that exposes block structure is
+   skimmed — every heading plus the first sentence of each paragraph (tables as
+   "[table: caption]"), labelled per page like "[page 4 · skim: 12 of 210 sentences]". A skim
+   built from built-in heuristic blocks is best-effort, so read content.md for the authoritative
+   text. Everything else — video, audio, documents without blocks, or a skim that still does not
+   fit — is sampled evenly from complete units, with a "preview: sampled ..." line naming what
+   was inlined and the pages/ranges not represented. In a skim that does not fit, all headings
+   are kept and sentences are sampled; only when even the headings do not fit are they sampled.
+   A file's own outline (PDF bookmarks / video-audio chapters) is another starting point.
+   With view "auto" (default), a range that fits still returns the full text; when it does not
+   fit and an outline exists, the outline comes first and the rest of the budget goes to the
+   text preview. A document without bookmarks gets an outline generated from its headings
+   (at least 5), labelled "outline: generated from headings". view "outline" returns only the
+   outline; for video/audio without chapters it says "no chapters" and generates nothing —
+   write your own outline from the overview in that case. view "text" forces the text pipeline.
 3. media_zoom — only for parts that matter. One frame of a video (at, or a start/end window)
    or one page of a document, optionally cropped.
 4. media_locate — "where was X said" (timestamp) or "on which page" (page number). Text only
@@ -1350,10 +1754,15 @@ TEXT SOURCE ORDER — subtitles first, ASR only as a fallback
 2. the subtitle track embedded in the container,
 3. a subtitle file with the same base name in the same directory (a.srt next to a.mp4),
 4. ASR, and only when none of the above exists.
-Every segment carries a source tag. "subtitle" is the author's own words — safe to quote.
+Every segment carries a source tag. "subtitle" comes from a subtitle file/track; usually the
+author's words, but may be auto-generated: check names and numbers against the frame.
 "asr" is machine transcription: names, numbers and jargon are often wrong, so NEVER quote an
 ASR segment as the speaker's exact words and never present it as a verbatim quotation.
+"text" is native text — a PDF text layer or a plain-text file: character-exact, and may be
+quoted directly.
 "ocr" is text read off a rendered page — check names and numbers against the page image.
+"mixed" (documents only) means the returned pages have different sources — read the tag on
+each page before quoting.
 "visual" means there is no text at all, only the picture.
 
 READING PICTURES
@@ -1363,7 +1772,9 @@ that moment, then read the cropped single frame.
 
 TOKEN DISCIPLINE
 - Long media must be narrowed with start/end (video, audio) or pages (document) before you
-  overview it, then paged through with the continuation hint in the result.
+  overview it, then paged through with the continuation hint in the result. A skim or sampled
+  preview is not the full text — read content.md from disk instead of assuming the preview is
+  complete.
 - Prefer more images with fewer cells over one image with many cells: 2 images x 9 legible
   cells beats 1 image x 16 tiny ones at the same token order.
 - Zoom only what the overview showed you is worth zooming into.
@@ -1372,10 +1783,10 @@ TOKEN DISCIPLINE
   a suggested smaller shape, not a silent truncation.
 
 WHEN TEXT IS UNAVAILABLE
-If media_probe reports that no ASR provider and no OCR provider are configured, or that the
-recording has no effective speech, you get the visuals only: describe what is on screen and
-state plainly that the spoken or written content was not available. Do not invent dialogue,
-captions or page text.
+If media_probe reports that no ASR provider, no OCR provider and no native text layer are
+available, or that the recording has no effective speech, you get the visuals only: describe
+what is on screen and state plainly that the spoken or written content was not available. Do
+not invent dialogue, captions or page text.
 
 FORMATS
 - Timestamps are given both as integer milliseconds (*Ms) and as seconds (*Sec); both refer to
@@ -1383,9 +1794,10 @@ FORMATS
 - Video and audio ranges are closed intervals of seconds: start/end, both ends included.
 - Document ranges use a comma-separated list of 1-based page numbers and closed ranges, e.g.
   "3-10,15". Out-of-range pages are an error, never a silent truncation.
-- The full text of an overview is written to disk; the result returns the paths of
-  content.md, segments.jsonl and manifest.json. Read those instead of asking for more inline
-  text.
+- The full text of an overview is written to disk; the result text ends with the absolute path
+  of content.md (segments.jsonl and manifest.json sit in the same directory). Read those instead
+  of asking for more inline text. If the export failed, the line says "full text: NOT written —
+  <reason>" and the inline preview is all you have.
 
 TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文档 / 转写 / 字幕 /
 关键帧 / 放大 / 提取文字 / 定位 / 截图), so Chinese requests match them too.
@@ -1401,7 +1813,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 
 | 变量 | 类型 | 默认值 | 作用 | 没配 / 配错时的行为 |
 |---|---|---|---|---|
-| `MMGREP_CACHE_DIR` | string | `~/.cache/multimediagrep`（Linux/macOS） | 缓存根目录：抽帧、页图、转写、全文落盘都在这。**按文件内容 hash 键控**（主键 = 内容 sha256），另有一份指纹索引做快速路径，见 §9.0 | 用默认目录。目录不存在会自动创建；不可写则报错 `TOOL_NOT_FOUND` 并指出路径 |
+| `MMGREP_CACHE_DIR` | string | `~/.cache/multimediagrep`（Linux/macOS） | 缓存根目录：抽帧、页图、转写、全文落盘都在这。**按文件内容 hash 键控**（主键 = 内容 sha256），另有一份指纹索引做快速路径，见 §9.0 | 用默认目录。目录不存在会自动创建；不可写时**调用不失败**：全文落盘退回系统临时目录，`full text:` 行会注明这份副本可能被清理（`structuredContent.fullText` 仍给出路径） |
 | `MMGREP_CACHE_MAX_BYTES` | integer（字节） | `10737418240`（10 GiB） | 缓存总容量上限。超出时按 **LRU** 淘汰（先删最久未访问的整条目） | 用默认值。每次写入后检查一次；单条超过上限的产物直接跳过缓存并只返回本次结果 |
 
 ### 12.2 ASR provider
@@ -1416,25 +1828,44 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` | string | `https://api.openai.com/v1` | OpenAI 兼容服务的 API 基址 | 用默认值；自建服务显式填自己的地址 |
 | `MMGREP_OPENAI_COMPATIBLE_MODEL` | string | `whisper-1` | OpenAI 兼容服务的转写模型名 | 用默认值。**不会**继承 ElevenLabs 的 `scribe_v1`；模型不被接受 → `PROVIDER_FAILED` |
 | `MMGREP_ASR_LANGUAGE` | string | `auto` | 强制语言（BCP-47，如 `zh` / `en`）。`auto` = 由 provider 自动判定 | 用默认值。填了不被支持的语言 → `PROVIDER_FAILED`（provider 原话） |
+| `MMGREP_ASR_MAX_BYTES` | integer | `104857600`（100 MiB） | 单次上传给 ASR 服务的音频上限 | 用默认值。超过时 provider 自己报错（不会切成无数片偷偷上传） |
+| `MMGREP_ASR_DIARIZE` | boolean | `false` | 仅 `elevenlabs`：是否向服务请求说话人分离。**本版只透传请求，还没有把 speaker 回填到 segments**（字段恒为 `null`） | 用默认值；`openai-compatible` 忽略它 |
+| `MMGREP_ASR_RESPONSE_FORMAT` | string | `verbose_json` | 仅 `openai-compatible`：请求的响应格式（要时间戳就得是 `verbose_json`） | 用默认值；服务不支持该格式 → `PROVIDER_FAILED` |
+| `MMGREP_ASR_TIMESTAMP_GRANULARITIES` | string | 空 | 仅 `openai-compatible`：逗号分隔的时间戳粒度（`word` / `segment`） | 空 = 不传，由服务默认 |
 
-> 兼容兜底：`MMGREP_ASR_API_KEY` / `MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 在对应的 provider 专属变量未设置时仍然生效，但会在 `config.warnings` 里记一条弃用提示；计划在 0.2.0 删除。旧 `MMGREP_ASR_MODEL` 与 `openai-compatible` 同用时还会额外警告该值可能不适配。
+> **provider 扩展变量**：`MMGREP_ASR_MAX_BYTES` / `MMGREP_ASR_DIARIZE` / `MMGREP_ASR_RESPONSE_FORMAT` /
+> `MMGREP_ASR_TIMESTAMP_GRANULARITIES` 由 ASR provider 适配器直接读取（`src/providers/asr/`），
+> 不经 `config.js`，所以不会出现在 `describeConfig()` 的输出里。
 
-### 12.3 文档解析 provider
+> 兼容兜底：`MMGREP_ASR_API_KEY` / `MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 在对应的 provider 专属变量未设置时仍然生效，但会在 `config.warnings` 里记一条弃用提示。**0.2.0 未删除它们**（本版删的是文档 provider 的 `MMGREP_DOC_*`）；按现有计划，删除会发生在后续大版本。旧 `MMGREP_ASR_MODEL` 与 `openai-compatible` 同用时还会额外警告该值可能不适配。
+
+### 12.3 文档 provider：OCR 角色
+
+0.2.0 起文档 provider 拆成 **ocr** / **typeset** 两个角色（契约 v2）。OCR 角色只处理
+**没有文字层**的页（以及 `ocrMode=force` 的页）。工具参数 `ocr: "force"`（`media_overview` /
+`media_locate`）由工具层转成后端的 `ocrMode=force`：请求页无论有没有文字层都交给这个角色，
+结果 `textOrigin = "ocr"`、页标 `(ocr)`，并按独立缓存键保存。
 
 | 变量 | 类型 | 默认值 | 作用 | 没配 / 配错时的行为 |
 |---|---|---|---|---|
-| `MMGREP_DOC_PROVIDER` | string | `none` | 文档解析后端。`none` = 不抽文字层；`mineru` = MinerU | `none` → 文档**只出页缩略图**，`pages[].text` 为空，`reason` 写明「MMGREP_DOC_PROVIDER is \"none\"」。未知 provider id → 记 warning 并回落到 `none` |
-| `MMGREP_MINERU_API_KEY` | string | 空 | MinerU 的 API token | 云端 provider 缺 key → `PROVIDER_NOT_CONFIGURED`；回环地址免 key |
-| `MMGREP_MINERU_BASE_URL` | string | `https://mineru.net/api/v4` | MinerU 的 API 基址 | 用内置默认值 |
-| `MMGREP_MINERU_MODEL` | string | 空 | MinerU 的解析模型名；留空 = 服务端默认 | 用内置默认值 |
+| `MMGREP_OCR_PROVIDER` | string | `none` | 无文字层页面的文字识别后端：`mineru` \| `none` | `none` → 扫描件 / 图片只出页图，`textOrigin = "unknown"`，`reason` 写明「MMGREP_OCR_PROVIDER is \"none\"」。未知 provider id → 记 warning 并回落到 `none` |
+| `MMGREP_MINERU_API_KEY` | string | 空 | MinerU 的 API token（两个角色共用） | 云端 provider 缺 key → `PROVIDER_NOT_CONFIGURED`；回环地址免 key |
+| `MMGREP_MINERU_BASE_URL` | string | `https://mineru.net/api/v4` | MinerU 的 API 基址（两个角色共用） | 用内置默认值 |
+| `MMGREP_MINERU_MODEL` | string | 空 | MinerU 的解析模型名；留空 = 服务端默认（两个角色共用） | 用内置默认值 |
 
-> 兼容兜底：`MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL` 在 `MMGREP_MINERU_*` 未设置时仍然生效，并记一条弃用提示；计划在 0.2.0 删除。
+> 0.2.0 删除：`MMGREP_DOC_PROVIDER` / `MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` /
+> `MMGREP_DOC_MODEL` **不再读取**。启动时检测到会 warn 并指出替代变量
+> （`MMGREP_OCR_PROVIDER` / `MMGREP_TYPESET_PROVIDER` / `MMGREP_MINERU_*`），不静默忽略。
 
-### 12.4 OCR provider
+### 12.4 文档 provider：typeset 角色
+
+typeset 角色只处理**有文字层**的页，恢复阅读顺序与结构；**不得重新识别字符**。
+provider 无法保证原字符时必须返回 `textOrigin = "ocr"` / `"unknown"`。
 
 | 变量 | 类型 | 默认值 | 作用 | 没配 / 配错时的行为 |
 |---|---|---|---|---|
-| `MMGREP_OCR_PROVIDER` | string | `none` | 扫描件的文字识别后端。`none` / `mineru` / `tesseract` | `none` → 扫描件只出页图，无文字层。`MMGREP_DOC_PROVIDER` 已配置时，**文档 provider 优先**（MinerU 自带 OCR），此变量只作用于独立的本地 OCR 路径 |
+| `MMGREP_TYPESET_PROVIDER` | string | `builtin` | 有文字层页面的排版后端：`builtin` \| `mineru` \| `none` | `none` → 有文字层的页直接用原生 `pdftotext` 文本（无结构重排）。未知 provider id → 记 warning 并回落到 `builtin`。`builtin` 是本地实现，不联网 |
+| `MMGREP_TYPESET_SKIP_SIMPLE` | boolean | `true` | 外部 typeset provider 是否跳过「builtin 判定为单栏的简单页」：`true` = 简单页交给本地 builtin，只把双栏 / 复杂页发给外部服务（省调用、省排队） | 用默认值。`false` = 所有有文字层的页都交给外部 typeset provider；非法值记 warning 并回落 `true` |
 
 ### 12.5 运行时与预算
 
@@ -1442,15 +1873,26 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 |---|---|---|---|---|
 | `MMGREP_MAX_IMAGE_TOKENS` | integer | `4000` | 单次调用的图片 token 软预算（§10.3） | 用默认值。自动模式保证不超；显式模式超出只警告 |
 | `MMGREP_MAX_IMAGE_EDGE` | integer | `1600` | 单张图最长边的全局上限（§10.2） | 用默认值。请求超过它 → `BUDGET_EXCEEDED` |
-| `MMGREP_MAX_TEXT_INLINE_CHARS` | integer | `24000` | 内联文本清单的字符上限。超出在段落/格边界截断，并给续读提示 | 用默认值。**全文永远落盘，不受此限制** |
+| `MMGREP_MAX_TEXT_INLINE_CHARS` | integer | `24000` | 内联文本预览的字符上限（含 header / notes / `full text:` 行）。超出时：有内置目录（PDF 书签 / 章节）或文档 blocks 里 ≥5 个 heading 时，`view:"auto"` 先出目录（最多占一半预算），余量再走文档 skim（全部 heading + 段首句，每页 `[page N · skim: X of Y sentences]`）/ 完整单元等距抽样；没有目录时直接 skim / 抽样。`view:"outline"` 只出目录。两种情况都写明未覆盖范围。HTTP 模式下可被请求头 `x-mmgrep-max-text-inline-chars` 按客户端覆盖（硬上限 `200000`） | 用默认值。**全文永远落盘，不受此限制** |
 | `MMGREP_MAX_CONCURRENCY` | integer | `2` | 单次调用内并行跑的 ffmpeg / 渲染任务数 | 用默认值。机器弱时调成 `1` |
 | `MMGREP_AUDIO_MIN_DBFS` | number | `-35` | 音频体检：判定「有有效声音」的平均音量下限（dBFS）。低于它 → `too-quiet`，**不跑 ASR** | 用默认值。录音确实偏小声时调低（如 `-45`） |
 | `MMGREP_AUDIO_MIN_SPEECH_RATIO` | number | `0.05` | 音频体检：判定「有有效声音」的非静音时长占比下限（0–1） | 用默认值。与 `MMGREP_AUDIO_MIN_DBFS` 是 **或** 的关系，任一不满足即判 `too-quiet` |
 | `MMGREP_ASR_TIMEOUT_MS` | integer | `120000` | ASR 单次请求超时 | 用默认值。超时 → `PROVIDER_FAILED: ASR request timed out after 120000 ms.` |
-| `MMGREP_DOC_TIMEOUT_MS` | integer | `180000` | 文档解析单次请求超时 | 用默认值。超时 → `PROVIDER_FAILED` |
+| `MMGREP_DOC_TIMEOUT_MS` | integer | `180000` | 文档解析单次请求超时（OCR 与 typeset 两个角色共用同一值） | 用默认值。超时 → `PROVIDER_FAILED` |
 | `MMGREP_FFMPEG_PATH` | string | 空（按 PATH 查找） | ffmpeg 可执行文件路径 | 找不到 → `TOOL_NOT_FOUND: ffmpeg was not found on PATH. Install ffmpeg, or set MMGREP_FFMPEG_PATH.` |
 | `MMGREP_FFPROBE_PATH` | string | 空（按 PATH 查找） | ffprobe 可执行文件路径 | 同上，文案换成 `ffprobe` |
 | `MMGREP_LOG_LEVEL` | string | `info` | 日志级别：`error` / `warn` / `info` / `debug` | 用默认值。`debug` 会额外打印每阶段耗时（只进 stderr，不污染 MCP 输出） |
+| `MMGREP_PROGRESS_NOTIFICATIONS` | boolean | `true` | 是否发 MCP `notifications/progress`（§2.6）。**本 server 的运维扩展**，不属于工具契约，宿主不支持时由框架静默跳过 | 用默认值。`false` = 完全不发进度通知，结果不变 |
+
+> **HTTP 每请求覆盖（目前只有 `MMGREP_MAX_TEXT_INLINE_CHARS`）**：请求头
+> `x-mmgrep-max-text-inline-chars` 的优先级是 **请求头 > `MMGREP_MAX_TEXT_INLINE_CHARS` > 默认 `24000`**。
+> 头值必须是正整数：超过硬上限 `200000` 时按 `200000` 截断并记 warning；非法值（`0`、负数、
+> 小数、带单位、非数字）记 warning 并回落到环境变量 / 默认值，**不会让请求失败**；空头等于没带。
+> stdio 传输没有请求头，仍然只读环境变量；也**没有**按调用的工具参数——agent 不能自己调大。
+> 头值不进日志（日志只出现头名），也不进 `requestOverrides`（那里只记录头名）。
+
+> **文档 provider 逐页缓存键**（含 `ocrMode`；工具参数 `ocr: "force"` 单独成键、不覆盖 auto）
+> 见 §2.7 与 §9.0。`ocr` 是工具参数，不是环境变量。
 
 > **MCP 的 stdout 是协议通道**：日志一律走 stderr，`LOG_LEVEL` 控制不了这一点。
 
@@ -1466,7 +1908,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 命令行 `--http` / `--host` / `--port` / `--token` 优先于环境变量；`--host` / `--port` / `--token`
 不带 `--http` 时不会改变传输方式。端点的 `Accept` / `Content-Type` 要求与状态码见 §2.8。
 
-### 12.7 每请求凭据头（仅 HTTP）
+### 12.7 每请求凭据与设置头（仅 HTTP）
 
 请求头名与 provider 专属环境变量一一对应（`MMGREP_FOO_BAR` → `x-mmgrep-foo-bar`）：
 
@@ -1480,19 +1922,22 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | `x-mmgrep-openai-compatible-base-url` | OpenAI 兼容服务基址 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` |
 | `x-mmgrep-openai-compatible-model` | OpenAI 兼容服务模型 | `MMGREP_OPENAI_COMPATIBLE_MODEL` |
 | `x-mmgrep-asr-api-key` | 通用兜底 key（旧共用变量语义） | `MMGREP_ASR_API_KEY` |
-| `x-mmgrep-doc-provider` | 本次请求的文档解析 provider：`mineru` | `MMGREP_DOC_PROVIDER` |
-| `x-mmgrep-mineru-api-key` | MinerU token | `MMGREP_MINERU_API_KEY` |
-| `x-mmgrep-mineru-base-url` | MinerU 基址 | `MMGREP_MINERU_BASE_URL` |
-| `x-mmgrep-mineru-model` | MinerU 模型 | `MMGREP_MINERU_MODEL` |
-| `x-mmgrep-doc-api-key` | 通用兜底 token（旧共用变量语义） | `MMGREP_DOC_API_KEY` |
+| `x-mmgrep-ocr-provider` | 本次请求的 OCR 角色 provider：`mineru` / `none` | `MMGREP_OCR_PROVIDER` |
+| `x-mmgrep-typeset-provider` | 本次请求的 typeset 角色 provider：`builtin` / `mineru` / `none` | `MMGREP_TYPESET_PROVIDER` |
+| `x-mmgrep-mineru-api-key` | MinerU token（两个角色共用） | `MMGREP_MINERU_API_KEY` |
+| `x-mmgrep-mineru-base-url` | MinerU 基址（两个角色共用） | `MMGREP_MINERU_BASE_URL` |
+| `x-mmgrep-mineru-model` | MinerU 模型（两个角色共用） | `MMGREP_MINERU_MODEL` |
+| `x-mmgrep-max-text-inline-chars` | 本次请求的内联文本上限（非凭据设置头）：正整数，超过硬上限 `200000` 截断并 warn，非法值 warn 后回落 | `MMGREP_MAX_TEXT_INLINE_CHARS` |
 
-优先级（逐字段计算）：该 provider 的专属请求头 > 通用 `x-mmgrep-<kind>-api-key`（只作用于 apiKey）
-> 该 provider 的环境变量 > 启动配置（仅当 provider 相同）> provider 内置默认值。
+优先级（逐字段计算）：该 provider 的专属请求头 > 该 provider 的环境变量 >
+启动配置（仅当 provider 相同）> provider 内置默认值。ASR 仍保留通用
+`x-mmgrep-asr-api-key` 兜底；文档角色已删除通用 key 头（`x-mmgrep-doc-api-key` 等不再识别）。
 
 - 请求头里的 provider 选择**只对当前请求生效**；未知 provider id → HTTP 400 / JSON-RPC `-32602`。
 - 空头（空串或全空白）等于没带，不会覆盖服务器配置。
 - 只带 provider 专属 key 头、却没选中该 provider（`x-mmgrep-asr-provider` 缺失且服务器 provider 为 `none`）时，该头不会自动启用 provider。
-- 这些头的**值**不写日志、不进缓存、不出现在响应里；日志中出现的头值统一替换为 `[redacted]`。
+- 这些头的**值**不写日志、不进缓存、不出现在响应里；日志中出现的头值统一替换为 `[redacted]`（`x-mmgrep-max-text-inline-chars` 的值同样不进日志，只出现头名）。
+- `x-mmgrep-max-text-inline-chars` 是**设置**头，不参与凭据检测：只带它时不会新建 provider，只覆盖内联上限。
 
 ---
 
@@ -1527,7 +1972,7 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 | 21 | 无进度通知 | 长任务发 MCP progress notification | 上游靠 DSH 宿主；我们是标准 MCP，用标准机制 |
 | 22 | 缓存目录 `DSH_VIDEO_CACHE_DIR`，单条上限 50 MB；**缓存键 = 路径 + 大小 + mtime** | `MMGREP_CACHE_DIR` + `MMGREP_CACHE_MAX_BYTES`（默认 10 GiB）；**缓存主键 = 文件内容的 sha256**，另有一份指纹索引（路径+大小+mtime → 内容 hash）做快速路径 | 统一前缀；本项目要缓存的是**全文与页图**，量级远大于上游的切点缓存。内容哈希做主键是 epic 决策 9：「文件改了但缓存还命中」是这类工具最致命的 bug，而 path+mtime 只是权宜之计。指纹索引解决「每次都全文件哈希」的代价 |
 | 23 | 无 `media_probe` 的文档 / 音频形态 | `media_probe` 覆盖三种媒体 | 跨媒体统一 |
-| 24 | 返回值里**不标**每段文字的来源，只有一个总的 `transcript="asr"` 之类的标记 | 每段带 `source`（`subtitle`/`ocr`/`asr`/`visual`/`none`）+ `origin`（`file`/`embedded`/`asr`/`ocr`/`none`） | agent 必须能分辨「作者写的字幕」和「机器猜的转写」。上游自己就踩过这个坑（专门写 OCR 模块用硬字幕校正 ASR），但**没有把可信度暴露给模型** |
+| 24 | 返回值里**不标**每段文字的来源，只有一个总的 `transcript="asr"` 之类的标记 | 每段带 `source`（`subtitle`/`text`/`ocr`/`asr`/`visual`/`none`；整份 `transcript` 还有 `mixed`）+ `origin`（`file`/`embedded`/`textlayer`/`asr`/`ocr`/`none`） | agent 必须能分辨「字幕文件里的文字」「PDF 原生文字层」和「机器猜的转写」。上游自己就踩过这个坑（专门写 OCR 模块用硬字幕校正 ASR），但**没有把可信度暴露给模型** |
 | 25 | 上游的 `transcript: "auto"` 是「内嵌字幕轨优先，否则 ASR」，但显式字幕文件给了之后两者都跳过 | 明确的三级顺序：显式字幕选择 → 内嵌字幕轨 → ASR，并写进工具描述与 server instructions | 字幕优先是硬要求：**字幕准、免费、快**；ASR 会听错人名和数字。顺序必须写进 agent 看得到的文本里，不能只存在实现里 |
 | 26 | 上游不做音频体检，直接送 ASR | `media_probe` 对音频返回 `audioHealth`（音量 / 语音占比 / 静音占比 / 判定），太安静直接**不跑 ASR** | 太安静的录音送进 ASR 会得到一整段幻觉台词，比没有转写更糟。体检必须发生在 ASR 之前，且结论要出现在 agent 看得到的文本里 |
 | 27 | 上游 `video_zoom` 与 `video_storyboard` 都出图，没有「宫格只用来找位置」的约定 | 契约明确：**宫格图 = 找位置，裁切单帧 = 读文字** | 宫格一格只有几百像素，里面的字看不清；agent 常误以为「看过了图就知道上面写了什么」。这条必须写进用法指引，否则模型会拿宫格里的模糊笔画编内容 |
@@ -1578,22 +2023,19 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 
 ## 14. 未决问题（需要人来定）
 
+> 0.2.0 已经落地的决策（文档 provider 双角色、`ocr: "force"`、目录 / `view`、`source` 新增 `text` / `mixed`、文档 locate 的 `hits` / `snippet`、provider 逐页缓存、24k 内联上限、同目录字幕自动发现、locate 默认不出图）不再列在这里——它们是契约本身，见对应章节。下面只列**仍未定或仍未验证**的事。
+
 | # | 问题 | 我的建议 | 影响面 |
 |---|---|---|---|
 | 1 | **图片预算的四个数**（4 张 / 16 格 / 1600 px / 4000 token）是推导值，不是实测值 | 等 beads `9z5.3`（Claude Code / Hermes 实测）出来后按实测收紧 | §10 全部；实现必须先复核 |
-| 2 | **`MMGREP_ELEVENLABS_BASE_URL` / `MMGREP_ELEVENLABS_MODEL` / `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_MODEL` 的默认值** | ElevenLabs 保留 `https://api.elevenlabs.io/v1` + `scribe_v1`，OpenAI 兼容保留 `https://api.openai.com/v1` + `whisper-1`；但**本仓库未联网验证**各家当前的转写 endpoint 与模型名，落地前需人工核对 | §12.2；配错会直接 `PROVIDER_FAILED` |
-| 3 | **`MMGREP_MINERU_BASE_URL` / `MMGREP_MINERU_MODEL` 的默认值** | 基址默认 `https://mineru.net/api/v4`、模型默认留空；MinerU 的接入方式与模型名**未在本仓库确认**（上游无文档后端，无从参照） | §12.3 |
-| 4 | **同目录字幕自动发现是否默认开启** | 我选了**默认开启**（§8.5），因为它命中率高，且命中的文件路径一定会在返回值里报出来，不是静默行为 | §8.5；若嫌意外，可改为默认关闭、需显式指定字幕文件 |
-| 5 | **`media_locate` 默认是否出图** | 我选了**默认不出图**（`includeFrame` 默认 `false`），沿用上游「定位不花像素」的定位 | §7.2 |
-| 6 | **文档 `cells` 的默认 6** | 视频默认 9、文档默认 6。文档格是页缩略图，6 页一张比 9 页一张更容易看清页内排版 | §10.3；可调 |
-| 7 | **`media_zoom` 的选帧规则** | 时间窗内选「最清晰的一帧」（上游 `pick: sharp` 的 Laplacian 方差口径）。也可改成「取中点帧」——更可预测但可能落在转场上 | §6.3 `target.selection` |
-| 8 | **`structuredContent` 的宿主兼容性** | 契约里定义了结构化 payload，但**是否所有宿主都消费** `structuredContent` 需要实现时按 SDK 版本验证；不支持时退化为只返回 content 文本块（内容不变） | §4.3 / §5.3 / §6.3 / §7.3 / §8.3 |
-| 9 | **ASR 的分片策略与长音频** | 建议沿用上游「≤45 s 切片、切在静音中点」的口径（上游 `asr-contract.md` 明确警告固定长度切分会切词） | §12.2 |
-| 10 | **派生代码的许可与署名** | 上游 v0.5.0 起为 **Apache-2.0**（v0.5.0 之前是 MIT）。派生进来的部分必须保留上游署名：根目录 `NOTICE` 按 §4(d) 复现版权与授权，每个改动文件顶部按 §4(b) 标注修改；完整清单见 `CREDITS.md` | 打包与分发 |
-| 11 | **音频体检的阈值** | 我选了 `meanDbfs >= -35` 且 `speechRatio >= 0.05` 为「有有效声音」。这两个数是拍的，没有实测样本支撑；不同录音（手机远讲、会议室、播客）差别很大 | §4.3.1 / §12.5；上线前最好用一批真实录音回归 |
-| 12 | **`speechRatio` 的静音门限（-45 dBFS）** | 短时 RMS 门限取 -45 dBFS。同样没实测 | §4.3.1；环境噪声大的录音需要调 |
-| 13 | **`source = "ocr"` 的独立 provider** | 文档 provider（MinerU）自带 OCR，`MMGREP_OCR_PROVIDER` 只用于独立本地 OCR 路径（tesseract）。两条路是否要并存，需要产品定 | §12.4 |
-| 14 | **`media_overview` 内联文本清单的节选长度** | 沿用上游的 24,000 字符上限（`MMGREP_MAX_TEXT_INLINE_CHARS`）。上游选这个数是因为「一张 16 格图的完整清单还有余量」 | §12.5 |
-| 15 | **指纹索引的过期窗口** | 指纹 = `sha256(path + ':' + size + ':' + mtimeMs)`。若文件被改动后**大小与 mtime 恰好都不变**，指纹会给出过期的内容 hash（概率极低但非零）。要不要提供「强制重算」开关（如 `MMGREP_CACHE_REHASH=1`），需要产品定 | §9.0 / §12.1 |
-| 16 | **`document.json` 是否会变成必备件** | 现在是**可选件**（下游不需要 cangjie 时只读前三个）。若 cangjie 成为唯一或主要蒸馏器，它应当转正为必备并进契约测试 | §9.4 |
-| 17 | **图片类文档 → `media_type: "pdf"` 的偏差** | cangjie 契约枚举里没有 `image`，所以图片文档在 `document.json` 里映射成 `pdf`，真实类型记在 `manifest.source.mediaType`。这是契约层面的妥协；若 cangjie 之后给枚举加了 `image`，映射应改回 | §9.4 |
+| 2 | **`MMGREP_ELEVENLABS_BASE_URL` / `MMGREP_ELEVENLABS_MODEL` / `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_MODEL` 的默认值** | 现值：ElevenLabs `https://api.elevenlabs.io/v1` + `scribe_v1`，OpenAI 兼容 `https://api.openai.com/v1` + `whisper-1`；但**本仓库未联网验证**各家当前的转写 endpoint 与模型名 | §12.2；配错会直接 `PROVIDER_FAILED` |
+| 3 | **`MMGREP_MINERU_BASE_URL` / `MMGREP_MINERU_MODEL` 的默认值** | 现值：基址 `https://mineru.net/api/v4`、模型留空（服务端默认）；MinerU 的模型名与 `model_version` 语义**未在真实 key 上端到端验证**（beads `9z5.36` 是这条验证票） | §12.3；配错会 `PROVIDER_FAILED` |
+| 4 | **`structuredContent` 的宿主兼容性** | 契约定义了结构化 payload，但**是否所有宿主都消费** `structuredContent` 需要按 SDK 版本验证；不支持时退化为只返回 content 文本块（文本内容不变，全文路径也在文本里） | §4.3 / §5.3 / §6.3 / §7.3 / §8.3 |
+| 5 | **派生代码的许可与署名** | 上游 v0.5.0 起为 **Apache-2.0**。派生进来的部分保留上游署名：根目录 `NOTICE` 按 §4(d) 复现版权与授权，每个改动文件顶部按 §4(b) 标注修改；完整清单见 `CREDITS.md` | 打包与分发 |
+| 6 | **音频体检的阈值** | 现值 `meanDbfs >= -35` 且 `speechRatio >= 0.05` 为「有有效声音」。这两个数是拍的，没有实测样本支撑；不同录音（手机远讲、会议室、播客）差别很大 | §4.3.1 / §12.5；上线前最好用一批真实录音回归 |
+| 7 | **`speechRatio` 的静音门限（-45 dBFS）** | 短时 RMS 门限取 -45 dBFS，同样没实测 | §4.3.1；环境噪声大的录音需要调 |
+| 8 | **指纹索引的过期窗口** | 指纹 = `sha256(path + ':' + size + ':' + mtimeMs)`。若文件被改动后**大小与 mtime 恰好都不变**，指纹会给出过期的内容 hash（概率极低但非零）。要不要提供「强制重算」开关（如 `MMGREP_CACHE_REHASH=1`），需要产品定 | §9.0 / §12.1 |
+| 9 | **`document.json` 是否会变成必备件** | 现在是**可选件**（下游不需要 cangjie 时只读前三个）。若 cangjie 成为唯一或主要蒸馏器，它应当转正为必备并进契约测试 | §9.4 |
+| 10 | **图片类文档 → `media_type: "pdf"` 的偏差** | cangjie 契约枚举里没有 `image`，所以图片文档在 `document.json` 里映射成 `pdf`，真实类型记在 `manifest.source.mediaType`。这是契约层面的妥协；若 cangjie 之后给枚举加了 `image`，映射应改回 | §9.4 |
+| 11 | **builtin 启发式 blocks 的准确度** | builtin typeset 的「标题 / 双栏 / 表格」判定是启发式（见 `src/providers/doc/builtin.js`），skim 与生成的目录都标注了 best-effort。要提升结构准确度就配 `MMGREP_TYPESET_PROVIDER=mineru`；是否要再做一轮启发式回归，需产品定 | §5.4 skim、§5.1 目录 |
+| 12 | **云端 MinerU 的 `textOrigin` 可能未知** | 云端结果包若不返回 `parse_mode` / OCR 证据，provider 只能保守标 `unknown`（下游按 `ocr` 处理）。是否要求用户显式声明 `model_version` 来消歧，需产品定 | §2.5 逐页映射、§12.3 |

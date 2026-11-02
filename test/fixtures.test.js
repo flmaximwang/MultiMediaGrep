@@ -90,6 +90,9 @@ function near(actual, expected, tolerance, message) {
 
 test('the generator produces every expected asset', () => {
   const expected = [
+    'sample-chapters.mp4',
+    'sample-garbled-text.pdf',
+    'sample-headings.pdf',
     'sample-image.png',
     'sample-scanned.pdf',
     'sample-scene.mp4',

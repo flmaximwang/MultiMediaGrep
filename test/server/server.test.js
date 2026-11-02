@@ -51,7 +51,7 @@ async function withStdioClient(fn) {
       MMGREP_CACHE_DIR: path.join(dir, 'cache'),
       MMGREP_LOG_LEVEL: 'info',
       MMGREP_ASR_PROVIDER: 'none',
-      MMGREP_DOC_PROVIDER: 'none',
+      MMGREP_OCR_PROVIDER: 'none',
     },
     stderr: 'pipe',
   });
@@ -115,7 +115,7 @@ test('stdio：listTools / instructions / 路径错误 / 占位后端', { timeout
     }
 
     // 5) 日志只走 stderr：启动横幅应该在那里
-    assert.match(stderr(), /multimediagrep@0\.1\.0 ready on stdio/);
+    assert.match(stderr(), /multimediagrep@0\.2\.0 ready on stdio/);
     assert.match(stderr(), /\[mmgrep\] info:/);
   });
 });
@@ -131,7 +131,7 @@ test('stdio：SIGTERM 后进程正常退出', { timeout: 30000 }, async () => {
       MMGREP_CACHE_DIR: path.join(dir, 'cache'),
       MMGREP_LOG_LEVEL: 'error',
       MMGREP_ASR_PROVIDER: 'none',
-      MMGREP_DOC_PROVIDER: 'none',
+      MMGREP_OCR_PROVIDER: 'none',
     },
     stderr: 'pipe',
   });

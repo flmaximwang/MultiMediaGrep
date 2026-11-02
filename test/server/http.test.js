@@ -17,7 +17,12 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
-import { createLogger, loadConfig } from '../../src/server/config.js';
+import {
+  DEFAULT_MAX_TEXT_INLINE_CHARS,
+  MAX_TEXT_INLINE_CHARS_HARD_CAP,
+  createLogger,
+  loadConfig,
+} from '../../src/server/config.js';
 import { createRuntime, createServer, logStartupBanner } from '../../src/server/index.js';
 import { startHttpServer, isAuthorized } from '../../src/server/http.js';
 import { assertFfmpegAvailable, run } from '../../src/media/ffmpeg.js';
@@ -468,7 +473,7 @@ test('http：真实进程起得来、鉴权生效、SIGINT 后退出码 0', asyn
       ...process.env,
       MMGREP_CACHE_DIR: path.join(dir, 'cache'),
       MMGREP_ASR_PROVIDER: 'none',
-      MMGREP_DOC_PROVIDER: 'none',
+      MMGREP_OCR_PROVIDER: 'none',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -611,6 +616,83 @@ test('http：逐请求凭据 —— 同一端点两个请求各用各的 provide
   }
 });
 
+test('http：x-mmgrep-ocr-provider / x-mmgrep-typeset-provider 覆盖 env（仅本次请求）', async () => {
+  const seen = [];
+  const serverFactory = (runtimeForRequest) => {
+    seen.push(runtimeForRequest);
+    return createServer(runtimeForRequest);
+  };
+
+  await withHttpServer(
+    { MMGREP_OCR_PROVIDER: 'none', MMGREP_TYPESET_PROVIDER: 'builtin' },
+    async ({ endpoint, runtime, logs }) => {
+      const list = { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} };
+      const res = await rpc(endpoint, list, {
+        'x-mmgrep-ocr-provider': 'mineru',
+        'x-mmgrep-typeset-provider': 'mineru',
+        'x-mmgrep-mineru-api-key': 'sentinel-role-key',
+      });
+      assert.equal(res.status, 200);
+      assert.equal(seen.length, 1);
+      assert.notEqual(seen[0], runtime);
+      assert.equal(seen[0].config.ocr.provider, 'mineru');
+      assert.equal(seen[0].config.typeset.provider, 'mineru');
+      assert.equal(seen[0].config.ocr.apiKey, 'sentinel-role-key');
+      assert.equal(seen[0].config.typeset.apiKey, 'sentinel-role-key');
+      assert.equal(seen[0].ocrProvider?.id, 'mineru');
+      assert.equal(seen[0].typesetProvider?.id, 'mineru');
+      // 两个角色同一 provider、同一份配置 → 复用同一个实例。
+      assert.equal(seen[0].ocrProvider, seen[0].typesetProvider);
+
+      // 共享 runtime 不受影响。
+      assert.equal(runtime.config.ocr.provider, 'none');
+      assert.equal(runtime.config.typeset.provider, 'builtin');
+      assert.equal(runtime.ocrProvider, null);
+      assert.equal(runtime.typesetProvider?.id, 'builtin');
+
+      // 日志只出现头名，不出现头值。
+      const text = logs.join('\n');
+      assert.match(text, /x-mmgrep-ocr-provider/);
+      assert.match(text, /x-mmgrep-typeset-provider/);
+      assert.ok(!text.includes('sentinel-role-key'), `日志泄漏了角色头的 key：${text}`);
+
+      // 第二个请求：typeset 关掉，ocr 保持 none → 两个 provider 都不建。
+      const off = await rpc(endpoint, { ...list, id: 2 }, {
+        'x-mmgrep-ocr-provider': 'none',
+        'x-mmgrep-typeset-provider': 'none',
+      });
+      assert.equal(off.status, 200);
+      assert.equal(seen.length, 2);
+      assert.equal(seen[1].config.ocr.provider, 'none');
+      assert.equal(seen[1].config.typeset.provider, 'none');
+      assert.equal(seen[1].ocrProvider, null);
+      assert.equal(seen[1].typesetProvider, null);
+    },
+    { serverFactory },
+  );
+});
+
+test('http：未知文档角色 provider 头 → 400 / -32602，列出允许值', async () => {
+  const seen = [];
+  const serverFactory = (runtimeForRequest) => {
+    seen.push(runtimeForRequest);
+    return createServer(runtimeForRequest);
+  };
+
+  await withHttpServer({}, async ({ endpoint }) => {
+    const res = await rpc(
+      endpoint,
+      { jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} },
+      { 'x-mmgrep-ocr-provider': 'tesseract' },
+    );
+    assert.equal(res.status, 400);
+    assert.equal(res.json.error.code, -32602);
+    assert.match(res.json.error.message, /x-mmgrep-ocr-provider/);
+    assert.match(res.json.error.message, /mineru/);
+    assert.equal(seen.length, 0);
+  }, { serverFactory });
+});
+
 test('http：日志只脱敏 key 值，凭据头名保持完整', async () => {
   const sentinel = 'sentinel-log-redaction-must-vanish';
   const genericSentinel = 'sentinel-generic-log-redaction-must-vanish';
@@ -701,4 +783,80 @@ test('http：请求头里的 key 不会落进缓存目录', async () => {
       assert.ok(!content.includes(sentinel), `${file} 的落盘内容里出现了请求头的 key`);
     }
   });
+});
+
+/* ------------------------------------------------------------------ *
+ * 非凭据的请求级设置（x-mmgrep-max-text-inline-chars）
+ * ------------------------------------------------------------------ */
+
+test('http：内联上限请求头 —— 无头基线 / 头优先于 env / 200000 截断 / 非法回落 env', async () => {
+  const seen = [];
+  const serverFactory = (runtimeForRequest) => {
+    seen.push(runtimeForRequest);
+    return createServer(runtimeForRequest);
+  };
+  const list = { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} };
+  const headersFor = (value) => ({ 'x-mmgrep-max-text-inline-chars': value });
+
+  await withHttpServer({ MMGREP_MAX_TEXT_INLINE_CHARS: '32000' }, async ({ endpoint, runtime, logs }) => {
+    assert.equal(runtime.config.text.maxInlineChars, 32000, 'env 基线没有生效');
+
+    // 1) 无头基线：复用共享 runtime，客户端不覆盖
+    assert.equal((await rpc(endpoint, list)).status, 200);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0], runtime, '没带头时必须原样复用共享 runtime');
+    assert.equal(seen[0].config.text.maxInlineChars, 32000);
+
+    // 2) 带头：本请求按头值生效；共享 runtime 保持不变
+    assert.equal((await rpc(endpoint, { ...list, id: 2 }, headersFor('5000'))).status, 200);
+    assert.equal(seen.length, 2);
+    assert.notEqual(seen[1], runtime);
+    assert.equal(seen[1].config.text.maxInlineChars, 5000);
+    assert.equal(runtime.config.text.maxInlineChars, 32000, '共享 runtime 被请求头改动了');
+    assert.match(logs.join('\n'), /applying per-request config \(x-mmgrep-max-text-inline-chars\)/);
+
+    // 3) 超过硬上限：按 200000 截断并 warn；日志不回显头值
+    assert.equal((await rpc(endpoint, { ...list, id: 3 }, headersFor('250000'))).status, 200);
+    assert.equal(seen[2].config.text.maxInlineChars, MAX_TEXT_INLINE_CHARS_HARD_CAP);
+    const clampedLogs = logs.join('\n');
+    assert.match(clampedLogs, /x-mmgrep-max-text-inline-chars exceeds the hard cap 200000/);
+    assert.ok(!clampedLogs.includes('250000'), `日志回显了请求头的值：${clampedLogs}`);
+
+    // 4) 非法值：warn + 回落 env（32000），不是默认 24000
+    assert.equal((await rpc(endpoint, { ...list, id: 4 }, headersFor('not-a-number'))).status, 200);
+    assert.equal(seen[3].config.text.maxInlineChars, 32000);
+    const invalidLogs = logs.join('\n');
+    assert.match(invalidLogs, /x-mmgrep-max-text-inline-chars is invalid; using the configured value 32000/);
+    assert.ok(!invalidLogs.includes('not-a-number'), `日志回显了请求头的值：${invalidLogs}`);
+
+    // 5) 空头等于没带：仍复用共享 runtime
+    assert.equal((await rpc(endpoint, { ...list, id: 5 }, headersFor('   '))).status, 200);
+    assert.equal(seen.length, 5);
+    assert.equal(seen[4], runtime, '空头不该触发请求级覆盖');
+  }, { serverFactory });
+});
+
+test('http：内联上限请求头 —— 没配 env 时缺省回落到 24000', async () => {
+  const seen = [];
+  const serverFactory = (runtimeForRequest) => {
+    seen.push(runtimeForRequest);
+    return createServer(runtimeForRequest);
+  };
+  const list = { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} };
+
+  await withHttpServer({}, async ({ endpoint, runtime }) => {
+    assert.equal(runtime.config.text.maxInlineChars, DEFAULT_MAX_TEXT_INLINE_CHARS);
+
+    // 无头：默认值，且复用共享 runtime
+    assert.equal((await rpc(endpoint, list)).status, 200);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0], runtime);
+
+    // 带头：按头值覆盖默认值
+    assert.equal(
+      (await rpc(endpoint, { ...list, id: 2 }, { 'x-mmgrep-max-text-inline-chars': '36000' })).status,
+      200,
+    );
+    assert.equal(seen[1].config.text.maxInlineChars, 36000);
+  }, { serverFactory });
 });

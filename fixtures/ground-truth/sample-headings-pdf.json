@@ -1,0 +1,212 @@
+{
+  "id": "sample-headings-pdf",
+  "kind": "pdf",
+  "file": "sample-headings.pdf",
+  "generator": "fixtures/generate.mjs",
+  "pageCount": 3,
+  "pageWidthPt": 595,
+  "pageHeightPt": 842,
+  "hasTextLayer": true,
+  "bookmarks": 0,
+  "headings": [
+    {
+      "page": 1,
+      "level": 2,
+      "text": "1. Introduction"
+    },
+    {
+      "page": 1,
+      "level": 2,
+      "text": "1.1 Scope"
+    },
+    {
+      "page": 1,
+      "level": 2,
+      "text": "1.2 Motivation"
+    },
+    {
+      "page": 2,
+      "level": 2,
+      "text": "2. Methods"
+    },
+    {
+      "page": 2,
+      "level": 2,
+      "text": "2.1 Sampling"
+    },
+    {
+      "page": 3,
+      "level": 2,
+      "text": "3. Results"
+    },
+    {
+      "page": 3,
+      "level": 2,
+      "text": "3.1 Summary"
+    }
+  ],
+  "pages": [
+    {
+      "page": 1,
+      "lines": [
+        {
+          "text": "1. Introduction",
+          "xPt": 72,
+          "yPt": 770,
+          "font": "F2",
+          "size": 15
+        },
+        {
+          "text": "This synthetic heading fixture exists to exercise the outline generated",
+          "xPt": 72,
+          "yPt": 734,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "from block headings. It has no PDF bookmarks at all.",
+          "xPt": 72,
+          "yPt": 718,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "1.1 Scope",
+          "xPt": 72,
+          "yPt": 682,
+          "font": "F2",
+          "size": 15
+        },
+        {
+          "text": "The heading heuristic recognises short numbered lines when they",
+          "xPt": 72,
+          "yPt": 646,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "are separated from body paragraphs by a blank line.",
+          "xPt": 72,
+          "yPt": 630,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "1.2 Motivation",
+          "xPt": 72,
+          "yPt": 594,
+          "font": "F2",
+          "size": 15
+        },
+        {
+          "text": "A document with at least five headings can expose",
+          "xPt": 72,
+          "yPt": 558,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "an outline even when its author never added bookmarks.",
+          "xPt": 72,
+          "yPt": 542,
+          "font": "F1",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "page": 2,
+      "lines": [
+        {
+          "text": "2. Methods",
+          "xPt": 72,
+          "yPt": 770,
+          "font": "F2",
+          "size": 15
+        },
+        {
+          "text": "Every heading in this page is a single short",
+          "xPt": 72,
+          "yPt": 734,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "numbered line; body paragraphs follow after a vertical gap.",
+          "xPt": 72,
+          "yPt": 718,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "2.1 Sampling",
+          "xPt": 72,
+          "yPt": 682,
+          "font": "F2",
+          "size": 15
+        },
+        {
+          "text": "Sampling paragraphs stay out of the generated",
+          "xPt": 72,
+          "yPt": 646,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "outline; only heading blocks become entries.",
+          "xPt": 72,
+          "yPt": 630,
+          "font": "F1",
+          "size": 11
+        }
+      ]
+    },
+    {
+      "page": 3,
+      "lines": [
+        {
+          "text": "3. Results",
+          "xPt": 72,
+          "yPt": 770,
+          "font": "F2",
+          "size": 15
+        },
+        {
+          "text": "The generated outline is labelled \"outline: generated from headings\" so the agent",
+          "xPt": 72,
+          "yPt": 734,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "knows it came from block structure, not from the file metadata.",
+          "xPt": 72,
+          "yPt": 718,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "3.1 Summary",
+          "xPt": 72,
+          "yPt": 682,
+          "font": "F2",
+          "size": 15
+        },
+        {
+          "text": "Six headings in total is above the",
+          "xPt": 72,
+          "yPt": 646,
+          "font": "F1",
+          "size": 11
+        },
+        {
+          "text": "five-heading threshold for generating an outline.",
+          "xPt": 72,
+          "yPt": 630,
+          "font": "F1",
+          "size": 11
+        }
+      ]
+    }
+  ]
+}

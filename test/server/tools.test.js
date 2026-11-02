@@ -214,13 +214,13 @@ test('listTools：4 个工具、描述带中文触发词、schema 完整', async
       }
 
       assert.deepEqual(Object.keys(byName.media_overview.inputSchema.properties).sort(), [
-        'cells', 'end', 'envelope', 'images', 'maxEdge', 'pages', 'path', 'segment', 'start', 'subtitle', 'transcript',
+        'cells', 'end', 'envelope', 'images', 'maxEdge', 'ocr', 'pages', 'path', 'segment', 'start', 'subtitle', 'transcript', 'view',
       ]);
       assert.deepEqual(Object.keys(byName.media_zoom.inputSchema.properties).sort(), [
         'at', 'crop', 'end', 'maxEdge', 'page', 'path', 'start',
       ]);
       assert.deepEqual(Object.keys(byName.media_locate.inputSchema.properties).sort(), [
-        'end', 'includeFrame', 'max', 'pages', 'path', 'query', 'segment', 'start', 'subtitle', 'transcript',
+        'end', 'includeFrame', 'max', 'ocr', 'pages', 'path', 'query', 'segment', 'start', 'subtitle', 'transcript',
       ]);
 
       // 参数 describe 里标注了适用媒体类型
@@ -367,6 +367,14 @@ test('不适用参数必须报契约原文案，不能静默忽略', async () =>
         ['media_overview', workspace.files.audio, { maxEdge: 1280 }, 'maxEdge is not applicable to audio media.'],
         ['media_overview', workspace.files.video, { envelope: true },
           'envelope is not applicable to video media. It only applies to audio recordings.'],
+        ['media_overview', workspace.files.video, { ocr: 'force' },
+          'ocr is not applicable to video media. Only documents have a page text layer or page images to OCR; video and audio use subtitles/transcript instead.'],
+        ['media_overview', workspace.files.audio, { ocr: 'force' },
+          'ocr is not applicable to audio media. Only documents have a page text layer or page images to OCR; video and audio use subtitles/transcript instead.'],
+        ['media_locate', workspace.files.video, { query: 'x', ocr: 'force' },
+          'ocr is not applicable to video media. Only documents have a page text layer or page images to OCR; video and audio use subtitles/transcript instead.'],
+        ['media_locate', workspace.files.audio, { query: 'x', ocr: 'force' },
+          'ocr is not applicable to audio media. Only documents have a page text layer or page images to OCR; video and audio use subtitles/transcript instead.'],
         ['media_overview', workspace.files.document, { subtitle: '/abs/a.srt' },
           'subtitle is not applicable to document media. Documents have a page text layer, not a transcript.'],
         ['media_overview', workspace.files.document, { transcript: 'off' },

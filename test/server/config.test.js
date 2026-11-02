@@ -20,9 +20,10 @@ test('loadConfig：全部走契约 §12 的默认值', () => {
   assert.equal(config.asr.model, DEFAULT_ASR_MODEL);
   assert.equal(config.asr.baseUrl, 'https://api.elevenlabs.io/v1');
   assert.equal(config.asr.timeoutMs, 120000);
-  assert.equal(config.doc.provider, 'none');
-  assert.equal(config.doc.timeoutMs, 180000);
   assert.equal(config.ocr.provider, 'none');
+  assert.equal(config.ocr.timeoutMs, 180000);
+  assert.equal(config.typeset.provider, 'builtin');
+  assert.equal(config.typeset.timeoutMs, 180000);
   assert.equal(config.images.maxTokens, DEFAULT_MAX_IMAGE_TOKENS);
   assert.equal(config.images.maxEdge, 1600);
   assert.equal(config.text.maxInlineChars, DEFAULT_MAX_TEXT_INLINE_CHARS);
@@ -43,10 +44,10 @@ test('loadConfig：读取自定义环境变量（按 provider 分组）', () => 
     MMGREP_ELEVENLABS_MODEL: 'scribe_v2',
     MMGREP_ASR_LANGUAGE: 'zh',
     MMGREP_ASR_TIMEOUT_MS: '90000',
-    MMGREP_DOC_PROVIDER: 'mineru',
+    MMGREP_OCR_PROVIDER: 'mineru',
+    MMGREP_TYPESET_PROVIDER: 'mineru',
     MMGREP_MINERU_API_KEY: 'doc-secret',
     MMGREP_DOC_TIMEOUT_MS: '60000',
-    MMGREP_OCR_PROVIDER: 'tesseract',
     MMGREP_MAX_IMAGE_TOKENS: '2000',
     MMGREP_MAX_IMAGE_EDGE: '1024',
     MMGREP_MAX_TEXT_INLINE_CHARS: '1000',
@@ -65,11 +66,13 @@ test('loadConfig：读取自定义环境变量（按 provider 分组）', () => 
   assert.equal(config.asr.model, 'scribe_v2');
   assert.equal(config.asr.language, 'zh');
   assert.equal(config.asr.timeoutMs, 90000);
-  assert.equal(config.doc.provider, 'mineru');
-  assert.equal(config.doc.apiKey, 'doc-secret');
-  assert.equal(config.doc.apiKeySource, 'MMGREP_MINERU_API_KEY');
-  assert.equal(config.doc.timeoutMs, 60000);
-  assert.equal(config.ocr.provider, 'tesseract');
+  assert.equal(config.ocr.provider, 'mineru');
+  assert.equal(config.ocr.apiKey, 'doc-secret');
+  assert.equal(config.ocr.apiKeySource, 'MMGREP_MINERU_API_KEY');
+  assert.equal(config.ocr.timeoutMs, 60000);
+  assert.equal(config.typeset.provider, 'mineru');
+  assert.equal(config.typeset.apiKey, 'doc-secret');
+  assert.equal(config.typeset.timeoutMs, 60000);
   assert.equal(config.images.maxTokens, 2000);
   assert.equal(config.images.maxEdge, 1024);
   assert.equal(config.text.maxInlineChars, 1000);
@@ -101,23 +104,42 @@ test('loadConfig：每个 provider 只读自己的变量组，baseUrl / model �
   assert.deepEqual(config.warnings, []);
 });
 
-test('loadConfig：旧通用变量仍可兜底，并记一条弃用 warning', () => {
+test('loadConfig：旧 ASR 通用变量仍可兜底，并记一条弃用 warning', () => {
   const config = loadConfig({
     MMGREP_ASR_PROVIDER: 'elevenlabs',
     MMGREP_ASR_API_KEY: 'legacy-asr-key',
-    MMGREP_DOC_PROVIDER: 'mineru',
-    MMGREP_DOC_API_KEY: 'legacy-doc-key',
   });
 
   assert.equal(config.asr.apiKey, 'legacy-asr-key');
   assert.equal(config.asr.apiKeySource, 'MMGREP_ASR_API_KEY');
-  assert.equal(config.doc.apiKey, 'legacy-doc-key');
-  assert.equal(config.doc.apiKeySource, 'MMGREP_DOC_API_KEY');
 
   const warnings = config.warnings.join('\n');
   assert.match(warnings, /MMGREP_ASR_API_KEY is deprecated.*MMGREP_ELEVENLABS_API_KEY/);
-  assert.match(warnings, /MMGREP_DOC_API_KEY is deprecated.*MMGREP_MINERU_API_KEY/);
   assert.equal(warnings.includes('legacy-asr-key'), false, 'warning 不能带 key 原文');
+});
+
+test('loadConfig：0.2.0 删除的 MMGREP_DOC_* 启动时 warn，指出替代变量且不生效', () => {
+  const config = loadConfig({
+    MMGREP_DOC_PROVIDER: 'mineru',
+    MMGREP_DOC_API_KEY: 'legacy-doc-key',
+    MMGREP_DOC_BASE_URL: 'https://legacy.example/api/v4',
+    MMGREP_DOC_MODEL: 'vlm',
+    MMGREP_MINERU_API_KEY: 'still-mineru-key',
+  });
+
+  // 旧变量被完全忽略：不会因此打开 OCR，也不会兜底成凭据。
+  assert.equal(config.ocr.provider, 'none');
+  assert.equal(config.ocr.apiKey, '');
+  assert.equal(config.ocr.apiKeySource, null);
+  assert.equal(config.typeset.provider, 'builtin');
+  assert.equal(config.typeset.apiKey, '');
+
+  const warnings = config.warnings.join('\n');
+  assert.match(warnings, /MMGREP_DOC_PROVIDER was removed in 0\.2\.0.*MMGREP_OCR_PROVIDER/);
+  assert.match(warnings, /MMGREP_DOC_PROVIDER was removed in 0\.2\.0.*MMGREP_TYPESET_PROVIDER/);
+  assert.match(warnings, /MMGREP_DOC_API_KEY was removed in 0\.2\.0.*MMGREP_MINERU_API_KEY/);
+  assert.match(warnings, /MMGREP_DOC_BASE_URL was removed in 0\.2\.0.*MMGREP_MINERU_BASE_URL/);
+  assert.match(warnings, /MMGREP_DOC_MODEL was removed in 0\.2\.0.*MMGREP_MINERU_MODEL/);
   assert.equal(warnings.includes('legacy-doc-key'), false, 'warning 不能带 key 原文');
 });
 
@@ -138,24 +160,28 @@ test('loadConfig：旧 MMGREP_ASR_MODEL 配 openai-compatible 时额外警告可
   assert.equal(warnings.includes('scribe_v1'), false, 'warning 不该重复输出配置值');
 });
 
-test('loadConfig：未知 provider 记 warning 并回落到 none（不崩）', () => {
+test('loadConfig：未知 provider 记 warning 并回落到各角色默认值（不崩）', () => {
   const config = loadConfig({
     MMGREP_ASR_PROVIDER: 'elevenlabz',
     MMGREP_ELEVENLABS_API_KEY: 'never-used-key',
-    MMGREP_DOC_PROVIDER: 'paddleocr',
+    MMGREP_OCR_PROVIDER: 'paddleocr',
+    MMGREP_TYPESET_PROVIDER: 'tesseract',
     MMGREP_MINERU_API_KEY: 'never-used-token',
   });
 
   assert.equal(config.asr.provider, 'none');
   assert.equal(config.asr.apiKey, '');
   assert.equal(config.asr.apiKeySource, null);
-  assert.equal(config.doc.provider, 'none');
-  assert.equal(config.doc.apiKey, '');
-  assert.equal(config.doc.apiKeySource, null);
+  assert.equal(config.ocr.provider, 'none');
+  assert.equal(config.ocr.apiKey, '');
+  assert.equal(config.ocr.apiKeySource, null);
+  assert.equal(config.typeset.provider, 'builtin');
+  assert.equal(config.typeset.apiKey, '');
 
   const warnings = config.warnings.join('\n');
   assert.match(warnings, /MMGREP_ASR_PROVIDER is "elevenlabz".*not a supported provider.*falling back to "none"/);
-  assert.match(warnings, /MMGREP_DOC_PROVIDER is "paddleocr".*not a supported provider.*falling back to "none"/);
+  assert.match(warnings, /MMGREP_OCR_PROVIDER is "paddleocr".*not a supported ocr provider.*falling back to "none"/);
+  assert.match(warnings, /MMGREP_TYPESET_PROVIDER is "tesseract".*not a supported typeset provider.*falling back to "builtin"/);
 });
 
 test('loadConfig：非法值回落默认并留下 warning（不崩 server）', () => {
@@ -177,7 +203,8 @@ test('describeConfig：绝不泄露 API key', () => {
   const config = loadConfig({
     MMGREP_ASR_PROVIDER: 'elevenlabs',
     MMGREP_ELEVENLABS_API_KEY: 'sk-super-secret',
-    MMGREP_DOC_PROVIDER: 'mineru',
+    MMGREP_OCR_PROVIDER: 'mineru',
+    MMGREP_TYPESET_PROVIDER: 'mineru',
     MMGREP_MINERU_API_KEY: 'doc-super-secret',
   });
   const described = describeConfig(config);
@@ -185,7 +212,8 @@ test('describeConfig：绝不泄露 API key', () => {
   assert.equal(json.includes('sk-super-secret'), false);
   assert.equal(json.includes('doc-super-secret'), false);
   assert.equal(described.asr.apiKey, 'set');
-  assert.equal(described.doc.apiKey, 'set');
+  assert.equal(described.ocr.apiKey, 'set');
+  assert.equal(described.typeset.apiKey, 'set');
 });
 
 test('多 provider 的 key 互不串用，且不出现在 describeConfig / warnings / 报错里', async () => {
@@ -198,11 +226,13 @@ test('多 provider 的 key 互不串用，且不出现在 describeConfig / warni
     MMGREP_ASR_PROVIDER: 'elevenlabs',
     MMGREP_ELEVENLABS_API_KEY: ELEVEN_SENTINEL,
     MMGREP_OPENAI_COMPATIBLE_API_KEY: OPENAI_SENTINEL,
-    MMGREP_DOC_PROVIDER: 'mineru',
+    MMGREP_OCR_PROVIDER: 'mineru',
+    MMGREP_TYPESET_PROVIDER: 'mineru',
     MMGREP_MINERU_API_KEY: MINERU_SENTINEL,
   });
   assert.equal(config.asr.apiKey, ELEVEN_SENTINEL);
-  assert.equal(config.doc.apiKey, MINERU_SENTINEL);
+  assert.equal(config.ocr.apiKey, MINERU_SENTINEL);
+  assert.equal(config.typeset.apiKey, MINERU_SENTINEL);
 
   const described = JSON.stringify(describeConfig(config));
   const warnings = config.warnings.join('\n');
@@ -230,12 +260,12 @@ test('多 provider 的 key 互不串用，且不出现在 describeConfig / warni
   }
 
   const { createDocProvider } = await import('../../src/providers/doc/index.js');
-  const doc = createDocProvider({
-    MMGREP_DOC_PROVIDER: 'mineru',
+  const doc = createDocProvider('ocr', {
+    MMGREP_OCR_PROVIDER: 'mineru',
     MMGREP_ELEVENLABS_API_KEY: ELEVEN_SENTINEL,
     MMGREP_OPENAI_COMPATIBLE_API_KEY: OPENAI_SENTINEL,
   });
-  const docError = await doc.parse({ filePath: '/tmp/whatever.pdf' }).then(
+  const docError = await doc.parse({ filePath: '/tmp/whatever.pdf', role: 'ocr' }).then(
     () => null,
     (err) => err,
   );
@@ -244,6 +274,20 @@ test('多 provider 的 key 互不串用，且不出现在 describeConfig / warni
   for (const secret of [ELEVEN_SENTINEL, OPENAI_SENTINEL, MINERU_SENTINEL]) {
     assert.equal(docError.message.includes(secret), false, 'DOC 报错不能出现 key 原文');
   }
+});
+
+test('MMGREP_TYPESET_SKIP_SIMPLE：默认 true；false 关闭；非法值回落并 warning', () => {
+  assert.equal(loadConfig({}).typeset.skipSimple, true);
+  assert.equal(loadConfig({ MMGREP_TYPESET_SKIP_SIMPLE: 'false' }).typeset.skipSimple, false);
+  assert.equal(loadConfig({ MMGREP_TYPESET_SKIP_SIMPLE: 'off' }).typeset.skipSimple, false);
+  assert.equal(loadConfig({ MMGREP_TYPESET_SKIP_SIMPLE: '1' }).typeset.skipSimple, true);
+
+  const invalid = loadConfig({ MMGREP_TYPESET_SKIP_SIMPLE: 'maybe' });
+  assert.equal(invalid.typeset.skipSimple, true);
+  assert.ok(invalid.warnings.some((warning) => warning.includes('MMGREP_TYPESET_SKIP_SIMPLE')));
+
+  const described = describeConfig(loadConfig({ MMGREP_TYPESET_SKIP_SIMPLE: '0' }));
+  assert.equal(described.typeset.skipSimple, false);
 });
 
 test('createLogger：只写注入的 stream，格式稳定', () => {

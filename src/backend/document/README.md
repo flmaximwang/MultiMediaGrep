@@ -3,8 +3,13 @@
 把本地文档变成 agent 能读的材料：**页面缩略图拼图** + **按页对齐的文字**，必要时用
 `media_zoom` 放大单页。职责与返回结构见 `docs/mcp-contract.md` §4.3 / §5 / §6 / §7。
 
-server 本身**不调用任何 LLM**。扫描件 / 图片的 OCR 交给用户配置的 `ctx.docProvider`
-（例如 MinerU，见 `src/providers/doc/README.md`）；没配就只返回页面图，让多模态模型自己看。
+server 本身**不调用任何 LLM**。文档 provider 按契约 v2 拆成两个角色
+（见 `src/providers/doc/README.md`）：
+
+- `ctx.ocrProvider`：从像素识别字符，只处理**没有文字层**的页（图片一律走它）；
+- `ctx.typesetProvider`：只处理**有文字层**的页，恢复阅读顺序 / 结构，**不得重新识别字符**。
+
+没配 OCR 就只返回页面图；typeset 默认 `builtin`（本地，不联网）。
 
 ## 支持范围
 
@@ -34,16 +39,23 @@ server 本身**不调用任何 LLM**。扫描件 / 图片的 OCR 交给用户配
 
 ## 文字从哪里来
 
-`overview` / `locate` 的顺序：**`ctx.docProvider` → PDF 文字层 → 空 + 警告**。
+`overview` / `locate` 的逐页路由（9z5.28）：
 
-- provider 成功时逐页使用它的 `text`；缺失的页再用 PDF 文字层补齐。
-- provider 抛错时 `overview` **不报错**：降级成页面图 + 警告；`locate` 是纯文字需求，
-  没有兜底文字时按错误码报 `PROVIDER_FAILED` / `PROVIDER_NOT_CONFIGURED`。
-- 完全没有文字、也没有 provider 时，`locate` 报 `NO_TRANSCRIPT`
+1. 用 `pdfSupport.extractTextLayers` 把请求页分成「有文字层」和「无文字层」两组；
+2. 有文字层 → `ctx.typesetProvider`；无文字层 → `ctx.ocrProvider`；
+3. 两个角色是同一 provider 且 `ocrMode=auto` → 只发**一次** `parse`（`role: 'both'`），
+   按返回的逐页 `textOrigin` 分配；
+4. 角色为 `none` / provider 失败：有文字层的页退回原生文字层 + 最简 paragraph blocks
+   （`textOrigin: 'textlayer'`），没有文字层的页退回页面图（`textOrigin: 'unknown'`）。
+
+- provider 抛错时 `overview` **不报错**：降级成页面图 / 原生文字层 + 警告；`locate` 是
+  纯文字需求，没有兜底文字时按错误码报 `PROVIDER_FAILED` / `PROVIDER_NOT_CONFIGURED`。
+- 完全没有文字、也没有 OCR provider 时，`locate` 报 `NO_TRANSCRIPT`
   （`no text layer and no OCR provider is configured`）；`overview` 仍返回页面图 + 警告。
-- 每页 segment 的 `source` / `origin` 均为 `ocr`（文档页文字的契约口径），
-  `startMs` / `endMs` 为 `null`——文档没有时间轴，位置就是 `page`。
-- provider 的文字如果包含表格，当前只取 `text` 字段；表格结构暂不透传。
+- 每页 segment 的 `source` / `origin` 仍是旧值 `ocr`（9z5.21 再按 `textOrigin` 映射成
+  `text` / `ocr` / `mixed`）；后端结果里已经带逐页 `textOrigin` / `blocks`。
+- `startMs` / `endMs` 为 `null`——文档没有时间轴，位置就是 `page`。
+- provider 的文字如果包含表格，当前只取 `text` / blocks；表格结构暂不透传。
 
 ## 图片预算与抽样
 

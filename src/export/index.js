@@ -23,7 +23,7 @@ import {
 } from './format.js';
 
 export const EXPORT_VERSION = 1;
-export const GENERATOR = Object.freeze({ name: 'multimediagrep', version: '0.1.0' });
+export const GENERATOR = Object.freeze({ name: 'multimediagrep', version: '0.2.0' });
 
 /** content.md 的段标题：时间区间用「mm:ss.mmm – mm:ss.mmm」，文档用「Page N」 */
 function segmentHeading(segment) {
@@ -103,6 +103,7 @@ export function buildManifest({
   pages = null,
   transcript = null,
   overview = null,
+  outline = null,
   provider = null,
   warnings = [],
   extra = {},
@@ -140,6 +141,7 @@ export function buildManifest({
       }
       : null,
     overview,
+    outline,
     provider,
     warnings,
     ...extra,
@@ -199,6 +201,7 @@ export async function writeExport({
   tool = 'media_overview',
   transcript = null,
   overview = null,
+  outline = null,
   window = null,
   pages = null,
   provider = null,
@@ -239,6 +242,7 @@ export async function writeExport({
     pages,
     transcript: transcript ? { ...transcript, segmentCount: normSegments.length } : null,
     overview,
+    outline,
     provider,
     warnings,
     extra: {
@@ -294,6 +298,7 @@ export async function exportAnalysis({
   title,
   transcript = null,
   overview = null,
+  outline = null,
   window = null,
   pages = null,
   provider = null,
@@ -311,6 +316,7 @@ export async function exportAnalysis({
     tool,
     transcript,
     overview,
+    outline,
     window,
     pages,
     provider,

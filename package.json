@@ -1,6 +1,6 @@
 {
   "name": "multimediagrep-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server giving agents eyes and ears over local media (video / recording / document): storyboard grids, zoomed crops, time- and page-aligned text. Local paths only — never downloads, never calls an LLM.",
   "license": "Apache-2.0",
   "author": "flmaximwang",

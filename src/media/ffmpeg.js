@@ -165,11 +165,11 @@ export function runBuffer(bin, args, { input = null, timeoutMs = DEFAULT_TIMEOUT
   });
 }
 
-/** ffprobe -print_format json：容器与流信息 */
+/** ffprobe -print_format json：容器、流与章节信息 */
 export async function ffprobeJson(filePath, { timeoutMs, signal } = {}) {
   const { stdout } = await run(
     'ffprobe',
-    ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', filePath],
+    ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', '-show_chapters', filePath],
     { timeoutMs, signal },
   );
   try {

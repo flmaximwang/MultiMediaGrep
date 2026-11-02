@@ -12,6 +12,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createDispatcher } from '../media/interface.js';
 import { createPlaceholderBackend, loadBackends } from './backends.js';
 import {
+  DOC_ROLE_ENV,
   SERVER_NAME,
   SERVER_VERSION,
   createLogger,
@@ -50,7 +51,8 @@ async function loadCache(config, logger) {
 }
 
 /**
- * 装 ASR / 文档解析 provider（契约 §12.2 / §12.3 的三态降级）：
+ * 装 ASR / 文档 provider（契约 §12.2 / §12.3 / §12.4 的三态降级）：
+ * 文档 provider 有两个角色（ocr / typeset），各自独立降级为 null。
  *   - 没配（none）→ null，功能降级为「只有画面」；
  *   - 配了但缺 key → provider 对象存在，真正转写时才抛清晰错误（由 provider 自己负责）；
  *   - provider 名拼错 / 模块缺失 → 记进 providerErrors，probe 的 capabilities 会说明原因。
@@ -67,7 +69,6 @@ async function loadCache(config, logger) {
 export async function loadProviders(config, env, logger, { pinCredentials = false } = {}) {
   const providerErrors = {};
   let asrProvider = null;
-  let docProvider = null;
 
   if (config.asr.provider !== 'none') {
     try {
@@ -94,33 +95,64 @@ export async function loadProviders(config, env, logger, { pinCredentials = fals
     }
   }
 
-  if (config.doc.provider !== 'none') {
-    try {
-      const mod = await import('../providers/doc/index.js');
-      if (typeof mod.createDocProvider !== 'function') {
-        providerErrors.doc = `MMGREP_DOC_PROVIDER is "${config.doc.provider}" but src/providers/doc/index.js `
-          + 'does not export createDocProvider() yet.';
-        logger.warn(providerErrors.doc);
-      } else {
-        docProvider = mod.createDocProvider(env, {
-          provider: config.doc.provider,
-          apiKey: pinCredentials ? config.doc.apiKey : (config.doc.apiKey || undefined),
-          baseUrl: config.doc.baseUrl,
-          model: pinCredentials ? config.doc.model : (config.doc.model || undefined),
-          timeoutMs: config.doc.timeoutMs,
-        });
-      }
-    } catch (error) {
-      const missing = error?.code === 'ERR_MODULE_NOT_FOUND' || error?.code === 'MODULE_NOT_FOUND';
-      providerErrors.doc = missing
-        ? `MMGREP_DOC_PROVIDER is "${config.doc.provider}" but the document parser module (src/providers/doc/index.js) is not available yet.`
-        : `document provider "${config.doc.provider}" could not be configured: ${error?.message ?? error}`;
-      logger.warn(providerErrors.doc);
-      docProvider = null;
-    }
+  const ocrProvider = await loadDocRoleProvider('ocr', config.ocr, env, logger, providerErrors, pinCredentials);
+  let typesetProvider = await loadDocRoleProvider(
+    'typeset',
+    config.typeset,
+    env,
+    logger,
+    providerErrors,
+    pinCredentials,
+  );
+
+  // 两个角色是同一个 provider、同一份配置 → 复用实例；后端仍只发一次 parse。
+  if (
+    ocrProvider
+    && typesetProvider
+    && ocrProvider.id === typesetProvider.id
+    && sameDocProviderConfig(config.ocr, config.typeset)
+  ) {
+    typesetProvider = ocrProvider;
   }
 
-  return { asrProvider, docProvider, providerErrors };
+  return { asrProvider, ocrProvider, typesetProvider, providerErrors };
+}
+
+/** 文档 provider 两个角色是否解析到同一份外部配置（用于复用实例）。 */
+function sameDocProviderConfig(a, b) {
+  if (!a || !b) return false;
+  return ['provider', 'apiKey', 'baseUrl', 'model', 'timeoutMs'].every((field) => a[field] === b[field]);
+}
+
+/** 装一个文档角色（ocr / typeset）的 provider；失败一律降级为 null + providerErrors。 */
+async function loadDocRoleProvider(role, section, env, logger, providerErrors, pinCredentials) {
+  const providerId = section?.provider ?? 'none';
+  if (providerId === 'none') return null;
+
+  const envName = DOC_ROLE_ENV[role] ?? `MMGREP_${role.toUpperCase()}_PROVIDER`;
+  try {
+    const mod = await import('../providers/doc/index.js');
+    if (typeof mod.createDocProvider !== 'function') {
+      providerErrors[role] = `${envName} is "${providerId}" but src/providers/doc/index.js `
+        + 'does not export createDocProvider() yet.';
+      logger.warn(providerErrors[role]);
+      return null;
+    }
+    return mod.createDocProvider(role, env, {
+      provider: providerId,
+      apiKey: pinCredentials ? section.apiKey : (section.apiKey || undefined),
+      baseUrl: section.baseUrl,
+      model: pinCredentials ? section.model : (section.model || undefined),
+      timeoutMs: section.timeoutMs,
+    });
+  } catch (error) {
+    const missing = error?.code === 'ERR_MODULE_NOT_FOUND' || error?.code === 'MODULE_NOT_FOUND';
+    providerErrors[role] = missing
+      ? `${envName} is "${providerId}" but the document provider module (src/providers/doc/index.js) is not available yet.`
+      : `${role} provider "${providerId}" could not be configured: ${error?.message ?? error}`;
+    logger.warn(providerErrors[role]);
+    return null;
+  }
 }
 
 /**
@@ -131,7 +163,7 @@ export async function loadProviders(config, env, logger, { pinCredentials = fals
  * @param {object} [options.config] 覆盖 loadConfig 的结果（测试用）
  * @param {object} [options.backends] 覆盖后端（测试注入 stub）
  * @param {object} [options.cache] 显式传入 cache（传 null 表示禁用）
- * @param {object} [options.asrProvider] / [options.docProvider] 显式传入 provider
+ * @param {object} [options.asrProvider] / [options.ocrProvider] / [options.typesetProvider] 显式传入 provider
  * @param {object} [options.logger]
  */
 export async function createRuntime(options = {}) {
@@ -144,14 +176,22 @@ export async function createRuntime(options = {}) {
   const cache = options.cache !== undefined ? options.cache : await loadCache(config, logger);
 
   const providers = options.providers
-    ?? (options.asrProvider !== undefined || options.docProvider !== undefined
-      ? { asrProvider: options.asrProvider ?? null, docProvider: options.docProvider ?? null, providerErrors: {} }
+    ?? (options.asrProvider !== undefined
+      || options.ocrProvider !== undefined
+      || options.typesetProvider !== undefined
+      ? {
+        asrProvider: options.asrProvider ?? null,
+        ocrProvider: options.ocrProvider ?? null,
+        typesetProvider: options.typesetProvider ?? null,
+        providerErrors: {},
+      }
       : await loadProviders(config, env, logger));
 
   const backendCtx = {
     cache,
     asrProvider: providers.asrProvider ?? null,
-    docProvider: providers.docProvider ?? null,
+    ocrProvider: providers.ocrProvider ?? null,
+    typesetProvider: providers.typesetProvider ?? null,
     logger,
     config,
   };
@@ -164,7 +204,8 @@ export async function createRuntime(options = {}) {
     logger,
     cache: cache ?? null,
     asrProvider: providers.asrProvider ?? null,
-    docProvider: providers.docProvider ?? null,
+    ocrProvider: providers.ocrProvider ?? null,
+    typesetProvider: providers.typesetProvider ?? null,
     providerErrors: providers.providerErrors ?? {},
     backends,
     dispatcher,
@@ -198,7 +239,8 @@ export function createServer(runtimeOrOptions = {}) {
     logger,
     cache: source.cache ?? null,
     asrProvider: source.asrProvider ?? null,
-    docProvider: source.docProvider ?? null,
+    ocrProvider: source.ocrProvider ?? null,
+    typesetProvider: source.typesetProvider ?? null,
     providerErrors: source.providerErrors ?? {},
     backends,
     dispatcher,
@@ -240,7 +282,10 @@ export function logStartupBanner(runtime, options = {}) {
     logger.info(`${config.server.name}@${config.server.version} ready on stdio`);
   }
   logger.info(`cache: ${config.cache.dir} (max ${config.cache.maxBytes} bytes)`);
-  logger.info(`asr: ${config.asr.provider}${config.asr.apiKey ? '' : ' (no API key)'} · doc: ${config.doc.provider} · ocr: ${config.ocr.provider}`);
+  logger.info(
+    `asr: ${config.asr.provider}${config.asr.apiKey ? '' : ' (no API key)'}`
+      + ` · ocr: ${config.ocr.provider} · typeset: ${config.typeset.provider}`,
+  );
   logger.info(`backends: ${backendLabels || '(none)'}`);
   logger.info(`image budget: ${config.images.maxTokens} tokens/call, maxEdge ${config.images.maxEdge}px`);
 }

@@ -14,8 +14,11 @@ import { createDocumentBackend } from '../../src/backend/document/index.js';
 import {
   createPdfSupport,
   normalizePageText,
+  pageLabelFromQpdf,
   parseMutoolInfo,
   parsePdfinfo,
+  parseQpdfOutlineJson,
+  romanNumeral,
   toContiguousRuns,
 } from '../../src/backend/document/pdf.js';
 import {
@@ -139,11 +142,12 @@ function assertImagesWithinBudget(images, { cells, images: maxImages, maxEdge })
   assert.ok(totalCells <= cells * maxImages, 'total cells within the call budget');
 }
 
-function stubDocProvider({ fail = null, texts = () => '' } = {}) {
+function stubDocProvider({ fail = null, texts = () => '', id = 'stub', roles = null } = {}) {
   const calls = [];
   const provider = {
-    id: 'stub',
-    describe: () => ({ id: 'stub', model: 'stub-v1', baseUrl: null }),
+    id,
+    ...(roles ? { roles } : {}),
+    describe: () => ({ id, model: 'stub-v1', baseUrl: null }),
     async parse(input) {
       calls.push(input);
       if (fail) throw fail;
@@ -152,9 +156,20 @@ function stubDocProvider({ fail = null, texts = () => '' } = {}) {
           ? Array.from({ length: input.pages.to - input.pages.from + 1 }, (_, i) => input.pages.from + i)
           : []);
       return {
-        provider: 'stub',
+        provider: id,
         model: 'stub-v1',
-        pages: requested.map((page) => ({ page, text: texts(page) })),
+        pages: requested.map((page) => {
+          const text = texts(page);
+          const textOrigin = input.ocrMode === 'force'
+            ? 'ocr'
+            : (input.role === 'typeset' ? 'textlayer' : 'ocr');
+          return {
+            page,
+            textOrigin,
+            blocks: text ? [{ type: 'paragraph', text }] : [],
+            text,
+          };
+        }),
       };
     },
   };
@@ -211,6 +226,39 @@ test('PDF 输出解析：pdfinfo / mutool / 页文本整理 / 连续区间', () 
   assert.deepEqual(toContiguousRuns([1, 2, 3, 5, 6, 8]), [[1, 2, 3], [5, 6], [8]]);
 });
 
+test('PDF 书签解析：qpdf 的 destpageposfrom1 + /PageLabels 字典 → 物理页与打印标签', () => {
+  // qpdf 给的是 /PageLabels 字典（/St 已按页递增），不是算好的字符串。
+  assert.equal(pageLabelFromQpdf({ '/S': '/r', '/St': 1 }), 'i');
+  assert.equal(pageLabelFromQpdf({ '/S': '/r', '/St': 4 }), 'iv');
+  assert.equal(pageLabelFromQpdf({ '/S': '/R', '/St': 14 }), 'XIV');
+  assert.equal(pageLabelFromQpdf({ '/S': '/D', '/St': 37 }), '37');
+  assert.equal(pageLabelFromQpdf({ '/S': '/D', '/P': 'A-', '/St': 7 }), 'A-7');
+  assert.equal(pageLabelFromQpdf({ '/S': '/a', '/St': 27 }), 'aa');
+  assert.equal(pageLabelFromQpdf(null), null);
+  assert.equal(romanNumeral(1990), 'mcmxc');
+
+  const parsed = parseQpdfOutlineJson({
+    pages: [
+      { pageposfrom1: 1, label: { '/S': '/r', '/St': 1 } },
+      { pageposfrom1: 2, label: { '/S': '/r', '/St': 2 } },
+      { pageposfrom1: 3, label: { '/S': '/D', '/St': 1 } },
+    ],
+    outlines: [
+      {
+        title: 'Chapter One\r',
+        destpageposfrom1: 1,
+        kids: [{ title: 'Section 1.1', destpageposfrom1: 2, kids: [] }],
+      },
+      { title: 'Chapter Two', destpageposfrom1: 3, kids: [] },
+    ],
+  });
+  assert.deepEqual(parsed, [
+    { level: 1, title: 'Chapter One', page: 1, label: 'i' },
+    { level: 2, title: 'Section 1.1', page: 2, label: 'ii' },
+    { level: 1, title: 'Chapter Two', page: 3, label: '1' },
+  ]);
+});
+
 /* ------------------------------------------------------------------ *
  * probe
  * ------------------------------------------------------------------ */
@@ -243,9 +291,10 @@ test('probe：文本 PDF 的契约字段、文字层与 OCR 能力', { skip: ski
     assert.equal(probe.capabilities.asr.provider, null);
     assert.equal(probe.capabilities.ocr.available, false);
     assert.equal(probe.capabilities.ocr.provider, null);
-    assert.match(probe.capabilities.ocr.reason, /No document parser is configured/);
-    assert.equal(probe.capabilities.transcriptSource, 'ocr');
-    assert.equal(probe.capabilities.transcriptOrigin, 'ocr');
+    assert.match(probe.capabilities.ocr.reason, /No OCR provider is configured/);
+    assert.equal(probe.capabilities.typeset.available, false);
+    assert.equal(probe.capabilities.transcriptSource, 'text');
+    assert.equal(probe.capabilities.transcriptOrigin, 'textlayer');
     assert.equal(probe.capabilities.transcriptPath, null);
     assert.equal(probe.recommended.mode, 'single');
     assert.ok(probe.recommended.note);
@@ -294,7 +343,7 @@ test('probe：txt / md 是一页有文字层，没有像素尺寸', async () => 
     assert.equal(probe.width, null);
     assert.equal(probe.height, null);
     assert.equal(probe.container, 'markdown');
-    assert.equal(probe.capabilities.transcriptSource, 'ocr');
+    assert.equal(probe.capabilities.transcriptSource, 'text');
     assert.equal(probe.capabilities.ocr.available, false);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -327,8 +376,8 @@ test('overview：页子集、格数 / 图数 / maxEdge 与每页文字严格对�
     for (const segment of result.segments) {
       assert.equal(segment.startMs, null);
       assert.equal(segment.endMs, null);
-      assert.equal(segment.source, 'ocr');
-      assert.equal(segment.origin, 'ocr');
+      assert.equal(segment.source, 'text');
+      assert.equal(segment.origin, 'textlayer');
       for (const line of groundTruthLines(TEXT_GT, segment.page)) {
         assert.ok(segment.text.includes(line), `page ${segment.page} must contain "${line}"`);
       }
@@ -337,8 +386,8 @@ test('overview：页子集、格数 / 图数 / maxEdge 与每页文字严格对�
     assert.ok(result.segments[1].text.includes('PAGE THREE HEADING'));
     assert.ok(!result.segments[0].text.includes('PAGE 1 OF 6'));
     assert.ok(!result.segments[1].text.includes('PAGE TWO HEADING'));
-    assert.equal(result.transcript.source, 'ocr');
-    assert.equal(result.transcript.origin, 'ocr');
+    assert.equal(result.transcript.source, 'text');
+    assert.equal(result.transcript.origin, 'textlayer');
     assert.equal(result.transcript.provider, null);
     assert.deepEqual(result.warnings, []);
   });
@@ -363,8 +412,8 @@ test('overview：images: 0 是零像素纯文本模式——不出页图，只�
     for (const segment of result.segments) {
       assert.equal(segment.startMs, null);
       assert.equal(segment.endMs, null);
-      assert.equal(segment.source, 'ocr');
-      assert.equal(segment.origin, 'ocr');
+      assert.equal(segment.source, 'text');
+      assert.equal(segment.origin, 'textlayer');
       for (const line of groundTruthLines(TEXT_GT, segment.page)) {
         assert.ok(segment.text.includes(line), `page ${segment.page} must contain "${line}"`);
       }
@@ -373,7 +422,7 @@ test('overview：images: 0 是零像素纯文本模式——不出页图，只�
     assert.ok(result.segments[1].text.includes('PAGE THREE HEADING'));
     // 没出图就不该有「图片预算只覆盖了 N 页」的告警
     assert.ok(!result.warnings.some((warning) => /image budget covers/.test(warning)));
-    assert.equal(result.transcript.source, 'ocr');
+    assert.equal(result.transcript.source, 'text');
   });
 });
 
@@ -437,7 +486,7 @@ test('overview：stub provider OCR 段落映射；provider 失败时降级不报
 }, async () => {
   await withCache(async () => {
     const stub = stubDocProvider({ texts: scanText });
-    const backend = createDocumentBackend({ docProvider: stub.provider, config: {} });
+    const backend = createDocumentBackend({ ocrProvider: stub.provider, config: {} });
     const result = await backend.overview({
       path: SCANNED_PDF,
       pages: [1, 2],
@@ -455,15 +504,19 @@ test('overview：stub provider OCR 段落映射；provider 失败时降级不报
     assert.equal(result.transcript.provider, 'stub');
     assert.equal(result.transcript.model, 'stub-v1');
     assert.deepEqual(stub.calls[0].pages, { from: 1, to: 2 });
+    assert.equal(stub.calls[0].role, 'ocr');
+    assert.equal(stub.calls[0].ocrMode, 'auto');
     for (const segment of result.segments) {
       assert.equal(segment.source, 'ocr');
       assert.equal(segment.origin, 'ocr');
+      assert.equal(segment.textOrigin, 'ocr');
+      assert.ok(segment.blocks.length > 0);
     }
 
     const failing = stubDocProvider({
       fail: new Error('stub OCR unavailable (Authorization: Bearer sk-supersecret123456789)'),
     });
-    const degradedBackend = createDocumentBackend({ docProvider: failing.provider, config: {} });
+    const degradedBackend = createDocumentBackend({ ocrProvider: failing.provider, config: {} });
     const degraded = await degradedBackend.overview({
       path: SCANNED_PDF,
       pages: [1],
@@ -475,8 +528,8 @@ test('overview：stub provider OCR 段落映射；provider 失败时降级不报
     assertImagesWithinBudget(degraded.images, { cells: 1, images: 1, maxEdge: 500 });
     assert.equal(degraded.segments[0].text, '');
     assert.equal(degraded.transcript.source, 'none');
-    assert.ok(degraded.warnings.some((warning) => /document parser "stub" failed/.test(warning)));
-    assert.ok(degraded.warnings.some((warning) => /No text layer was available; page images only/.test(warning)));
+    assert.ok(degraded.warnings.some((warning) => /OCR provider "stub" failed/.test(warning)));
+    assert.ok(degraded.warnings.some((warning) => /Pages without a text layer are returned as page images only/.test(warning)));
     assert.ok(degraded.warnings.every((warning) => !warning.includes('sk-supersecret123456789')));
     assert.ok(degraded.warnings.some((warning) => warning.includes('Bearer ***')));
 
@@ -527,8 +580,11 @@ test('overview：纯文本没有页面图，文字放在第 1 页 segment', asyn
     assert.equal(result.images.length, 0);
     assert.equal(result.segments.length, 1);
     assert.equal(result.segments[0].page, 1);
+    assert.equal(result.segments[0].source, 'text');
+    assert.equal(result.segments[0].origin, 'file');
     assert.match(result.segments[0].text, /Alpha Bravo Charlie/);
-    assert.equal(result.transcript.source, 'ocr');
+    assert.equal(result.transcript.source, 'text');
+    assert.equal(result.transcript.origin, 'file');
     assert.ok(result.warnings.some((warning) => /no page images/.test(warning)));
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -610,15 +666,15 @@ test('locate：文本 PDF 页码匹配 + includeFrame 返回最佳匹配页', {
     assert.equal(best.rank, 1);
     assert.equal(best.page, 3);
     assert.equal(best.score, 1);
-    assert.equal(best.source, 'ocr');
-    assert.equal(best.origin, 'ocr');
+    assert.equal(best.source, 'text');
+    assert.equal(best.origin, 'textlayer');
     assert.equal(best.startMs, null);
     assert.equal(best.endMs, null);
     assert.equal(best.startSec, null);
     assert.equal(best.endSec, null);
     assert.match(best.text, /SIX SEVEN EIGHT NINE TEN/);
-    assert.equal(result.transcript.source, 'ocr');
-    assert.equal(result.transcript.origin, 'ocr');
+    assert.equal(result.transcript.source, 'text');
+    assert.equal(result.transcript.origin, 'textlayer');
 
     assert.ok(result.frame, 'includeFrame must return a frame');
     assert.equal(result.frame.page, 3);
@@ -654,8 +710,8 @@ test('locate：纯文本可搜，includeFrame 降级为 warning', async () => {
     });
     assert.equal(result.matches.length, 1);
     assert.equal(result.matches[0].page, 1);
-    assert.equal(result.matches[0].source, 'ocr');
-    assert.equal(result.matches[0].origin, 'ocr');
+    assert.equal(result.matches[0].source, 'text');
+    assert.equal(result.matches[0].origin, 'file');
     assert.equal(result.totalSegments, 1);
     assert.equal(result.frame, null);
     assert.ok(result.warnings.some((warning) => /no page image/.test(warning)));
