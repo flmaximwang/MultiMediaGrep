@@ -8,7 +8,8 @@
 //   - 首次写入从 probe.annotationOutline 导入 n1…nN（页 → rect.y → rect.x），与读侧派生一致；
 //   - 视频缺省 end = start + 5 s（截到时长）；
 //   - 损坏 sidecar 绝不覆盖；嵌入失败 / 检查项失败 → sidecar 不变、无临时文件；
-//   - 默认嵌入器是 9z5.38.2 / 9z5.38.3 的占位：TOOL_NOT_FOUND 且什么都不写；
+//   - 默认 PDF 嵌入器是 9z5.38.2 的占位：TOOL_NOT_FOUND 且什么都不写；
+//     视频 / 音频嵌入器从 9z5.38.3 起是真实现（写 .mmgrep.annotation.vtt，不改媒体）；
 //   - 图片 / 无嵌入器时只写 sidecar；导入的 raw / 不可新建类型原样保留。
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
@@ -610,7 +611,8 @@ test('embedder: null 明确只写 sidecar（不嵌入、不报错）', async (t)
 });
 
 /* ------------------------------------------------------------------ *
- * 默认嵌入器是 9z5.38.2 / 9z5.38.3 的占位：TOOL_NOT_FOUND 且什么都不写
+ * 默认嵌入器：PDF 仍是 9z5.38.2 的占位（TOOL_NOT_FOUND 且什么都不写）；
+ * 视频 / 音频从 9z5.38.3 起是真实现（写 .mmgrep.annotation.vtt，不改媒体）
  * ------------------------------------------------------------------ */
 
 test('默认 PDF 嵌入器（占位）：TOOL_NOT_FOUND，不写 sidecar、无临时文件', async (t) => {
@@ -630,21 +632,24 @@ test('默认 PDF 嵌入器（占位）：TOOL_NOT_FOUND，不写 sidecar、无�
   assert.deepEqual(await listTemps(ws.dir), []);
 });
 
-test('默认 VTT 嵌入器（占位）：TOOL_NOT_FOUND，不写 sidecar 也不写 VTT', async (t) => {
+test('默认 VTT 嵌入器（9z5.38.3 起是真实现）：写 VTT + sidecar，媒体文件不变', async (t) => {
   const ws = await makeWorkspace();
   t.after(ws.cleanup);
 
-  const error = await errorOf(annotationEngine.execute({
+  const result = await annotationEngine.execute({
     filePath: ws.video,
     media: 'video',
     probe: videoProbe(),
     operations: { add: [{ note: 'x', start: 1 }] },
     context: { author: 'Agent' },
-  }));
-  assert.equal(error.code, 'TOOL_NOT_FOUND');
-  assert.match(error.message, /MultiMediaGrep-9z5\.38\.3/);
-  assert.equal(existsSync(annotationEngine.sidecarPath(ws.video)), false);
-  assert.equal(existsSync(`${ws.video}.mmgrep.annotation.vtt`), false);
+  });
+  assert.deepEqual(result.embed.checks.map((check) => [check.name, check.ok]), [
+    ['vtt-readback', true],
+    ['media-unchanged', true],
+  ]);
+  assert.equal(result.embed.target, `${ws.video}.mmgrep.annotation.vtt`);
+  assert.equal(existsSync(annotationEngine.sidecarPath(ws.video)), true);
+  assert.equal(existsSync(`${ws.video}.mmgrep.annotation.vtt`), true);
   assert.deepEqual(await listTemps(ws.dir), []);
 });
 

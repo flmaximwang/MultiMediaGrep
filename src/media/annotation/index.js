@@ -69,9 +69,15 @@ export {
 } from './embedders.js';
 
 export { pdfAnnotationEmbedder, PDF_ANNOTATION_EMBED_TARGET } from './embedder-pdf.js';
-export { ANNOTATION_VTT_SUFFIX, annotationVttPathFor, vttAnnotationEmbedder } from './embedder-vtt.js';
+export {
+  ANNOTATION_VTT_SUFFIX,
+  annotationVttPathFor,
+  buildAnnotationVttCues,
+  parseAnnotationVtt,
+  vttAnnotationEmbedder,
+} from './embedder-vtt.js';
 
-/** media_annotate 的通用引擎实例（pdf/video/audio 嵌入器在 38.1 是 TOOL_NOT_FOUND 占位） */
+/** media_annotate 的通用引擎实例（pdf 嵌入器在 38.1 是 TOOL_NOT_FOUND 占位；video/audio 在 38.3 起写 VTT） */
 export const annotationEngine = createSidecarEngine({
   label: 'media_annotate',
   idPrefix: ANNOTATION_ID_PREFIX,
