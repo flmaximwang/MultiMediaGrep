@@ -15,9 +15,11 @@
 // = 图片只写 sidecar（不写任何多余文件）；video/audio 写
 // <basename>.mmgrep.annotation.vtt（从不改媒体文件）；pdf 原地写批注对象。
 //
-// 9z5.38.1 的默认注册表里 pdf / video / audio 都是**占位实现**：抛
-// TOOL_NOT_FOUND（分别由 9z5.38.2 / 9z5.38.3 填充）。因此默认配置下批注必须
-// 什么都不写；工具层可以注入假嵌入器（测试）或 null（只写 sidecar）。
+// 9z5.38.3 起：video / audio 已经是**真实现**（写
+// <basename>.mmgrep.annotation.vtt，从不改媒体文件）；pdf 仍是 9z5.38.2 的
+// TOOL_NOT_FOUND 占位（抛错 ⇒ sidecar 也不写）。
+//
+// 工具层可以注入假嵌入器（测试）或 null（只写 sidecar）。
 // ===================================================================
 
 import { pdfAnnotationEmbedder } from './embedder-pdf.js';

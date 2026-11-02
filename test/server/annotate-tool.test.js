@@ -1,8 +1,9 @@
 // test/server/annotate-tool.test.js —— media_annotate 的 MCP 注册与调用（9z5.38.1）
 //
-// 走真实 MCP 协议（InMemoryTransport），后端是 stub，嵌入器是假的：
-// 本 ticket 只验证工具骨架（schema / author 回退 / 结果格式 / 全有或全无），
-// 不验证真实 PDF 批注对象与 VTT 写入（那是 9z5.38.2 / 9z5.38.3）。
+// 走真实 MCP 协议（InMemoryTransport），后端是 stub，PDF 嵌入器是假的：
+// 本文件验证工具骨架（schema / author 回退 / 结果格式 / 全有或全无），
+// 不验证真实 PDF 批注对象（那是 9z5.38.2）；视频嵌入从 9z5.38.3 起是真实现，
+// 这里只验证它写出了 sidecar + <源文件>.mmgrep.annotation.vtt。
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -487,7 +488,7 @@ test('非法操作：一次列出所有错误、什么都不写、不调嵌入�
   }, { annotationEmbedders: annotationEmbedders({ pdf }) });
 });
 
-test('默认嵌入器是占位：TOOL_NOT_FOUND，不写 sidecar、无临时文件（PDF 与视频都一样）', async (t) => {
+test('默认嵌入器：PDF 仍是 9z5.38.2 的占位（TOOL_NOT_FOUND）；视频从 9z5.38.3 起写真实 VTT', async (t) => {
   const ws = await makeWorkspace();
   t.after(ws.cleanup);
 
@@ -499,18 +500,21 @@ test('默认嵌入器是占位：TOOL_NOT_FOUND，不写 sidecar、无临时文�
     assert.equal(pdf.isError, true);
     assert.equal(errorCode(pdf), 'TOOL_NOT_FOUND');
     assert.match(errorText(pdf), /MultiMediaGrep-9z5\.38\.2/);
+    assert.equal(existsSync(`${ws.files.pdf}.mmgrep.annotation.json`), false);
 
+    // 9z5.38.3：视频嵌入器是真实现 → 写 sidecar + <源文件>.mmgrep.annotation.vtt
     const video = await client.callTool({
       name: 'media_annotate',
       arguments: { path: ws.files.video, add: [{ note: 'x', start: 1 }] },
     });
-    assert.equal(video.isError, true);
-    assert.equal(errorCode(video), 'TOOL_NOT_FOUND');
-    assert.match(errorText(video), /MultiMediaGrep-9z5\.38\.3/);
-
-    assert.equal(existsSync(`${ws.files.pdf}.mmgrep.annotation.json`), false);
-    assert.equal(existsSync(`${ws.files.video}.mmgrep.annotation.json`), false);
-    assert.equal(existsSync(`${ws.files.video}.mmgrep.annotation.vtt`), false);
+    assert.notEqual(video.isError, true, errorText(video));
+    assert.equal(video.structuredContent.embed.target, `${ws.files.video}.mmgrep.annotation.vtt`);
+    assert.deepEqual(video.structuredContent.embed.checks.map((check) => [check.name, check.ok]), [
+      ['vtt-readback', true],
+      ['media-unchanged', true],
+    ]);
+    assert.equal(existsSync(`${ws.files.video}.mmgrep.annotation.json`), true);
+    assert.equal(existsSync(`${ws.files.video}.mmgrep.annotation.vtt`), true);
     assert.deepEqual(await listTemps(ws.dir), []);
   });
 });
