@@ -584,18 +584,10 @@ test('引擎参数化：id 前缀与 sidecar 后缀可换（media_annotate 的�
   assert.ok(result.sidecarPath.endsWith('.mmgrep.annotation.json'));
 });
 
-test('默认嵌入器注册表：PDF / VTT 写入器仍是 stub，报「尚未实现」并指出对应 ticket', async (t) => {
+// PDF 写入器已由 9z5.37.2 实现（test/media/pdf-embedder.test.js 覆盖）；这里只剩 VTT。
+test('默认嵌入器注册表：VTT 写入器仍是 stub，报「尚未实现」并指出对应 ticket', async (t) => {
   const ws = await makeWorkspace();
   t.after(ws.cleanup);
-
-  const pdfError = await errorOf(bookmarkEngine.execute({
-    filePath: ws.pdf,
-    media: 'pdf',
-    probe: pdfProbe([]),
-    operations: { add: [{ title: 'One', page: 1 }] },
-  }));
-  assert.equal(pdfError.code, 'TOOL_NOT_FOUND');
-  assert.match(pdfError.message, /not implemented yet \(ticket 9z5\.37\.2\)/);
 
   const videoError = await errorOf(bookmarkEngine.execute({
     filePath: ws.video,
