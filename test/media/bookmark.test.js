@@ -583,21 +583,3 @@ test('引擎参数化：id 前缀与 sidecar 后缀可换（media_annotate 的�
   assert.deepEqual(result.outline.entries, [{ id: 'n1', title: 'Note', page: 2, level: 1 }]);
   assert.ok(result.sidecarPath.endsWith('.mmgrep.annotation.json'));
 });
-
-test('默认嵌入器注册表：PDF 写入器仍是 stub，报「尚未实现」并指出对应 ticket', async (t) => {
-  const ws = await makeWorkspace();
-  t.after(ws.cleanup);
-
-  const pdfError = await errorOf(bookmarkEngine.execute({
-    filePath: ws.pdf,
-    media: 'pdf',
-    probe: pdfProbe([]),
-    operations: { add: [{ title: 'One', page: 1 }] },
-  }));
-  assert.equal(pdfError.code, 'TOOL_NOT_FOUND');
-  assert.match(pdfError.message, /not implemented yet \(ticket 9z5\.37\.2\)/);
-
-  // 视频/音频的 VTT 写入器已由 9z5.37.4 实现，真实写入见 test/media/vtt-embedder.test.js
-  assert.equal(existsSync(ws.sidecar), false);
-  assert.deepEqual(await listTemps(ws.dir), []);
-});

@@ -352,23 +352,9 @@ test('图片：没有嵌入器，只写 sidecar（嵌入目标为 null）', asyn
  * 调用：失败路径
  * ------------------------------------------------------------------ */
 
-test('默认嵌入器仍是 stub：PDF 写入报 TOOL_NOT_FOUND（9z5.37.2），不写 sidecar', async (t) => {
-  const ws = await makeWorkspace();
-  t.after(ws.cleanup);
-
-  await withClient(ws, async (client) => {
-    const result = await client.callTool({
-      name: 'media_bookmark',
-      arguments: { path: ws.files.pdf, add: [{ title: 'One', page: 1 }] },
-    });
-    assert.equal(result.isError, true);
-    assert.equal(errorCode(result), 'TOOL_NOT_FOUND');
-    assert.match(result.content[0].text, /not implemented yet \(ticket 9z5\.37\.2\)/);
-    assert.equal(existsSync(`${ws.files.pdf}.mmgrep.bookmark.json`), false);
-    assert.deepEqual(await readFile(ws.files.pdf), PDF);
-    assert.deepEqual(await listTemps(ws.dir), []);
-  });
-});
+// PDF 写入器已由 9z5.37.2 实现，原来的「默认嵌入器是 stub」用例已失效；
+// 真实 PDF 写入器的失败路径（原文件不变、不留临时文件）覆盖在
+// test/media/pdf-embedder.test.js，工具层的失败注入见下面的 fakePdfEmbedder 用例。
 
 test('非法操作：一次列出所有错误、什么都不写', async (t) => {
   const ws = await makeWorkspace();
