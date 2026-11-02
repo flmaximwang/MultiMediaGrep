@@ -188,13 +188,13 @@ function errorCode(result) {
  * 工具目录
  * ------------------------------------------------------------------ */
 
-test('listTools：5 个工具、描述带中文触发词、schema 完整', async () => {
+test('listTools：6 个工具、描述带中文触发词、schema 完整', async () => {
   const workspace = await makeWorkspace();
   try {
     await withClient(workspace, async (client) => {
       const listed = await client.listTools();
       assert.deepEqual(listed.tools.map((tool) => tool.name), [
-        'media_probe', 'media_overview', 'media_zoom', 'media_locate', 'media_bookmark',
+        'media_probe', 'media_overview', 'media_zoom', 'media_locate', 'media_bookmark', 'media_annotate',
       ]);
       const byName = Object.fromEntries(listed.tools.map((tool) => [tool.name, tool]));
 
@@ -233,6 +233,27 @@ test('listTools：5 个工具、描述带中文触发词、schema 完整', async
         idempotentHint: false,
         openWorldHint: false,
       });
+
+      // media_annotate：第 6 个工具，schema 与 media_bookmark 同构（path + author + 三种操作）
+      assert.deepEqual(Object.keys(byName.media_annotate.inputSchema.properties).sort(), [
+        'add', 'author', 'path', 'remove', 'update',
+      ]);
+      assert.deepEqual(byName.media_annotate.annotations, {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      });
+      assert.match(byName.media_annotate.description, /批注/);
+      assert.match(byName.media_annotate.description, /注释/);
+      assert.match(byName.media_annotate.description, /评论/);
+      assert.match(byName.media_annotate.description, /annotate/i);
+      assert.match(byName.media_annotate.description, /comment/i);
+      assert.match(byName.media_annotate.description, /note/i);
+      assert.match(byName.media_annotate.description, /IN PLACE/);
+      assert.match(byName.media_annotate.description, /\*\.mmgrep\.\*/);
+      assert.match(byName.media_annotate.description, /OVERWRITTEN/);
+      assert.match(byName.media_annotate.description, /git/);
 
       // 参数 describe 里标注了适用媒体类型
       const overview = byName.media_overview.inputSchema.properties;

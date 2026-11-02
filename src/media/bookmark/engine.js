@@ -116,6 +116,8 @@ export function applyOperations({
   limits = {},
   idPrefix = BOOKMARK_ID_PREFIX,
   adapter = bookmarkEntryAdapter,
+  idNoun = 'bookmark',
+  context = {},
 }) {
   const pre = Array.isArray(entries) ? entries : [];
   const { ops, errors } = normalizeOperations(operations);
@@ -135,7 +137,7 @@ export function applyOperations({
       return;
     }
     if (!isEntryId(rawId, idPrefix)) {
-      errors.push(`${label}: ${describeValue(rawId)} is not a valid bookmark id (expected ${idPrefix}1, ${idPrefix}2, …)`);
+      errors.push(`${label}: ${describeValue(rawId)} is not a valid ${idNoun} id (expected ${idPrefix}1, ${idPrefix}2, …)`);
       return;
     }
     if (removeSet.has(rawId)) {
@@ -160,7 +162,7 @@ export function applyOperations({
       errors.push(`${label}: id ${describeValue(rawId)} is also in remove (the entry would not exist)`);
       return;
     }
-    const { patch, errors: patchErrors } = adapter.validateUpdate(raw, { media, limits, label, idPrefix });
+    const { patch, errors: patchErrors } = adapter.validateUpdate(raw, { media, limits, label, idPrefix, context });
     errors.push(...patchErrors);
     if (!patch) return;
     if (updateSeen.has(raw.id)) {
@@ -177,6 +179,7 @@ export function applyOperations({
       media,
       durationSec: limits.durationSec,
       label,
+      context,
     });
     errors.push(...applyErrors);
     if (!entry) return;
@@ -191,11 +194,11 @@ export function applyOperations({
     const label = `add[${index}]`;
     if (raw !== null && typeof raw === 'object' && raw.id !== undefined) {
       errors.push(`${label}: must not include "id" (ids are assigned by the server; remove the old entry and add a new one to change an id)`);
-      const { errors: addErrors } = adapter.validateAdd({ ...raw, id: undefined }, { media, limits, label });
+      const { errors: addErrors } = adapter.validateAdd({ ...raw, id: undefined }, { media, limits, label, context });
       errors.push(...addErrors);
       return;
     }
-    const { entry, errors: addErrors } = adapter.validateAdd(raw, { media, limits, label });
+    const { entry, errors: addErrors } = adapter.validateAdd(raw, { media, limits, label, context });
     errors.push(...addErrors);
     if (!entry) return;
     const id = `${idPrefix}${counter}`;
@@ -240,7 +243,8 @@ function normalizeEmbedResult(result, media) {
 }
 
 /**
- * 创建 sidecar 引擎。书签用默认参数；9z5.38.1 传自己的 adapter / idPrefix / sidecarSuffix。
+ * 创建 sidecar 引擎。书签用默认参数；media_annotate 传自己的 adapter / idPrefix /
+ * sidecarSuffix / deriveEntries / resultKey（9z5.38.1 起复用同一份实现）。
  *
  * @param {{
  *   label?: string,                  // 错误信息里的工具名
@@ -248,6 +252,11 @@ function normalizeEmbedResult(result, media) {
  *   sidecarSuffix?: string,          // '.mmgrep.bookmark.json'
  *   adapter?: object,                // 条目 schema 适配器
  *   embedders?: Record<string, object>|null, // 默认嵌入器注册表
+ *   deriveEntries?: Function,        // 首次写入的导入函数 (media, probe, {idPrefix}) → entries
+ *   resultKey?: string,              // 结果对象里条目列表的键（书签 'outline' / 批注 'annotations'）
+ *   idNoun?: string,                 // 错误信息里的 id 名词（'bookmark' / 'annotation'）
+ *   sidecarNoun?: string,            // 错误信息里的 sidecar 名词（'bookmark' / 'annotation'）
+ *   imageSidecarDetail?: string,     // 图片没有嵌入器时的检查说明
  * }} [options]
  */
 export function createSidecarEngine({
@@ -256,6 +265,11 @@ export function createSidecarEngine({
   sidecarSuffix = BOOKMARK_SIDECAR_SUFFIX,
   adapter = bookmarkEntryAdapter,
   embedders = defaultBookmarkEmbedders,
+  deriveEntries = deriveEntriesFromProbe,
+  resultKey = 'outline',
+  idNoun = 'bookmark',
+  sidecarNoun = 'bookmark',
+  imageSidecarDetail = 'image: no native outline; the sidecar is the only store',
 } = {}) {
   return {
     label,
@@ -263,6 +277,10 @@ export function createSidecarEngine({
     sidecarSuffix,
     adapter,
     embedders,
+    deriveEntries,
+    resultKey,
+    idNoun,
+    sidecarNoun,
 
     /** 源文件 → 它的 sidecar 路径 */
     sidecarPath(filePath) {
@@ -279,22 +297,32 @@ export function createSidecarEngine({
      *   operations: object,            // { add?, remove?, update? }
      *   embedder?: object|null,        // undefined = 用注册表；null = 明确不嵌入
      *   signal?: AbortSignal|null,
+     *   context?: object,              // 传给 adapter 的调用级上下文（批注用 { author }）
      * }} input
      */
-    async execute({ filePath, media, probe = null, operations, embedder = undefined, signal = null }) {
+    async execute({
+      filePath,
+      media,
+      probe = null,
+      operations,
+      embedder = undefined,
+      signal = null,
+      context = {},
+    }) {
       throwIfAborted(signal);
       const resolvedPath = path.resolve(String(filePath));
       const resolvedSidecarPath = sidecarPathFor(resolvedPath, sidecarSuffix);
+      const sidecarOptions = { media, idPrefix, adapter, noun: sidecarNoun, toolName: label };
 
       // 1) 读 sidecar —— 坏了就报错，绝不覆盖
-      const existing = await readSidecar(resolvedSidecarPath, { media, idPrefix });
+      const existing = await readSidecar(resolvedSidecarPath, sidecarOptions);
       const created = !existing.exists;
 
       // 2) 首次写入：从文件自带目录导入
       let baseEntries = existing.entries;
       let imported = 0;
       if (created) {
-        baseEntries = deriveEntriesFromProbe(media, probe, { idPrefix });
+        baseEntries = deriveEntries(media, probe, { idPrefix });
         imported = baseEntries.length;
       }
 
@@ -308,6 +336,8 @@ export function createSidecarEngine({
         limits,
         idPrefix,
         adapter,
+        idNoun,
+        context,
       });
       if (!plan.ok) {
         throw new ToolError(
@@ -353,7 +383,7 @@ export function createSidecarEngine({
                 ok: true,
                 detail:
                   media === 'image'
-                    ? 'image: no native outline; the sidecar is the only store'
+                    ? imageSidecarDetail
                     : `no embedder registered for "${media}"; only the sidecar is written`,
               },
             ],
@@ -365,7 +395,7 @@ export function createSidecarEngine({
       // 5) 原子写 sidecar
       throwIfAborted(signal);
       try {
-        await writeSidecar(resolvedSidecarPath, media, plan.entries, { signal });
+        await writeSidecar(resolvedSidecarPath, media, plan.entries, { signal, adapter });
       } catch (error) {
         // 嵌入已完成而 sidecar 写失败：必须如实报告，避免用户以为什么都没写
         if (error instanceof ToolError) {
@@ -379,7 +409,7 @@ export function createSidecarEngine({
       }
 
       // 6) 回读校验
-      const readBack = await readSidecar(resolvedSidecarPath, { media, idPrefix });
+      const readBack = await readSidecar(resolvedSidecarPath, sidecarOptions);
       const expected = JSON.stringify(plan.entries);
       const actual = JSON.stringify(readBack.entries);
       if (expected !== actual) {
@@ -404,7 +434,7 @@ export function createSidecarEngine({
         applied: plan.applied,
         embed: { target: embed.target, checks: embed.checks },
         checks: [...embed.checks, readbackCheck],
-        outline: {
+        [resultKey]: {
           source: 'sidecar',
           available: true,
           total: plan.entries.length,

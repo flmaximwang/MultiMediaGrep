@@ -22,18 +22,28 @@ import { SIDECAR_VERSION, canonicalEntry, isEntryId, sortEntries, validateStored
 /** sidecar 文件后缀（书签）；9z5.38.1 的注释侧车用 `.mmgrep.annotation.json` */
 export const BOOKMARK_SIDECAR_SUFFIX = '.mmgrep.bookmark.json';
 
+/**
+ * 默认（书签）sidecar 适配器：条目校验 / 规范化 / 排序。
+ * media_annotate 传自己的 adapter，其余读写逻辑完全共用。
+ */
+export const BOOKMARK_SIDECAR_ADAPTER = Object.freeze({
+  validateStored: (raw, options) => validateStoredEntry(raw, options),
+  canonical: (media, raw) => canonicalEntry(media, raw),
+  sort: (entries, media) => sortEntries(entries, media),
+});
+
 /** 源文件旁边的 sidecar 路径：`/a/b/report.pdf` → `/a/b/report.pdf.mmgrep.bookmark.json` */
 export function sidecarPathFor(filePath, suffix = BOOKMARK_SIDECAR_SUFFIX) {
   const resolved = path.resolve(String(filePath));
   return path.join(path.dirname(resolved), `${path.basename(resolved)}${suffix}`);
 }
 
-function corruptedSidecar(sidecarPath, details, hint = null) {
+function corruptedSidecar(sidecarPath, details, { noun = 'bookmark', toolName = 'media_bookmark', hint = null } = {}) {
   const lines = details.map((detail) => `  - ${detail}`);
   return new ToolError(
     'INVALID_ARGUMENT',
-    `the bookmark sidecar "${sidecarPath}" is corrupted, so nothing was written:\n${lines.join('\n')}`,
-    hint ?? 'Fix or delete the sidecar file, then call media_bookmark again. The sidecar was not modified.',
+    `the ${noun} sidecar "${sidecarPath}" is corrupted, so nothing was written:\n${lines.join('\n')}`,
+    hint ?? `Fix or delete the sidecar file, then call ${toolName} again. The sidecar was not modified.`,
   );
 }
 
@@ -41,18 +51,27 @@ function corruptedSidecar(sidecarPath, details, hint = null) {
  * 解析并校验 sidecar 文本。
  *
  * @param {string} text 文件内容
- * @param {{sidecarPath: string, media: string, idPrefix: string}} options
+ * @param {{sidecarPath: string, media: string, idPrefix: string, adapter?: object,
+ *          noun?: string, toolName?: string}} options
  * @returns {Array<object>} 排序后的条目（结构合法）
  */
-export function parseSidecarText(text, { sidecarPath, media, idPrefix }) {
+export function parseSidecarText(text, {
+  sidecarPath,
+  media,
+  idPrefix,
+  adapter = BOOKMARK_SIDECAR_ADAPTER,
+  noun = 'bookmark',
+  toolName = 'media_bookmark',
+}) {
+  const context = { noun, toolName };
   let parsed;
   try {
     parsed = JSON.parse(text);
   } catch (error) {
-    throw corruptedSidecar(sidecarPath, [`it is not valid JSON: ${error?.message ?? error}`]);
+    throw corruptedSidecar(sidecarPath, [`it is not valid JSON: ${error?.message ?? error}`], context);
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw corruptedSidecar(sidecarPath, ['the top level must be a JSON object { version, media, entries }']);
+    throw corruptedSidecar(sidecarPath, ['the top level must be a JSON object { version, media, entries }'], context);
   }
 
   const details = [];
@@ -69,7 +88,7 @@ export function parseSidecarText(text, { sidecarPath, media, idPrefix }) {
   const entries = [];
   if (Array.isArray(parsed.entries)) {
     for (let index = 0; index < parsed.entries.length; index += 1) {
-      const { entry, errors } = validateStoredEntry(parsed.entries[index], {
+      const { entry, errors } = adapter.validateStored(parsed.entries[index], {
         media,
         idPrefix,
         label: `entries[${index}]`,
@@ -87,8 +106,8 @@ export function parseSidecarText(text, { sidecarPath, media, idPrefix }) {
     }
   }
 
-  if (details.length > 0) throw corruptedSidecar(sidecarPath, details);
-  return sortEntries(entries, media);
+  if (details.length > 0) throw corruptedSidecar(sidecarPath, details, context);
+  return adapter.sort(entries, media);
 }
 
 /**
@@ -96,23 +115,34 @@ export function parseSidecarText(text, { sidecarPath, media, idPrefix }) {
  *
  * @returns {Promise<{exists: boolean, path: string, entries: Array<object>}>}
  */
-export async function readSidecar(sidecarPath, { media, idPrefix }) {
+export async function readSidecar(sidecarPath, {
+  media,
+  idPrefix,
+  adapter = BOOKMARK_SIDECAR_ADAPTER,
+  noun = 'bookmark',
+  toolName = 'media_bookmark',
+}) {
+  const context = { noun, toolName };
   let text;
   try {
     text = await readFile(sidecarPath, 'utf8');
   } catch (error) {
     if (error?.code === 'ENOENT') return { exists: false, path: sidecarPath, entries: [] };
-    throw corruptedSidecar(sidecarPath, [`it cannot be read: ${error?.message ?? error}`]);
+    throw corruptedSidecar(sidecarPath, [`it cannot be read: ${error?.message ?? error}`], context);
   }
-  return { exists: true, path: sidecarPath, entries: parseSidecarText(text, { sidecarPath, media, idPrefix }) };
+  return {
+    exists: true,
+    path: sidecarPath,
+    entries: parseSidecarText(text, { sidecarPath, media, idPrefix, adapter, ...context }),
+  };
 }
 
 /** 条目数组 → sidecar JSON 文本（规范化字段顺序 + 两空格缩进 + 结尾换行） */
-export function serializeSidecar(media, entries) {
+export function serializeSidecar(media, entries, { adapter = BOOKMARK_SIDECAR_ADAPTER } = {}) {
   const document = {
     version: SIDECAR_VERSION,
     media,
-    entries: entries.map((entry) => canonicalEntry(media, entry)),
+    entries: entries.map((entry) => adapter.canonical(media, entry)),
   };
   return `${JSON.stringify(document, null, 2)}\n`;
 }
@@ -176,8 +206,8 @@ export async function writeFileAtomic(targetPath, text, { signal = null } = {}) 
 }
 
 /** 写 sidecar（原子）。调用方负责先完成嵌入；嵌入失败时不会走到这里。 */
-export async function writeSidecar(sidecarPath, media, entries, { signal = null } = {}) {
-  const text = serializeSidecar(media, entries);
+export async function writeSidecar(sidecarPath, media, entries, { signal = null, adapter = BOOKMARK_SIDECAR_ADAPTER } = {}) {
+  const text = serializeSidecar(media, entries, { adapter });
   await writeFileAtomic(sidecarPath, text, { signal });
   return text;
 }

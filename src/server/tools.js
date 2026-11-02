@@ -1,4 +1,4 @@
-// src/server/tools.js —— 5 个 MCP 工具的定义与 handler
+// src/server/tools.js —— 6 个 MCP 工具的定义与 handler
 //
 // 分工（重要）：
 //   - 本文件负责**参数校验 + 分派 + 结果信封**（content blocks / structuredContent / 文本清单）。
@@ -26,6 +26,15 @@ import {
   embedderFor as bookmarkEmbedderFor,
   formatEntry as formatBookmarkEntry,
 } from '../media/bookmark/index.js';
+import {
+  ANNOTATION_ID_PREFIX,
+  DEFAULT_ANNOTATION_AUTHOR,
+  MAX_AUTHOR_CHARS,
+  annotationEngine,
+  annotationEmbedderFor,
+  formatAnnotation,
+  normalizeAuthor,
+} from '../media/annotation/index.js';
 import {
   METHOD_MATRIX,
   ToolError,
@@ -268,6 +277,46 @@ After the write, media_probe / media_overview / media_locate show this outline (
 file's native one. The result contains the full outline, the sidecar path, the embed target, and every
 check result. (书签 / 目录 / 章节 / bookmark / outline / chapter)`;
 
+export const ANNOTATE_DESCRIPTION = `Write annotations (notes, comments, sticky notes, highlighted areas) into a local media file so they
+survive across sessions and are visible to humans in the file itself: real PDF annotation objects for a
+PDF, a sidecar VTT for video/audio, and a sidecar JSON for every supported media type.
+(写入批注 / 注释 / 评论 / 标注：PDF 原地写真正的批注对象；视频、音频写同名
+.mmgrep.annotation.vtt；所有类型都写 <file>.mmgrep.annotation.json 侧车。
+中文触发词：批注、注释、评论、标注、annotate、comment、note。)
+
+The sidecar "<file>.mmgrep.annotation.json" is the single source of truth. The first write (no sidecar
+yet) imports the file's own annotations (9z5.38.2 wires the reader; for now the list is empty), then
+applies this call. Entries are anchored per media type:
+- PDF: page (1-based PHYSICAL page) + type ("text" = sticky note, "square" = rectangle area; "square"
+  also needs rect {x,y,width,height} as fractions 0..1 of the page). Other annotation types cannot be
+  created in this version, but imported ones are kept verbatim, including their raw geometry.
+- video/audio: start (seconds, < duration) and optional end (default start + 5 s, clipped to the end of
+  the media). No page, no rect, no type.
+- image: rect only (fractions of the image); no page, start/end or type.
+- every entry: note (plain text, 1..4000 characters, newlines allowed) and, for PDF, type.
+
+Ids are n1, n2, …; new ids are max+1 and are never reused by this call; update keeps the id.
+One call can mix add / remove / update; they are applied remove → update → add, all-or-nothing: if
+anything is invalid, nothing is written and every problem is listed at once (unknown id, bad field,
+page/time out of range, duplicate ids, malformed entry, …).
+
+The author is resolved once per call: the "author" argument, else the MCP client's name, else
+"${DEFAULT_ANNOTATION_AUTHOR}". The model name is never used. Imported annotations keep their original
+author; update never changes it.
+
+WARNING — this tool modifies files:
+- A PDF is modified IN PLACE: annotation objects are written into the PDF file itself, no copy is made
+  (the page content is not rewritten). Video and audio files are never modified — only the VTT is written.
+- Files are written NEXT TO the source: a *.mmgrep.* sidecar for every media type, plus
+  *.mmgrep.annotation.vtt for video/audio. They are not written into the cache directory.
+- When a sidecar already exists, external edits to the file's own annotations are OVERWRITTEN on the next
+  write. To change an annotation, use update; the sidecar wins over the file.
+- Protect your originals with git (or a backup) before calling this tool.
+
+The result lists every written annotation in the same shape the read side uses ("n1 (p.12): note",
+"n1 (00:12:34–00:12:39): note"), plus the sidecar path, the embed target, and every check result.
+(批注 / 注释 / 评论 / 标注 / annotate / comment / note)`;
+
 /* ------------------------------------------------------------------ *
  * 参数 schema
  *
@@ -401,6 +450,44 @@ const BOOKMARK_UPDATE_PARAM = z.array(BOOKMARK_ENTRY_INPUT).optional().describe(
   'Entries to update: pass "id" plus at least one of title / page / start / end / level. The id never changes. (更新书签：保留 id，只改字段)',
 );
 
+// media_annotate 的条目参数。同样是 optional + passthrough + 引擎一次报全：
+// 必填、范围、按媒体类型的字段适用性、未知字段都由 annotation 适配器收集。
+const ANNOTATE_RECT_INPUT = z.object({
+  x: z.number().optional().describe('Left edge as a fraction of the page/image width, 0..1.'),
+  y: z.number().optional().describe('Top edge as a fraction of the page/image height, 0..1.'),
+  width: z.number().optional().describe('Width as a fraction, > 0, and x + width <= 1.'),
+  height: z.number().optional().describe('Height as a fraction, > 0, and y + height <= 1.'),
+}).passthrough();
+
+const ANNOTATE_ENTRY_INPUT = z.object({
+  id: z.string().optional().describe('Existing annotation id (n1, n2, …). Required for update; add must not include an id.'),
+  type: z.string().optional().describe('PDF only, required for add: "text" (sticky note) or "square" (rectangle area). "square" also needs rect.'),
+  note: z.string().optional().describe('The annotation text: plain text, 1..4000 characters, newlines allowed. Required for add; optional for update.'),
+  page: z.number().optional().describe('PDF only: 1-based PHYSICAL page number — the same numbers media_overview accepts. Required for add.'),
+  start: z.number().optional().describe('Video/audio only: start time in seconds (>= 0 and < duration). Required for add.'),
+  end: z.number().optional().describe('Video/audio only: end time in seconds (must be greater than start and <= duration). Omit it to default to start + 5 s, clipped to the media duration.'),
+  rect: ANNOTATE_RECT_INPUT.optional().describe('PDF "square" or image: rectangle {x, y, width, height} as fractions 0..1 of the page/image.'),
+}).passthrough();
+
+const ANNOTATE_ADD_PARAM = z.array(ANNOTATE_ENTRY_INPUT).optional().describe(
+  'Annotations to add. Each gets a new id (max+1); do not pass "id". '
+  + '(新增批注：note + type/page（PDF）或 start/end（视频/音频）或 rect（图片）)',
+);
+
+const ANNOTATE_REMOVE_PARAM = z.array(z.string()).optional().describe(
+  'Annotation ids to remove, e.g. ["n2"]. Unknown or duplicate ids are errors and nothing is written. (删除批注：n1、n2 …)',
+);
+
+const ANNOTATE_UPDATE_PARAM = z.array(ANNOTATE_ENTRY_INPUT).optional().describe(
+  'Annotations to update: pass "id" plus at least one of note / type / page / rect / start / end. The id and the author never change. (更新批注：保留 id，只改内容 / 位置)',
+);
+
+const AUTHOR_PARAM = z.string().optional().describe(
+  'Who is writing these annotations (stored in the sidecar and, for PDF, in the annotation). '
+  + `Defaults to the MCP client's name, then "${DEFAULT_ANNOTATION_AUTHOR}". `
+  + 'Imported annotations keep their original author; update never changes it. (批注作者)',
+);
+
 /** 每个工具的 zod raw shape（`.strict()`：未知参数直接拒绝，不静默吞掉） */
 export const TOOL_SHAPES = Object.freeze({
   media_probe: {
@@ -450,6 +537,13 @@ export const TOOL_SHAPES = Object.freeze({
     add: BOOKMARK_ADD_PARAM,
     remove: BOOKMARK_REMOVE_PARAM,
     update: BOOKMARK_UPDATE_PARAM,
+  },
+  media_annotate: {
+    path: PATH_PARAM,
+    author: AUTHOR_PARAM,
+    add: ANNOTATE_ADD_PARAM,
+    remove: ANNOTATE_REMOVE_PARAM,
+    update: ANNOTATE_UPDATE_PARAM,
   },
 });
 
@@ -2988,7 +3082,7 @@ function bookmarkMediaType(base, probed) {
   );
 }
 
-function summarizeBookmarkApplied(applied) {
+function summarizeApplied(applied) {
   const parts = [];
   if (applied.remove.length > 0) parts.push(`removed ${applied.remove.join(', ')}`);
   if (applied.update.length > 0) parts.push(`updated ${applied.update.join(', ')}`);
@@ -2996,7 +3090,7 @@ function summarizeBookmarkApplied(applied) {
   return parts.length > 0 ? parts.join('; ') : 'no changes';
 }
 
-function formatBookmarkChecks(checks) {
+function formatChecksSummary(checks) {
   if (!Array.isArray(checks) || checks.length === 0) return 'no checks';
   return checks
     .map((check) => `${check.name}: ${check.ok ? 'ok' : 'FAILED'}${check.detail ? ` (${check.detail})` : ''}`)
@@ -3032,10 +3126,10 @@ async function handleBookmark(args, call) {
   const lines = [
     `Bookmarks written for "${result.path}" (${result.media}): ${result.outline.total} entries`
       + `${result.created ? `; imported ${result.imported} from the file's own outline` : ''}.`,
-    `applied: ${summarizeBookmarkApplied(result.applied)}`,
+    `applied: ${summarizeApplied(result.applied)}`,
     `sidecar: ${result.sidecarPath}`,
     `embed target: ${result.embed.target ?? '(none — sidecar only)'}`,
-    `checks: ${formatBookmarkChecks(result.checks)}`,
+    `checks: ${formatChecksSummary(result.checks)}`,
     '',
     `OUTLINE (${result.outline.total} entries${result.media === 'pdf' ? ', physical pages' : ''}):`,
     formatBookmarkOutline(result.media, result.outline.entries),
@@ -3058,21 +3152,136 @@ async function handleBookmark(args, call) {
 }
 
 /* ------------------------------------------------------------------ *
+ * media_annotate —— 批注写入（sidecar 引擎 + 嵌入器）
+ *
+ * 与 media_bookmark 共用 src/media/bookmark/engine.js：批注自己的 schema、
+ * id 前缀 n、结果键 annotations 和错误文案都是引擎参数，流程不复制。
+ * 写入顺序仍然是「嵌入成功 → 原子写 sidecar」，嵌入失败时 sidecar 不变。
+ * ------------------------------------------------------------------ */
+
+/** 探测结果 → 批注媒体类型（pdf / video / audio / image），其它一律拒绝 */
+function annotationMediaType(base, probed) {
+  const mediaType = refineMediaType(probed, base.mediaType);
+  if (mediaType === 'video' || mediaType === 'audio') return mediaType;
+  if (mediaType === 'document') {
+    const container = typeof probed?.container === 'string' ? probed.container.toLowerCase() : '';
+    if (container === 'pdf') return 'pdf';
+    if (OUTLINE_IMAGE_CONTAINERS.has(container)) return 'image';
+    throw new ToolError(
+      'UNSUPPORTED_MEDIA_TYPE',
+      `media_annotate does not support this document (container: ${container || 'unknown'}).`,
+      'Annotations need a page position or a time range, so only PDF, image, video and audio are supported. '
+        + 'For a text or Office document, convert it to PDF first.',
+    );
+  }
+  throw new ToolError(
+    'UNSUPPORTED_MEDIA_TYPE',
+    `media_annotate does not support ${mediaType} media.`,
+    'Supported media: PDF, image, video and audio.',
+  );
+}
+
+/**
+ * 解析本次调用的作者：显式参数 → MCP initialize 的 clientInfo.name → "MultiMediaGrep"。
+ *
+ * 每次调用只解析一次（新批注都用它）；绝不使用模型名，也不读环境变量。
+ * 导入的批注保留原作者；update 不改作者。
+ *
+ * @param {string|undefined} explicitAuthor 调用参数 author
+ * @param {{name?: string}|null|undefined} clientInfo MCP initialize 里的 clientInfo
+ * @returns {string}
+ */
+function resolveAnnotationAuthor(explicitAuthor, clientInfo) {
+  if (explicitAuthor !== undefined && explicitAuthor !== null) {
+    const author = normalizeAuthor(explicitAuthor);
+    if (author === null) {
+      throw new ToolError(
+        'INVALID_ARGUMENT',
+        `author must be a non-empty string of at most ${MAX_AUTHOR_CHARS} characters `
+          + `(got ${JSON.stringify(explicitAuthor)}).`,
+        'Pass the human or agent name that should own these annotations, or omit "author" '
+          + 'to use the MCP client name.',
+      );
+    }
+    return author;
+  }
+  return normalizeAuthor(clientInfo?.name) ?? DEFAULT_ANNOTATION_AUTHOR;
+}
+
+function formatAnnotationList(media, entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return '(no annotations)';
+  return entries
+    .map((entry) => formatAnnotation(entry, { media, idPrefix: ANNOTATION_ID_PREFIX }))
+    .join('\n');
+}
+
+async function handleAnnotate(args, call) {
+  const base = await resolveMedia(args);
+  const probed = await internalProbe(base, {}, call);
+  const media = annotationMediaType(base, probed);
+  const author = resolveAnnotationAuthor(args.author, call.clientInfo);
+
+  // 注入点：测试 / 9z5.38.2 / 9z5.38.3 可以传自己的注册表；undefined = 默认注册表，null = 只写 sidecar
+  const embedder = call.annotationEmbedders === undefined
+    ? undefined
+    : annotationEmbedderFor(media, call.annotationEmbedders);
+
+  const result = await annotationEngine.execute({
+    filePath: base.path,
+    media,
+    probe: probed,
+    operations: { add: args.add, remove: args.remove, update: args.update },
+    embedder,
+    signal: call.signal,
+    context: { author },
+  });
+
+  const lines = [
+    `Annotations written for "${result.path}" (${result.media}): ${result.annotations.total} entries`
+      + `${result.created ? `; imported ${result.imported} from the file's own annotations` : ''}.`,
+    `author: ${author}`,
+    `applied: ${summarizeApplied(result.applied)}`,
+    `sidecar: ${result.sidecarPath}`,
+    `embed target: ${result.embed.target ?? '(none — sidecar only)'}`,
+    `checks: ${formatChecksSummary(result.checks)}`,
+    '',
+    `ANNOTATIONS (${result.annotations.total} entries${result.media === 'pdf' ? ', physical pages' : ''}):`,
+    formatAnnotationList(result.media, result.annotations.entries),
+  ];
+
+  return {
+    content: [{ type: 'text', text: lines.join('\n') }],
+    structuredContent: {
+      path: result.path,
+      media: result.media,
+      sidecarPath: result.sidecarPath,
+      created: result.created,
+      imported: result.imported,
+      applied: result.applied,
+      author,
+      embed: result.embed,
+      checks: result.checks,
+      annotations: result.annotations,
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * 注册
  * ------------------------------------------------------------------ */
 
 /** 只读工具（probe / overview / zoom / locate）：不写文件、不联网 */
 const READ_ONLY_ANNOTATIONS = Object.freeze({ readOnlyHint: true, openWorldHint: false });
 
-/** 写工具（bookmark）：改写源文件 / 在源文件旁写 sidecar，不可逆、非幂等 */
-const BOOKMARK_ANNOTATIONS = Object.freeze({
+/** 写工具（bookmark / annotate）：改写源文件 / 在源文件旁写 sidecar，不可逆、非幂等 */
+const WRITE_ANNOTATIONS = Object.freeze({
   readOnlyHint: false,
   destructiveHint: true,
   idempotentHint: false,
   openWorldHint: false,
 });
 
-/** 5 个工具的定义表（顺序即注册顺序） */
+/** 6 个工具的定义表（顺序即注册顺序） */
 export const TOOL_DEFINITIONS = Object.freeze([
   {
     name: 'media_probe',
@@ -3112,7 +3321,15 @@ export const TOOL_DEFINITIONS = Object.freeze([
     description: BOOKMARK_DESCRIPTION,
     shape: TOOL_SHAPES.media_bookmark,
     handler: handleBookmark,
-    annotations: BOOKMARK_ANNOTATIONS,
+    annotations: WRITE_ANNOTATIONS,
+  },
+  {
+    name: 'media_annotate',
+    title: 'Annotate',
+    description: ANNOTATE_DESCRIPTION,
+    shape: TOOL_SHAPES.media_annotate,
+    handler: handleAnnotate,
+    annotations: WRITE_ANNOTATIONS,
   },
 ]);
 
@@ -3147,8 +3364,13 @@ export function createProgressReporter({ tool, extra, config, logger = null }) {
   };
 }
 
-/** 每次调用共享的上下文 */
-export function createCallContext(runtime, extra, toolName) {
+/**
+ * 每次调用共享的上下文。
+ *
+ * `options.clientInfo` 是 MCP initialize 里客户端报的 clientInfo（stdio 与 HTTP 共用同一个
+ * McpServer，所以两条传输都能拿到）；media_annotate 用它做 author 回退的第二级。
+ */
+export function createCallContext(runtime, extra, toolName, { clientInfo = null } = {}) {
   const onProgress = createProgressReporter({
     tool: toolName,
     extra,
@@ -3162,8 +3384,11 @@ export function createCallContext(runtime, extra, toolName) {
     logger: runtime.logger,
     cache: runtime.cache ?? null,
     dispatcher: runtime.dispatcher,
-    // media_bookmark 的嵌入器注册表：undefined = 默认注册表，null = 明确只写 sidecar
+    // 嵌入器注册表：undefined = 默认注册表，null = 明确只写 sidecar
     bookmarkEmbedders: runtime.bookmarkEmbedders,
+    annotationEmbedders: runtime.annotationEmbedders,
+    // MCP initialize 的 clientInfo（未初始化 / 客户端没报时为 null）
+    clientInfo: clientInfo ?? null,
     signal: extra?.signal ?? null,
     onProgress,
     backendCtx: {
@@ -3180,12 +3405,21 @@ export function createCallContext(runtime, extra, toolName) {
 }
 
 /**
- * 把 5 个工具注册到 McpServer。
+ * 把 6 个工具注册到 McpServer。
  *
  * @param {import('@modelcontextprotocol/sdk/server/mcp.js').McpServer} server
- * @param {object} runtime { config, logger, cache, asrProvider, ocrProvider, typesetProvider, backends, dispatcher, bookmarkEmbedders }
+ * @param {object} runtime { config, logger, cache, asrProvider, ocrProvider, typesetProvider, backends, dispatcher,
+ *   bookmarkEmbedders, annotationEmbedders }
  */
 export function registerTools(server, runtime) {
+  // clientInfo 要等 initialize 之后才有；每次调用时现读，未初始化时返回 null。
+  const getClientInfo = () => {
+    try {
+      return server.server.getClientVersion() ?? null;
+    } catch {
+      return null;
+    }
+  };
   for (const definition of TOOL_DEFINITIONS) {
     const inputSchema = z.object(definition.shape).strict();
     server.registerTool(
@@ -3198,7 +3432,10 @@ export function registerTools(server, runtime) {
       },
       guardToolHandler(
         definition.name,
-        async (args, extra) => definition.handler(args ?? {}, createCallContext(runtime, extra, definition.name)),
+        async (args, extra) => definition.handler(
+          args ?? {},
+          createCallContext(runtime, extra, definition.name, { clientInfo: getClientInfo() }),
+        ),
         { logger: runtime.logger },
       ),
     );
