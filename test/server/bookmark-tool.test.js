@@ -178,6 +178,7 @@ test('注册：media_bookmark 是第 5 个工具，带破坏性注解、警告�
       'media_zoom',
       'media_locate',
       'media_bookmark',
+      'media_annotate',
     ]);
 
     const bookmark = tools.find((tool) => tool.name === 'media_bookmark');

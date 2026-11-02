@@ -209,8 +209,9 @@ export async function createRuntime(options = {}) {
     providerErrors: providers.providerErrors ?? {},
     backends,
     dispatcher,
-    // media_bookmark 的嵌入器注册表（测试 / 9z5.38.1 注入点；undefined = 默认注册表）
+    // 嵌入器注册表（测试 / 9z5.38.x 注入点；undefined = 默认注册表，null = 只写 sidecar）
     bookmarkEmbedders: options.bookmarkEmbedders,
+    annotationEmbedders: options.annotationEmbedders,
   };
 }
 
@@ -247,6 +248,7 @@ export function createServer(runtimeOrOptions = {}) {
     backends,
     dispatcher,
     bookmarkEmbedders: source.bookmarkEmbedders,
+    annotationEmbedders: source.annotationEmbedders,
   };
 
   const server = new McpServer(
