@@ -22,6 +22,9 @@ MultiMediaGrep 是一个 **MCP server**：默认走 stdio（由宿主拉起）�
 
 1. **server 自己绝不调用 LLM。** server 只做「取帧 / 转写 / 排版」，理解由 agent 自己的多模态模型完成。
 2. **server 不做取数。** 只收本地文件的绝对路径；拒绝 URL；不碰 cookie、不替你管理凭据、不下载。provider key 只由调用方显式提供（环境变量或 HTTP 请求头）。
+   唯一例外是 0.3.0 的两个写工具（`media_bookmark` / `media_annotate`）：它们会在源文件旁写
+   `*.mmgrep.*` sidecar / VTT，并在 PDF 上**原地**写入目录 / 批注——只有用户明确调用写工具时才会发生，
+   见 §15 / §16。
 3. **server 不保存用户凭据。** stdio 模式不做鉴权；HTTP 模式只做 Bearer 令牌这一层接入控制。请求头里的 provider key 只活在这一个请求内，不落盘、不缓存、不回显。需要字幕就让取数层把字幕文件交给它。
 
 契约里出现的一切**工具名、参数名、字段名、工具描述文本**都是英文（agent 的 API 面）；本文件的**正文说明是中文**。
@@ -96,7 +99,7 @@ flowchart TD
 
 ### 2.2 参数适用性（工具 × 参数 × 媒体）
 
-**规则一：不属于该工具的参数由 `inputSchema` 直接拒绝。** 四个工具的 schema 都加了 `.strict()`：多传一个未声明的参数不会被忽略，而是由 MCP 输入校验返回错误（JSON-RPC `-32602`，文案里点名未知字段）。所以「`media_zoom` 能不能传 `view`」这种问题的答案是「不能传」——不是「传了没效果」。
+**规则一：不属于该工具的参数由 `inputSchema` 直接拒绝。** 六个工具的 schema 都加了 `.strict()`：多传一个未声明的参数不会被忽略，而是由 MCP 输入校验返回错误（JSON-RPC `-32602`，文案里点名未知字段）。所以「`media_zoom` 能不能传 `view`」这种问题的答案是「不能传」——不是「传了没效果」。
 
 **规则二：参数对当前媒体不适用时必须报错，不能静默忽略。** 静默忽略会让 agent 以为参数生效了，然后在错误的时间窗里读到错误的内容。
 
@@ -123,6 +126,9 @@ flowchart TD
 | `max` | — | — | — | ✅ | video / audio / document |
 | `includeFrame` | — | — | — | ✅ | video / document（audio 报错） |
 
+`media_bookmark` 与 `media_annotate` 的参数是独立的写入口（`path` + `add` / `remove` / `update`，
+annotate 另有 `author`），见 §15.2 / §16.2；它们同样 `.strict()`，不属于上面这张只读参数表。
+
 **媒体不适用时的错误文案（`INVALID_ARGUMENT`，节选）：**
 
 | 参数 | video | audio | document |
@@ -142,7 +148,7 @@ flowchart TD
 | `maxEdge` | ✅ | `maxEdge is not applicable to audio media.` | ✅ |
 | `envelope` | `envelope is not applicable to video media. It only applies to audio recordings.` | ✅ | `envelope is not applicable to document media. It only applies to audio recordings.` |
 
-**`view` 的语义是跨媒体统一的**（只有 `media_overview` 收它）：目录优先 / 只出目录 / 只出文本这三种行为对三种媒体相同。区别只在目录从哪来——PDF 书签、视频/录音章节；两者都没有时文档还能从 heading 生成（≥5 条），视频/录音不生成（server 不调 LLM）。
+**`view` 的语义是跨媒体统一的**（只有 `media_overview` 收它）：目录优先 / 只出目录 / 只出文本这三种行为对三种媒体相同。区别只在目录从哪来：**先 bookmark sidecar**（存在就是唯一来源），否则文件自带目录（PDF 书签、视频/录音章节），两者都没有时文档还能从 heading 生成（≥5 条），视频/录音不生成（server 不调 LLM）。详见 §15.10。
 
 文档的 `cells` 语义是「每张拼图放几页缩略图」；视频的 `cells` 语义是「每张宫格放几个镜头格」。同一个名字，两种媒体各自解释——这是「按动作命名、跨媒体统一」的核心收益。
 
@@ -300,7 +306,7 @@ flowchart TD
 | `media_zoom` | 否 |
 | `media_locate` | 否 |
 
-> 进度上报是**框架能力**：`createProgressReporter` 对四个工具都可用，但当前只有 `media_overview` 显式调用它。宿主没给 `progressToken`、宿主不支持 `notifications/progress`、或 `MMGREP_PROGRESS_NOTIFICATIONS=false` 时静默跳过，不影响结果。
+> 进度上报是**框架能力**：`createProgressReporter` 对六个工具都可用，但当前只有 `media_overview` 显式调用它。宿主没给 `progressToken`、宿主不支持 `notifications/progress`、或 `MMGREP_PROGRESS_NOTIFICATIONS=false` 时静默跳过，不影响结果。
 
 progress token 形如 `media_overview 3/5 · scanning 0-300s`，让宿主 UI 能显示进度。**进度通知是 best-effort**。
 
@@ -310,7 +316,7 @@ progress token 形如 `media_overview 3/5 · scanning 0-300s`，让宿主 UI 能
 |---|---|
 | 缓存**主键** | **源文件内容的 sha256**（`sha256:<64 位 hex>`），不是路径 + 大小 + mtime。内容变了 → key 变了 → 缓存自然失效 |
 | **快速指纹索引** | 另有一份 `fingerprint-index.json`：`sha256(绝对路径 + ':' + size + ':' + mtimeMs)` → 内容 sha256。命中指纹就跳过全文件哈希；不命中就老老实实算内容 hash 并写回索引 |
-| 缓存目录 | `MMGREP_CACHE_DIR`（默认 `~/.cache/multimediagrep`），**绝不写到用户文件旁边** |
+| 缓存目录 | `MMGREP_CACHE_DIR`（默认 `~/.cache/multimediagrep`），**绝不写到用户文件旁边**。唯一例外是写工具的 sidecar / VTT：它们按契约写到源文件旁（`*.mmgrep.*`，见 §15.4 / §16.4），不写缓存目录 |
 | 容量 | `MMGREP_CACHE_MAX_BYTES`（默认 10 GiB），超出按 LRU 淘汰整条目 |
 | provider 逐页结果缓存 | 文档 provider 的结果按页写入同一缓存树：namespace = `sha256:<源内容 hash>:doc-provider:<role>:<hash(源 hash + provider id + model + ocrMode + role)>`，每页存契约 v2 的 page 对象。同一范围再次调用（overview / locate 共享）不再请求 provider，只把缺失页发出去；工具参数 `ocr: "force"`（= 后端 `ocrMode=force`）单独成键，不覆盖 auto / 文字层结果 |
 | 落盘产物 | `content.md` + `segments.jsonl` + `manifest.json`（三个必备）+ `document.json`（可选，cangjie `SourceDocument Contract v1`） |
@@ -350,8 +356,15 @@ HTTP 端点对 `Accept` / `Content-Type` 有要求：请求必须同时接受 `a
 | `media_overview` | 总览 | ✅ | ✅ | ✅ | 0–4 张 |
 | `media_zoom` | 特写 | ✅ | ❌ | ✅ | 1 张 |
 | `media_locate` | 定位 | ✅ | ✅ | ✅ | 0–1 张 |
+| `media_bookmark` | 增删改目录（**写**） | ✅ | ✅ | ✅（PDF / 图片） | 0 张 |
+| `media_annotate` | 增删改批注（**写**） | ✅ | ✅ | ✅（PDF / 图片） | 0 张 |
 
-**调用顺序建议：`media_probe` → `media_overview` → （必要时）`media_zoom` / `media_locate`。**
+**读的调用顺序建议：`media_probe` → `media_overview` → （必要时）`media_zoom` / `media_locate`。**
+
+**写的调用顺序建议：先用 `media_probe` / `media_overview` / `media_locate` 找到页码或时间戳，再调用
+`media_bookmark` / `media_annotate`；之后 probe / overview / locate 会从 sidecar 读回这份目录 / 批注。**
+`media_bookmark` / `media_annotate` 是仅有的两个会改文件的工具（`destructiveHint: true`），完整契约见
+§15 / §16；只想看不动文件时不要调用它们。
 
 **每个工具的返回都带 `source` 字段**（`subtitle` / `text` / `ocr` / `asr` / `mixed` / `visual` / `none`）标注内容的来源与可信度，见 §2.5。`mixed` 只用于整份 `transcript`（逐页标签不一致），不会出现在单个 segment / match 上。
 
@@ -387,12 +400,25 @@ For audio it also reports a quick health check — average level, speech ratio a
 call on it. A recording that is effectively silent is reported as such and is never sent to ASR
 (no hallucinated transcript).
 
-It also reports the file's own outline when it has one: PDF bookmarks (each entry carries the
-PHYSICAL page number — the same 1-based page numbers media_overview accepts — and, when the PDF
-defines page labels, the printed label too, e.g. "xii") and chapter markers in video/audio files
-(title + start/end timestamps). The text output shows at most 2 levels / 60 entries; the full
-outline is in structuredContent.outline. Use it to pick a range instead of reading the whole
-file. (内置目录：PDF 书签带物理页与打印页标签；视频/音频列出章节时间戳。文本最多 2 层 / 60 条)
+It also shows ONE outline for the file, from the first available source: the bookmark sidecar
+("<file>.mmgrep.bookmark.json", written by media_bookmark) when one exists, otherwise the
+file's own outline — PDF bookmarks (PHYSICAL page numbers, the same 1-based numbers
+media_overview accepts) or chapter markers in video/audio (title + start/end timestamps).
+Every line carries a bookmark id ("b3  p.12  title" for PDFs, "b3  00:12:34  title" for
+video/audio) — these are the ids media_bookmark accepts. When a sidecar exists, the last
+outline line is "full detail: <sidecar path>": read that file for the complete outline.
+The text shows at most 2 levels / 60 entries; structuredContent.outline has every entry, the
+source and the sidecar path. Read-only: probing never creates or modifies a sidecar.
+(读取侧只展示一份目录：sidecar 优先，其次文件自带目录；行首 b1…bN 就是 media_bookmark 的 id)
+
+It also reports the ANNOTATIONS of the file: how many there are and where they live — the
+annotation sidecar ("<file>.mmgrep.annotation.json", written by media_annotate) when one
+exists, otherwise the file's own annotations (PDF annotation objects). Probe reports the
+COUNT and the sidecar path only; the notes themselves are shown by media_overview, next to
+the page / time range they belong to ("n3 (p.12): note" for PDFs, "n3 (00:12:34–00:12:39):
+note" for video/audio). media_locate can also search the annotation text. Read-only:
+probing never creates or modifies a sidecar.
+(读取侧也展示批注：条数 + 侧车路径；note 本身在 overview 里按页 / 时间范围展示)
 
 This server never downloads anything and never calls an LLM: you always pass a local absolute
 path, and it only prepares images and text for your own model to look at.
@@ -432,18 +458,31 @@ path, and it only prepares images and text for your own model to look at.
 | `audioHealth` | object \| null | 音频体检结果（video/audio 才有；见 §4.3.1） | — |
 | `pageCount` | integer \| null | 总页数（document） | 页 |
 | `hasTextLayer` | boolean \| null | 是否已有文字层（document；**采样**首页/中间页/末页的结论，见 §4.3.2；本机没有文字抽取器时为 `null` = 判不出来） | — |
-| `outline` | object \| null | 内置目录（9z5.33）：PDF 书签或视频/录音章节；没有目录时 `available = false` 且 `reason` 写明原因。stub 后端 / 没有目录概念的后端可能为 `null` | — |
-| `outline.available` | boolean | 是否有内置目录 | — |
-| `outline.source` | `"pdf-bookmarks"` \| `"chapters"` \| null | 目录来源 | — |
+| `outline` | object \| null | 唯一一份目录（0.3.0 统一读取侧，见 §15.10）：来源依次是 bookmark sidecar → 文件自带目录（PDF 书签 / 视频录音章节）→ 文档 heading 生成（仅 overview）。没有目录时 `available = false` 且 `reason` 写明原因；`media` 是条目位置的口径（PDF 用页、视频/录音用时间），跑不到目录时可能为 `null` | — |
+| `outline.available` | boolean | 是否有可展示的目录 | — |
+| `outline.source` | `"sidecar"` \| `"pdf-bookmarks"` \| `"chapters"` \| `"headings"` \| null | 本次实际使用的来源；`sidecar` 永远优先 | — |
+| `outline.media` | `"pdf"` \| `"video"` \| `"audio"` \| `"image"` \| null | 目录条目按哪种媒体格式化（决定 `p.` 还是时间戳） | — |
+| `outline.generated` | boolean | 是否由 heading 生成（`source = "headings"` 时为 true） | — |
 | `outline.total` | integer | 完整目录的条目总数（不是 probe 文本展示的条数） | 条 |
-| `outline.entries[]` | array | **完整**目录，不截断（probe 文本最多 2 层 / 60 条） | — |
+| `outline.entries[]` | array | **完整**目录，不截断（probe 文本最多 2 层 / 60 条）；条目带稳定的 `id` | — |
+| `outline.entries[].id` | string | `b1`、`b2` …；与 media_bookmark 的 id 完全一致 | — |
 | `outline.entries[].title` | string | 条目标题 | — |
-| `outline.entries[].level` | integer | 书签层级，从 1 开始（PDF 书签才有） | — |
-| `outline.entries[].page` | integer \| null | **物理**页码（与 `pages` 参数同一口径；PDF 书签才有） | 页 |
-| `outline.entries[].label` | string \| null | 打印页标签（PDF 定义了 `/PageLabels` 时才有，如 `"xii"`、`"37"`） | — |
-| `outline.entries[].startMs` / `endMs` | integer | 章节起止（video/audio） | ms |
-| `outline.entries[].startSec` / `endSec` | number | 同上，秒 | s |
-| `outline.reason` | string \| null | 没有目录 / 读不了目录的人话原因（如 qpdf 未安装、文件没有章节） | — |
+| `outline.entries[].level` | integer | 书签层级，从 1 开始（PDF 目录才有） | — |
+| `outline.entries[].page` | integer \| null | **物理**页码（与 `pages` 参数同一口径；PDF 目录才有） | 页 |
+| `outline.entries[].label` | string \| null | 打印页标签（文件自带 PDF 书签且定义了 `/PageLabels` 时才有，如 `"xii"`、`"37"`；sidecar 条目不存 label） | — |
+| `outline.entries[].start` / `end` | number | 章节起止，秒（video/audio）；`end` 可省略 | s |
+| `outline.sidecarPath` | string \| null | 存在（或损坏）的 bookmark sidecar 绝对路径；只在有 sidecar 时出现 | — |
+| `outline.sidecarError` | string \| null | sidecar 存在但读不了时的短原因（含路径）；此时目录回退到文件自带 / heading 生成 | — |
+| `outline.reason` | string \| null | 没有目录 / 读不了目录的人话原因（如 qpdf 未安装、文件没有章节、sidecar 为空） | — |
+| `annotations` | object | 唯一一份批注摘要（§16.10）：来源依次是 annotation sidecar → 文件自带 PDF 批注；对没有批注面的媒体（txt / Office）是 `media: null`、`available: false` 的对象 | — |
+| `annotations.available` | boolean | 是否有批注 | — |
+| `annotations.source` | `"sidecar"` \| `"file"` \| null | 批注来源 | — |
+| `annotations.media` | `"pdf"` \| `"video"` \| `"audio"` \| `"image"` \| null | 批注媒体类型 | — |
+| `annotations.total` | integer | 批注总数 | 条 |
+| `annotations.sidecarPath` | string \| null | annotation sidecar 路径（存在或损坏时） | — |
+| `annotations.sidecarError` | string \| null | sidecar 读不了时的短原因 | — |
+| `annotations.reason` | string \| null | 没有批注 / 读不了的人话原因 | — |
+| `annotations.note` | string \| null | 额外提示（例如损坏时「已回退到文件自带批注」） | — |
 | `subtitleTracks` | array | 内嵌字幕轨 | — |
 | `subtitleTracks[].index` | integer | 轨道序号 | — |
 | `subtitleTracks[].language` | string \| null | 语言标签（BCP-47，可能为 null） | — |
@@ -594,12 +633,15 @@ text layer: looks unreliable (96% of word tokens are isolated single letters; 34
 - `transcript source:` 是实际会走的来源：`text`（原生文字层 / 纯文本）、`ocr`（只有 OCR）、`mixed`（文字层与 OCR 都可用，逐页路由可能混合）、`none`。
 - 旧输出里「OCR 不可用」与「文字来源是 OCR」同时出现的那种自相矛盾的说法不会再出现：provider 行描述角色可用性，`transcript source:` 描述实际文字来源，二者不是一回事。
 
-**内置目录（9z5.33）**——PDF 书签 / 视频章节存在时，probe 在 `transcript` 行之后列出目录：
+**唯一一份目录（0.3.0）**——probe 在 `transcript` 行之后列出目录；来源是 bookmark sidecar、PDF 书签、
+视频/录音章节三者中第一个可用的，不合并。行格式处处一致：PDF 是 `b1  p.1  title`（行首两空格表示
+下一层），视频 / 录音是 `b1  00:00  title`；`b1…` 就是 media_bookmark 的 id。
 
 ```
-outline: 24 PDF bookmarks — use the outline to pick a range
-- Engineered human Argonaute 2 for targeted C-to-U RNA base editing  — page 1
-  - Loop-inducing gRNAs enable RNA editing by AGO2–APOBEC3A (A3A) fusions  — page 2 (label "ii")
+outline: PDF outline — 24 entries — use the outline to pick a range
+b1  p.1  Engineered human Argonaute 2 for targeted C-to-U RNA base editing
+  b2  p.1  1.1 Loop-inducing gRNAs enable RNA editing by AGO2–APOBEC3A (A3A) fusions
+b3  p.4  Methods
   ...
   +N more (full outline in structuredContent.outline)
 How to read: use the outline to pick a range, e.g. media_overview({ path, pages: "1-5" }).
@@ -608,15 +650,44 @@ How to read: use the outline to pick a range, e.g. media_overview({ path, pages:
 视频 / 录音的章节用时间戳，提示改成 `start` / `end`：
 
 ```
-outline: 4 chapters — use the outline to pick a range
-- Opening  00:00.000-00:02.000
-- Build Up  00:02.000-00:05.000
+outline: container chapters — 4 chapters — use the outline to pick a range
+b1  00:00  Opening
+b2  00:02  Build Up
+b3  00:05  Main Section
+b4  00:09  Wrap Up
 How to read: use the outline to pick a range, e.g. media_overview({ path, start: 0, end: 2 }).
 ```
 
-- 文本最多 **2 层 / 60 条**，其余写 `+N more`；完整目录永远在 `structuredContent.outline`（overview 还写进 `manifest.json`）。
-- PDF 条目给**物理页码**（`pages` 参数接受的就是物理页）；PDF 定义了 `/PageLabels` 时再给打印标签：`— page 4 (label "ii")`。读取用 qpdf（`pdftotext` / `pdfinfo` 读不了 outline）；qpdf 未安装时输出 `outline: none — PDF bookmarks cannot be read: qpdf is not installed (...)`，不会静默省略。
-- 没有书签的 PDF 输出 `outline: none — this PDF has no bookmarks (no outline).`；视频/录音没有章节时输出 `chapters: none — ...`。
+文档没有书签、但请求范围里 ≥5 个 heading 时（只有 `media_overview` 会生成；probe 不生成）：
+
+```
+outline: generated from headings — 6 entries (best-effort: built from block structure; full outline in structuredContent.outline and manifest.json)
+b1  p.1  1. Introduction
+  b2  p.1  1.1 Scope
+b3  p.3  2. Methods
+...
+```
+
+- 首行说明来源（`sidecar` / `PDF outline` / `container chapters` / `generated from headings`）与条数；
+  probe 文本最多 **2 层 / 60 条**，其余写 `+N more`；完整目录永远在 `structuredContent.outline`
+  （overview 还写进 `manifest.json`）。
+- **有 bookmark sidecar 时**：来源行是 `outline: sidecar — N entries — ...`，目录块最后一行是
+  `full detail: /abs/a.pdf.mmgrep.bookmark.json`；probe 的 `How to read:` 行在目录块之后。
+- 没有 sidecar 时，条目 id 由共享 derive 助手按文件自带目录顺序推导（b1…bN），与 media_bookmark
+  首次导入完全一致；PDF 条目给**物理页码**（`pages` 参数接受的就是物理页），文件自带书签定义了
+  `/PageLabels` 时 `structuredContent` 里另带 `label`（文本不显示 label）。
+- 读取 PDF 书签用 qpdf（`pdftotext` / `pdfinfo` 读不了 outline）；qpdf 未安装时输出
+  `outline: none — PDF bookmarks cannot be read: qpdf is not installed (...)`，不会静默省略。
+- 没有书签的 PDF 输出 `outline: none — this PDF has no bookmarks (no outline).`；视频/录音没有章节时
+  输出 `chapters: none — ...`。sidecar 损坏时回退到文件自带目录，并多一行
+  `note: the bookmark sidecar "<path>" could not be read (...) — showing PDF outline instead.`。
+- probe 还输出批注条数与 annotation sidecar 路径（§16.10）：
+
+```
+annotations: 2 (sidecar)
+annotation sidecar: /abs/a.pdf.mmgrep.annotation.json
+```
+
 
 ### 4.5 错误行为
 
@@ -690,24 +761,38 @@ drops a whole page silently: pages that could not be represented are listed, and
 over-long unit is truncated with a trailing "…[+N chars]". Read content.md when you need the
 complete text.
 
-VIEW — the view parameter controls the inline text (default "auto"). Many files carry a real
-outline: PDF bookmarks, or chapter markers in video/audio. (1) "auto": if the requested range
-fits, you get the full text; if it does not fit and the file has an outline, the outline comes
-first (page numbers for PDFs, timestamps for chapters) and the rest of the budget goes to the
-text preview; if there is no outline, you get the normal skim/sampled preview. A document
-without bookmarks gets an outline GENERATED FROM ITS HEADINGS when the range has at least 5
-headings, labelled "outline: generated from headings" (best-effort). (2) "outline": return only
-the outline — generated from headings for a document without bookmarks; for video/audio without
-chapters you get an explicit "no chapters" message and NOTHING is generated, because this server
-never invents an outline from content. In that case read the overview (or a start/end window)
-and write your own outline from the time-aligned text and storyboard grids. (3) "text": ignore
-the outline and force the text pipeline. The full outline is always in structuredContent.outline
-and, for an overview that writes an export, in manifest.json.
-(目录：view:auto 放不下时先出目录；view:outline 只出目录；view:text 只出文本。视频/音频没有章节时不生成目录)
+VIEW — the view parameter controls the inline text (default "auto"). The result carries ONE
+outline from the first available source: the bookmark sidecar ("<file>.mmgrep.bookmark.json",
+written by media_bookmark) when one exists, otherwise the file's own outline (PDF bookmarks, or
+chapter markers in video/audio); a document without bookmarks may get an outline GENERATED FROM
+ITS HEADINGS when the range has at least 5 headings, labelled "outline: generated from
+headings" (best-effort). (1) "auto": if the requested range fits, you get the full text; if it
+does not fit and there is an outline, the outline comes first (ids b1…bN with page numbers for
+PDFs, timestamps for chapters) and the rest of the budget goes to the text preview; if there is
+no outline, you get the normal skim/sampled preview. (2) "outline": return only the outline —
+generated from headings for a document without bookmarks; for video/audio without chapters you
+get an explicit "no chapters" message and NOTHING is generated, because this server never
+invents an outline from content. In that case read the overview (or a start/end window) and
+write your own outline from the time-aligned text and storyboard grids. (3) "text": ignore the
+outline and force the text pipeline. The full outline (entries, source, sidecar path) is always
+in structuredContent.outline and, for an overview that writes an export, in manifest.json. When
+a sidecar exists its last outline line is "full detail: <sidecar path>" — read that file for the
+complete bookmark detail.
+(目录：sidecar 优先，其次文件自带目录，最后才是 heading 生成；view:auto 放不下时先出目录；view:outline 只出目录；view:text 只出文本)
+
+The result also carries the ANNOTATIONS of the requested range, right next to the page /
+time range they belong to: the annotation sidecar ("<file>.mmgrep.annotation.json", written
+by media_annotate) when one exists, otherwise the file's own annotations (PDF annotation
+objects). One annotation per line, in the same shape media_annotate writes
+("n3 (p.12): note" for PDFs, "n3 (00:12:34–00:12:39): note" for video/audio). The line
+starts with the annotation id (n1, n2, …) — these are the ids media_annotate accepts. The
+author is in structuredContent.annotations only; the note text is shown as written.
+(批注按请求范围展示：行首 n1…nN 就是 media_annotate 的 id)
 
 Always call media_probe first: it tells you how long the file is, whether a subtitle source
-exists, which transcript source applies, and whether the file carries a built-in outline
-(PDF bookmarks / chapters), for free. Long media must be narrowed with
+exists, which transcript source applies, and which outline applies (bookmark sidecar first,
+then the file's own PDF bookmarks / video-audio chapters, or headings for a document), for
+free. Long media must be narrowed with
 start/end (video, audio) or pages (document) — one giant grid of a two-hour film gives you
 illegible cells and spoils the ending. Follow the continuation hint in the result to page
 through the rest.
@@ -725,7 +810,7 @@ through the rest.
 | `segment` | integer | ❌ | `300` | video, audio | 只给 `start` 不给 `end` 时的窗口长度（秒，30–3600） |
 | `pages` | string | ❌ | 全文 | document | 页码范围，如 `"3-10,15"` |
 | `ocr` | `"auto"` \| `"force"` | ❌ | `"auto"` | document | 页文字的获取方式。`"auto"`：有文字层就用文字层，只有没文字层的页走 OCR；`"force"`：请求的页**无论有没有文字层**都交给 OCR provider 重新识别，结果 `textOrigin = "ocr"`、页标 `(ocr)`，并单独缓存（不覆盖 auto 结果）。用在 probe 说 `text layer: looks unreliable` 时。需要已配置 OCR provider（`MMGREP_OCR_PROVIDER`），否则报 `PROVIDER_NOT_CONFIGURED`；纯文本 `.txt` / `.md` 没有页图，force 会报 `INVALID_ARGUMENT`；video / audio 传它报 `INVALID_ARGUMENT` |
-| `view` | `"auto"` \| `"outline"` \| `"text"` | ❌ | `"auto"` | 全部 | 内联文字的内容。`"auto"`：请求范围放得下就给全文；放不下且有目录（内置 PDF 书签 / 章节，或文档 blocks 里 ≥5 个 heading）时先出目录，余量给文本预览；没有目录时走 skim / 抽样。`"outline"`：只出目录（文档无书签时从 heading 生成；视频/录音无章节时只给「无章节」说明，不生成内容）。`"text"`：忽略目录，强制走文本管线。完整目录始终在 `structuredContent.outline` 与 `manifest.json` |
+| `view` | `"auto"` \| `"outline"` \| `"text"` | ❌ | `"auto"` | 全部 | 内联文字的内容。`"auto"`：请求范围放得下就给全文；放不下且有目录时先出目录，余量给文本预览；没有目录时走 skim / 抽样。目录来源按优先级：**bookmark sidecar → 文件自带 PDF 书签 / 章节 → 文档 ≥5 个 heading（只对文档生成）**，不合并（§15.10）。`"outline"`：只出这一份目录（视频/录音无章节时只给「无章节」说明，不生成内容；有 sidecar 时末行是 `full detail: <sidecar path>`）。`"text"`：忽略目录，强制走文本管线。完整目录始终在 `structuredContent.outline` 与 `manifest.json` |
 | `cells` | integer | ❌ | video `9` / document `6` | video, document | 每张拼图的格数（video=镜头格，document=页缩略图），1–16 |
 | `images` | integer | ❌ | `2` | video, document, audio（仅 `0`） | 返回几张拼图，`0`–`4`；`0` = 零像素纯文本模式（不出图，只回文字，`budget` 全零） |
 | `maxEdge` | integer | ❌ | `1280` | video, document | 单张图最长边（px），上限 1600 |
@@ -741,7 +826,7 @@ through the rest.
 | `mediaType` | string | 媒体类型 | — |
 | `path` | string | 绝对路径 | — |
 | `view` | `"auto"` \| `"outline"` \| `"text"` | 本次调用的 `view`（缺省为 `auto`） | — |
-| `outline` | object | 本次的完整目录（PDF 书签 / 章节 / 从 heading 生成）；`available=false` 时 `entries=[]` 且 `reason` 说明原因。字段同 §4.3 的 `outline`，另加 `generated`（是否由 heading 生成） | — |
+| `outline` | object | 本次的完整目录（sidecar / PDF 书签 / 章节 / 从 heading 生成，取第一个可用的）；`available=false` 时 `entries=[]` 且 `reason` 说明原因。字段同 §4.3 的 `outline`（含 `id` / `media` / `generated` / `sidecarPath` / `sidecarError`） | — |
 | `window.startMs` / `window.endMs` | integer | 本次覆盖的时间窗 | ms |
 | `window.startSec` / `window.endSec` | number | 同上，秒 | s |
 | `window.pages` | integer[] \| null | 本次覆盖的页码（document） | 页 |
@@ -786,9 +871,10 @@ through the rest.
 | `preview.sampled` | boolean | skim 模式下是否有 skim 单元被抽样掉；其它模式不出现 | — |
 | `preview.headingsSampled` | boolean | skim 模式下是否对 heading 本身做了抽样（只有全部 heading 都放不下时才为 `true`） | — |
 | `preview.notRepresented` | integer[] | 没有被内联任何单元的页码（文档；其它媒体为空数组） | 页 |
-| `preview.outlineSource` | `"pdf-bookmarks"` \| `"chapters"` \| `"headings"` \| `"none"` | 本次目录来源（有目录时出现） | — |
+| `preview.outlineSource` | `"sidecar"` \| `"pdf-bookmarks"` \| `"chapters"` \| `"headings"` \| `"none"` | 本次目录来源（有目录时出现；`sidecar` 永远优先） | — |
 | `preview.outlineInlined` | integer | 实际写进内联文本的目录条目数（目录放不下时小于总数；`view:"outline"` 时也受上限约束） | 条 |
 | `preview.outlineTotal` | integer | 目录条目总数（完整目录在 `structuredContent.outline`） | 条 |
+| `annotations` | object | 本次范围内的批注（§16.10）：`available` / `source` / `media` / `total`（全部批注数）/ `totalInRange`（落在请求范围内的条数）/ `entries[]`（范围内的完整批注条目）/ `sidecarPath` / `sidecarError` / `reason` / `note` | — |
 | `continuation` | object \| null | 续读提示 | — |
 | `continuation.nextStartMs` / `nextStartSec` | integer / number | 下一段起点（video/audio） | ms / s |
 | `continuation.nextPage` | integer | 下一批起始页（document） | 页 |
@@ -899,15 +985,17 @@ note: complete text of pages 1-2 (nothing omitted).
 full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, manifest.json in the same directory)
 ```
 
-**目录优先（9z5.33）**——放不下且有目录时，`view:"auto"` 先给目录，余量才给文本；`view:"outline"` 只给目录：
+**目录优先（0.3.0 统一目录）**——放不下且有目录时，`view:"auto"` 先给目录，余量才给文本；
+`view:"outline"` 只给目录：
 
 ```
 <overview path="/abs/book.pdf" type="document" pages="1-28" source="text" typesetProvider="builtin" />
-outline: 24 PDF bookmarks — full outline in structuredContent.outline and manifest.json
-- Engineered human Argonaute 2 ...  — page 1
-  - Loop-inducing gRNAs ...  — page 2
-  ...
+outline: sidecar — 24 entries — full outline in structuredContent.outline and manifest.json
+b1  p.1  Engineered human Argonaute 2 ...
+  b2  p.2  Loop-inducing gRNAs ...
+...
 hint: pick a range with pages, e.g. media_overview({ path, pages: "1-5" }).
+full detail: /abs/book.pdf.mmgrep.bookmark.json
 [page 1  ] (text)  「……」
 ...
 preview: skim — 84 of 620 sentences inlined across pages 1-28; all 24 headings kept; not represented: 21-28. Skim = headings + first sentence per paragraph (tables as [table: caption]).
@@ -919,10 +1007,23 @@ full text: /home/me/.cache/multimediagrep/ab/12…/content.md (segments.jsonl, m
 写 `(no entry fits the inline budget; read the full outline in structuredContent.outline / manifest.json)`。
 **「完整 / 没有省略」的 note 只在 tier 1（whole）出现**——有目录 + 预览的组合永远不会说「complete」。
 
-- 有目录时 `preview.outlineSource` / `outlineInlined` / `outlineTotal` 说明目录内联了多少条。
-- 文档目录来自 heading 时头部标 `outline: generated from headings`（best-effort；builtin 启发式 blocks 可能把结构判错）。
-- 视频/录音有章节时用 `start`/`end` 提示；没有章节时 `view:"outline"` 只回一句「no chapters」，**不生成**任何目录内容。
+- 目录来源按优先级取第一个（sidecar → 文件自带 → heading 生成），不合并；`preview.outlineSource` /
+  `outlineInlined` / `outlineTotal` 说明目录内联了多少条。
+- 文档目录来自 heading 时头部标 `outline: generated from headings`（best-effort；builtin 启发式 blocks
+  可能把结构判错）。
+- 视频/录音有章节时用 `start`/`end` 提示；没有章节时 `view:"outline"` 只回一句「no chapters」，
+  **不生成**任何目录内容。
+- 有 sidecar 时，目录块最后一行是 `full detail: <sidecar path>`（在 `hint` 之后、文本预览之前）。
 - `view:"text"` 跳过目录；`view:"auto"` 在请求范围整体放得下时也给全文（tier 1 优先于目录）。
+
+范围内的批注跟在目录 / 文本旁（行格式与 media_annotate 结果一致；有 sidecar 时末行 `full detail:`）：
+
+```
+annotations (1 of 2 in pages 1-12, sidecar):
+n1 (p.3): check this number
+full detail: /abs/book.pdf.mmgrep.annotation.json
+```
+
 
 **文档预览的三层（9z5.32）**：whole（整体放得下）→ skim（契约 v2 blocks 可用时）→ sampled（没有 blocks 的旧路径，或 skim 也放不下时）。视频 / 录音**没有** skim，直接 whole → sampled。
 
@@ -1104,6 +1205,21 @@ says so instead of guessing. Use media_overview if you only need the visuals.
 Each match is tagged with its source. A match whose source is "asr" came from machine
 transcription, so the wording may be wrong (names, numbers, jargon) — do not present it as the
 speaker's exact words.
+
+The result also carries the same single outline as media_probe / media_overview in
+structuredContent.outline: the bookmark sidecar first, then the file's own PDF bookmarks or
+chapter markers. Its entries carry the ids media_bookmark accepts (b1…bN), and
+structuredContent.outline.sidecarPath / sidecarError point at the bookmark sidecar when one
+exists. Locate is read-only: it never creates or modifies a sidecar.
+(定位结果也带同一份目录：sidecar 优先，其次文件自带目录；line 首 b1…bN 可用于 media_bookmark)
+
+It also searches the ANNOTATION text: the notes written next to the media (annotation
+sidecar "<file>.mmgrep.annotation.json", or the file's own PDF annotations) are searched
+too, and annotation hits are reported in their own "annotation matches" section. They are
+marked as annotations (kind "annotation" plus the id, n1, n2, …) and are NEVER counted as
+media content hits — the match count above them counts transcript / page matches only. An
+annotation hit is a note somebody wrote; it is not something the media says.
+(定位也搜批注文本；批注命中单独成段，不计入媒体命中数)
 ```
 
 ### 7.2 参数
@@ -1131,6 +1247,21 @@ speaker's exact words.
 | `mediaType` | string | 媒体类型 | — |
 | `path` | string | 绝对路径 | — |
 | `query` | string | 原始查询串 | — |
+| `outline` | object | 与 probe / overview 相同的唯一一份目录（sidecar 优先；locate 不生成 heading 目录），字段同 §4.3 | — |
+| `annotations` | object | 批注摘要（§16.10），字段同 §4.3 的 `annotations` | — |
+| `annotationMatches[]` | array | 在批注 `note` 里搜到的命中；**永远不计入 `matches`**，也不与媒体内容混淆 | — |
+| `annotationMatches[].kind` | `"annotation"` | 固定值，提醒调用方这不是媒体内容 | — |
+| `annotationMatches[].id` | string | 批注 id（`n1` …） | — |
+| `annotationMatches[].media` | string | 批注媒体类型 | — |
+| `annotationMatches[].page` | integer \| null | 批注所在页（PDF） | 页 |
+| `annotationMatches[].startMs` / `endMs` | integer \| null | 批注时间范围（video/audio） | ms |
+| `annotationMatches[].startSec` / `endSec` | number \| null | 同上，秒 | s |
+| `annotationMatches[].text` | string | 批注 note | — |
+| `annotationMatches[].author` | string \| null | 批注作者 | — |
+| `annotationMatches[].hits` / `fuzzy` | integer / boolean | 命中次数 / 是否 token 覆盖 | — |
+| `annotationMatches[].source` | `"annotation"` | 固定值（与媒体 `source` 三档不混用） | — |
+| `annotationMatches[].origin` | `"sidecar"` \| `"file"` \| null | 批注来源 | — |
+| `annotationMatches[].line` | string | 与 media_annotate 结果同形的文本行（`n3 (p.12): note`） | — |
 | `transcriptSource` | `"subtitle"` \| `"text"` \| `"ocr"` \| `"asr"` \| `"visual"` \| `"mixed"` \| `"none"` | 用的哪份转写（可信度口径，见 §2.5）。文档可能是 `text` / `ocr` / `mixed` | — |
 | `transcriptOrigin` | `"file"` \| `"embedded"` \| `"textlayer"` \| `"asr"` \| `"ocr"` \| `"none"` | 来源渠道（文档：`textlayer` = PDF 文字层） | — |
 | `matches[]` | array | 匹配列表（视频/录音按分数降序；文档按 §7.3.1 排序） | — |
@@ -1195,6 +1326,15 @@ matches for "deimmunization" (2 of 28 pages):
 Feed any of these pages to media_zoom({ path, page }) — no need to re-read the whole file.
 ```
 
+批注命中单独成段（永远不计入上面的媒体命中数）：
+
+```
+annotation matches for "deimmunization" (1):
+  n2 (p.12): 这里的公式与正文不一致
+note: the lines above are ANNOTATIONS — notes written next to the media (sidecar or the file itself),
+not media content. They are not part of the transcript or the page text.
+```
+
 `(text)` 的片段来自原生文字层，字符精确；`(ocr)` 的片段经过字符识别，专名与数字建议 `media_zoom` 核对。
 
 ### 7.5 错误行为
@@ -1207,8 +1347,6 @@ Feed any of these pages to media_zoom({ path, page }) — no need to re-read the
 - 文档的 OCR / typeset 角色**配置了但不可用**（缺 key、provider 初始化失败）→ `PROVIDER_NOT_CONFIGURED` / `PROVIDER_FAILED`，文案以 `cannot search this document: ` 开头——不像 overview 那样降级，因为 locate 必须要有文字可搜。
 - `includeFrame: true` 但媒体是 audio → `includeFrame is not applicable to audio media. There are no frames to show.`
 - 一条都没匹配上 → **不是错误**：`matches` 为空数组，文本里写 `no line matched "xxx" among 128 transcript segments. Try shorter keywords, or a phrase that appears verbatim.`
-
----
 
 ## 8. 字幕读取（`media_overview` 的纯文本模式）
 
@@ -1456,10 +1594,13 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
     "available": true,
     "source": "chapters",
     "generated": false,
+    "media": "video",
     "total": 1,
     "entries": [
-      { "title": "Opening", "startMs": 0, "endMs": 2000, "startSec": 0, "endSec": 2 }
+      { "id": "b1", "title": "Opening", "start": 0, "end": 2 }
     ],
+    "sidecarPath": null,
+    "sidecarError": null,
     "reason": null
   },
   "transcript": {
@@ -1495,7 +1636,7 @@ fingerprint = sha256(绝对路径 + ':' + size + ':' + mtimeMs)  →  内容 sha
 | `document.version_id` | 内容版本 ID = `sha256:<hex>`，**内容变了就变** |
 | `document.element_count` | `document.json` 里的 element 数量 |
 | `counts` | 产物计数，按 segment 的粒度归类：`segment`（没有页码的段落：视频 / 录音）与 `page`（有页码的段落：文档）。两者不会同时出现 |
-| `outline` | **完整**内置目录（PDF 书签 / 视频章节），字段与 §5.3 `structuredContent.outline` 相同；从 heading 生成的目录也写在这里（`source: "headings"`、`generated: true`）。没有目录时是 `available: false` 的对象，`reason` 说明原因 |
+| `outline` | **完整**目录（sidecar / PDF 书签 / 视频章节 / heading 生成），字段与 §5.3 `structuredContent.outline` 相同：条目带 `id`；`source` 为 `sidecar` / `pdf-bookmarks` / `chapters` / `headings`；有 sidecar 时带 `sidecarPath` / `sidecarError`。没有目录时是 `available: false` 的对象，`reason` 说明原因 |
 | `overview.images[]` | 每张图的描述（`index` / `width` / `height` / `cells` / `mimeType` / `bytes` / `estimatedTokens`），**不含像素、也不含文件名**——像素只在 `content` 的 image block 里，manifest 不引用图片文件 |
 | `transcript` | 转写来源（`source` / `provider` / `model` / `language` / `segmentCount` / `file`）。**没有 `origin` 字段**：渠道口径在 `segments.jsonl` 的逐段 `origin` 上 |
 | `provider` | 实际处理文字的外部 provider（没有时为 `null`） |
@@ -1691,8 +1832,8 @@ estimatedTokens    = max(gridTokens, pixelTokens)
 
 0.2.0 起不再维护第三份独立的用法指引文本。给 agent 的指引只有两个权威来源，且都逐字来自本契约：
 
-1. **四个工具描述**（§4.1 / §5.1 / §6.1 / §7.1）：每个工具自己该在什么时候用、参数怎么传、结果怎么读，都写在描述里。
-2. **server instructions**（§11.2）：通过 MCP `initialize` 的 `instructions` 字段下发，讲清 probe → overview → zoom → locate 的顺序与全局纪律。
+1. **六个工具描述**（§4.1 / §5.1 / §6.1 / §7.1 / §15.1 / §16.1）：每个工具自己该在什么时候用、参数怎么传、结果怎么读，都写在描述里。
+2. **server instructions**（§11.2）：通过 MCP `initialize` 的 `instructions` 字段下发，讲清 probe → overview → zoom / locate 的读流程、bookmark / annotate 的写流程，以及全局纪律。
 
 两者都由 `src/server/tools.js` / `src/server/server-instructions.js` 逐字复制，改契约等于改代码。几条不变的硬约束（描述与 instructions 里都能找到对应句子）：
 
@@ -1700,7 +1841,8 @@ estimatedTokens    = max(gridTokens, pixelTokens)
 - **文字来源分三档可信度**：`text`（原生文字层 / 纯文本，字符精确，可原样引用）> `subtitle` / `ocr`（可能是机器生成 / 识别，专名数字要核对画面）> `asr`（机器听写，**不可当原话引用**）。`mixed` 只表示整份文档的逐页来源不一致。
 - **全文永远落盘**：`media_overview` 的 text content 末尾有 `full text: <content.md 绝对路径> ...` 一行；内联的只是预览（文本三档 whole / skim / sampled，或 outline 目录视图），读全文要读文件。
 - **宫格图只用来找位置**，读画面上的字必须 `media_zoom` 单帧放大。
-- **长素材先收窄**（`start`/`end` 或 `pages`），再跟着 `continuation` 翻页；`view:"outline"` 可以先拿文件自带的目录（PDF 书签 / 章节）。
+- **长素材先收窄**（`start`/`end` 或 `pages`），再跟着 `continuation` 翻页；`view:"outline"` 先拿**唯一一份**目录（bookmark sidecar → 文件自带 PDF 书签 / 章节 → heading 生成）。
+- **只有 `media_bookmark` / `media_annotate` 会改文件**：PDF 原地改 outline / 批注，视频/录音只写 `.mmgrep.*.vtt`，所有类型都写 `.mmgrep.*.json` sidecar；sidecar 是唯一真相源，外部改动会被下次写入覆盖，动原件前请 `git commit`。
 
 ### 11.2 server instructions（可直接粘贴进 MCP server 的 `instructions` 字段）
 
@@ -1708,6 +1850,8 @@ estimatedTokens    = max(gridTokens, pixelTokens)
 MultiMediaGrep gives you eyes and ears over LOCAL media files: video, audio recordings and
 documents. It never downloads anything and never calls an LLM — you always pass a local
 absolute path, and it prepares images and text for your own multimodal model to look at.
+Read with media_probe → media_overview → media_zoom / media_locate; write with
+media_bookmark / media_annotate.
 
 READING ORDER
 1. media_probe first — cheap, no image tokens. Gives duration / page count / tracks and
@@ -1718,10 +1862,15 @@ READING ORDER
    output of a bad OCR pass: call media_overview({ path, ocr: "force" }) to re-recognize the
    requested pages with the OCR provider (this needs MMGREP_OCR_PROVIDER configured). Forced
    pages are tagged "ocr" and cached separately from the default "auto".
-   The probe also shows the file's own outline when it has one: PDF bookmarks (PHYSICAL page
-   numbers — the same 1-based numbers media_overview accepts — plus the printed page label
-   when the PDF defines one) and chapter markers in video/audio files (title + start/end
-   timestamps). Use it to pick a range instead of reading the whole file.
+   The probe shows ONE outline from the first available source: the bookmark sidecar
+   ("<file>.mmgrep.bookmark.json", written by media_bookmark), otherwise the file's own
+   outline — PDF bookmarks (PHYSICAL page numbers — the same 1-based numbers media_overview
+   accepts — plus the printed page label when the PDF defines one) or chapter markers in
+   video/audio files (title + start/end timestamps). Every entry carries an id (b1…bN); those
+   are the ids media_bookmark accepts. Use the outline to pick a range instead of reading the
+   whole file. When a sidecar exists, its last outline line is "full detail: <sidecar path>".
+   The probe also reports the file's ANNOTATIONS (the count and the annotation sidecar path).
+   The notes themselves are shown by media_overview and searched by media_locate.
 2. media_overview — the main read. Video: numbered storyboard grids plus a time-aligned text
    index. Audio: a timestamped transcript. Document: page thumbnails plus page text.
    The full text of the requested range is written to disk, and the result text ends with a
@@ -1737,17 +1886,46 @@ READING ORDER
    fit — is sampled evenly from complete units, with a "preview: sampled ..." line naming what
    was inlined and the pages/ranges not represented. In a skim that does not fit, all headings
    are kept and sentences are sampled; only when even the headings do not fit are they sampled.
-   A file's own outline (PDF bookmarks / video-audio chapters) is another starting point.
-   With view "auto" (default), a range that fits still returns the full text; when it does not
-   fit and an outline exists, the outline comes first and the rest of the budget goes to the
-   text preview. A document without bookmarks gets an outline generated from its headings
-   (at least 5), labelled "outline: generated from headings". view "outline" returns only the
-   outline; for video/audio without chapters it says "no chapters" and generates nothing —
-   write your own outline from the overview in that case. view "text" forces the text pipeline.
+   The outline comes from the same single source as the probe: the bookmark sidecar first, then
+   the file's own PDF bookmarks / video-audio chapters. A document without either may get an
+   outline generated from its headings (at least 5), labelled "outline: generated from
+   headings"; video/audio without chapters is NEVER given a generated outline. With view "auto"
+   (default), a range that fits still returns the full text; when it does not fit and an outline
+   exists, the outline comes first and the rest of the budget goes to the text preview. view
+   "outline" returns only that outline. view "text" forces the text pipeline. When a sidecar
+   exists, its last outline line is "full detail: <sidecar path>".
+   The result also shows the ANNOTATIONS of the requested range, right next to the pages /
+   time range they belong to: the annotation sidecar when one exists, otherwise the file's own
+   PDF annotations. One per line, starting with its id ("n3 (p.12): note" for PDFs,
+   "n3 (00:12:34–00:12:39): note" for video/audio) — those are the ids media_annotate accepts.
+   The author is in structuredContent.annotations only. When an annotation sidecar exists, the
+   block ends with "full detail: <sidecar path>".
 3. media_zoom — only for parts that matter. One frame of a video (at, or a start/end window)
    or one page of a document, optionally cropped.
 4. media_locate — "where was X said" (timestamp) or "on which page" (page number). Text only
-   by default; includeFrame adds one picture at the best match.
+   by default; includeFrame adds one picture at the best match. It carries the same single
+   outline in structuredContent.outline, and it also searches annotation notes: annotation
+   hits are marked as annotations, never as media content.
+
+WRITING — bookmarks and annotations
+- media_bookmark writes the outline (PDF bookmarks, video/audio chapters, or the sidecar for an
+  image). media_annotate writes notes and comments. Call them only when the user asks you to
+  change a file, after reading it.
+- The sidecar next to the source is the single source of truth:
+  "<file>.mmgrep.bookmark.json" and "<file>.mmgrep.annotation.json". Each write also embeds:
+  a PDF's outline / annotation objects are rewritten IN PLACE — the PDF file itself changes,
+  no copy is made, and the page content is not rewritten. A video or audio file is never
+  modified: only "<file>.mmgrep.bookmark.vtt" / "<file>.mmgrep.annotation.vtt" is written.
+  An image gets the sidecar only.
+- The first write imports the file's own outline / annotations as b1…bN / n1…nN, then applies
+  the call. Afterwards the sidecar wins: external edits to the file's own outline / annotations
+  are overwritten by the next write. One call can mix add / remove / update (applied remove →
+  update → add) and is all-or-nothing: if anything is invalid, nothing is written and every
+  problem is listed at once. ids never change; new ids are max+1 and are never reused. Protect
+  your originals with git (or a backup) before calling a write tool.
+- The result lists the full outline / annotations in the read-side format, then the sidecar
+  path, the embed target and every check result. Read-only tools never create or modify a
+  sidecar.
 
 TEXT SOURCE ORDER — subtitles first, ASR only as a fallback
 1. a subtitle you select explicitly (subtitle: a file path, a track index, or a language code),
@@ -1798,6 +1976,12 @@ FORMATS
   of content.md (segments.jsonl and manifest.json sit in the same directory). Read those instead
   of asking for more inline text. If the export failed, the line says "full text: NOT written —
   <reason>" and the inline preview is all you have.
+- Annotation positions use the same units as the read tools: PDF page plus rect
+  {x, y, width, height} as fractions 0..1 of the page (top-left origin, the same space as
+  media_zoom crop); video/audio start/end in seconds, with end defaulted to start + 5 s and
+  clipped to the media duration; an image uses rect only.
+- Outline and annotation ids are stable: b1…bN for outlines, n1…nN for annotations. Pass them
+  back to media_bookmark / media_annotate unchanged.
 
 TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文档 / 转写 / 字幕 /
 关键帧 / 放大 / 提取文字 / 定位 / 截图), so Chinese requests match them too.
@@ -1873,7 +2057,7 @@ provider 无法保证原字符时必须返回 `textOrigin = "ocr"` / `"unknown"`
 |---|---|---|---|---|
 | `MMGREP_MAX_IMAGE_TOKENS` | integer | `4000` | 单次调用的图片 token 软预算（§10.3） | 用默认值。自动模式保证不超；显式模式超出只警告 |
 | `MMGREP_MAX_IMAGE_EDGE` | integer | `1600` | 单张图最长边的全局上限（§10.2） | 用默认值。请求超过它 → `BUDGET_EXCEEDED` |
-| `MMGREP_MAX_TEXT_INLINE_CHARS` | integer | `24000` | 内联文本预览的字符上限（含 header / notes / `full text:` 行）。超出时：有内置目录（PDF 书签 / 章节）或文档 blocks 里 ≥5 个 heading 时，`view:"auto"` 先出目录（最多占一半预算），余量再走文档 skim（全部 heading + 段首句，每页 `[page N · skim: X of Y sentences]`）/ 完整单元等距抽样；没有目录时直接 skim / 抽样。`view:"outline"` 只出目录。两种情况都写明未覆盖范围。HTTP 模式下可被请求头 `x-mmgrep-max-text-inline-chars` 按客户端覆盖（硬上限 `200000`） | 用默认值。**全文永远落盘，不受此限制** |
+| `MMGREP_MAX_TEXT_INLINE_CHARS` | integer | `24000` | 内联文本预览的字符上限（含 header / notes / `full text:` 行）。超出时：有目录（bookmark sidecar、文件自带的 PDF 书签 / 章节，或只对 overview 生效的文档 ≥5 个 heading）时，`view:"auto"` 先出目录（最多占一半预算），余量再走文档 skim（全部 heading + 段首句，每页 `[page N · skim: X of Y sentences]`）/ 完整单元等距抽样；没有目录时直接 skim / 抽样。`view:"outline"` 只出目录。两种情况都写明未覆盖范围。HTTP 模式下可被请求头 `x-mmgrep-max-text-inline-chars` 按客户端覆盖（硬上限 `200000`） | 用默认值。**全文永远落盘，不受此限制** |
 | `MMGREP_MAX_CONCURRENCY` | integer | `2` | 单次调用内并行跑的 ffmpeg / 渲染任务数 | 用默认值。机器弱时调成 `1` |
 | `MMGREP_AUDIO_MIN_DBFS` | number | `-35` | 音频体检：判定「有有效声音」的平均音量下限（dBFS）。低于它 → `too-quiet`，**不跑 ASR** | 用默认值。录音确实偏小声时调低（如 `-45`） |
 | `MMGREP_AUDIO_MIN_SPEECH_RATIO` | number | `0.05` | 音频体检：判定「有有效声音」的非静音时长占比下限（0–1） | 用默认值。与 `MMGREP_AUDIO_MIN_DBFS` 是 **或** 的关系，任一不满足即判 `too-quiet` |
@@ -2039,3 +2223,476 @@ provider 无法保证原字符时必须返回 `textOrigin = "ocr"` / `"unknown"`
 | 10 | **图片类文档 → `media_type: "pdf"` 的偏差** | cangjie 契约枚举里没有 `image`，所以图片文档在 `document.json` 里映射成 `pdf`，真实类型记在 `manifest.source.mediaType`。这是契约层面的妥协；若 cangjie 之后给枚举加了 `image`，映射应改回 | §9.4 |
 | 11 | **builtin 启发式 blocks 的准确度** | builtin typeset 的「标题 / 双栏 / 表格」判定是启发式（见 `src/providers/doc/builtin.js`），skim 与生成的目录都标注了 best-effort。要提升结构准确度就配 `MMGREP_TYPESET_PROVIDER=mineru`；是否要再做一轮启发式回归，需产品定 | §5.4 skim、§5.1 目录 |
 | 12 | **云端 MinerU 的 `textOrigin` 可能未知** | 云端结果包若不返回 `parse_mode` / OCR 证据，provider 只能保守标 `unknown`（下游按 `ocr` 处理）。是否要求用户显式声明 `model_version` 来消歧，需产品定 | §2.5 逐页映射、§12.3 |
+
+---
+
+## 15. `media_bookmark` — 增删改媒体目录（0.3.0）
+
+> 0.3.0 新增的写工具。目录（书签 / 章节）的唯一真相源是源文件旁的
+> `<file>.mmgrep.bookmark.json`（sidecar）；每次写入同时把目录嵌入文件本身：PDF 原地重写 outline，
+> 视频 / 录音只写一个 VTT（**从不修改媒体文件**），图片只有 sidecar。
+
+### 15.1 工具描述（英文，含中文触发词）
+
+```text
+Write bookmarks (an outline, chapters) into a local media file so they survive across sessions and are
+visible to humans in the file itself: the PDF outline for a PDF, a sidecar VTT for video/audio, and a
+sidecar JSON for every supported media type.
+(写入书签 / 目录 / 章节：PDF 改写文件自带目录；视频、音频写同名 .mmgrep.bookmark.vtt；
+所有类型都写 <file>.mmgrep.bookmark.json 侧车。中文触发词：书签、目录、章节、bookmark、outline、chapter。)
+
+The sidecar "<file>.mmgrep.bookmark.json" is the single source of truth. The first write (no sidecar yet)
+imports the file's own outline — PDF bookmarks, or video/audio chapter markers — as b1…bN in file order,
+then applies this call. New ids are max+1 and are never reused; update keeps the id. One call can mix
+add / remove / update; they are applied remove → update → add, all-or-nothing: if anything is invalid,
+nothing is written and every problem is listed at once (unknown id, bad field, page/time out of range,
+duplicate ids, malformed entry, …). An image has no native outline and gets the sidecar only; text and
+Office documents are not supported.
+
+WARNING — this tool modifies files:
+- A PDF's outline is rewritten IN PLACE: the PDF file itself is modified in place, no copy is made.
+- Files are written NEXT TO the source: a *.mmgrep.* sidecar for every media type, plus
+  *.mmgrep.bookmark.vtt for video/audio. They are not written into the cache directory.
+- When a sidecar already exists, external edits to the file's own outline are OVERWRITTEN on the next write.
+- Protect your originals with git (or a backup) before calling this tool.
+
+After the write, media_probe / media_overview / media_locate show this outline (ids b1…bN) instead of the
+file's native one. The result contains the full outline, the sidecar path, the embed target, and every
+check result. (书签 / 目录 / 章节 / bookmark / outline / chapter)
+```
+
+### 15.2 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|---|---|:---:|---|---|
+| `path` | string | ✅ | — | 本地绝对路径（PDF / 图片 / 视频 / 录音） |
+| `add` | array | ❌ | `[]` | 新增条目；**不许带 `id`**（id 由 server 分配） |
+| `remove` | string[] | ❌ | `[]` | 要删除的 id（`b1`、`b12` …） |
+| `update` | array | ❌ | `[]` | 要修改的条目：`{id, ...至少一个可改字段}`；不能改 id |
+
+`add` / `remove` / `update` 至少给一个，三者全空会被拒绝。一次调用可以混用三种操作，依次应用
+**remove → update → add**。
+
+### 15.3 条目结构（按媒体）
+
+**PDF**（`media: "pdf"`）：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|:---:|---|
+| `title` | string | ✅ | 非空；首尾空白与连续空白会被折叠 |
+| `page` | integer | ✅ | **物理**页码，1-based；probe 知道 `pageCount` 时校验 `1 ≤ page ≤ pageCount` |
+| `level` | integer | ❌ | 书签层级，≥1 的整数，默认 1；决定 outline 的缩进 |
+
+**视频 / 录音**（`media: "video"` \| `"audio"`）：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|:---:|---|
+| `title` | string | ✅ | 非空；单行（写入 VTT 时折叠为一行） |
+| `start` | number | ✅ | 起点，秒，≥0；知道时长时 `< duration` |
+| `end` | number | ❌ | 终点，秒，必须 `> start` 且 `≤ duration`；省略时不写（回读时按 VTT 的缺省规则补） |
+
+**图片**（`media: "image"`）：只有 `title`，没有位置字段。
+
+通用规则：未知字段直接拒绝；`add` 条目里出现 `id` 会报错并提示「要换 id 请 remove 再 add」；
+`update` 必须带 `id` 且至少改一个可写字段（PDF：`title` / `page` / `level`；视频/录音：
+`title` / `start` / `end`）。
+
+### 15.4 sidecar
+
+- 路径：与源文件同目录、同 basename（**含扩展名**）加后缀：
+  `/abs/a.pdf` → `/abs/a.pdf.mmgrep.bookmark.json`。
+- 结构（UTF-8 JSON，`version` 固定 1）：
+
+```json
+{
+  "version": 1,
+  "media": "pdf",
+  "entries": [
+    { "id": "b1", "title": "Introduction", "page": 1, "level": 1 },
+    { "id": "b2", "title": "Methods", "page": 3, "level": 2 }
+  ]
+}
+```
+
+- 条目按位置排序：PDF 按 `page`（稳定），视频 / 录音按 `start`（稳定），图片保持写入顺序。
+- 条目字段就是 §15.3 的字段 + `id`；PDF 条目必须带 `page` 与 `level`。
+- **sidecar 一旦存在就是唯一真相源**：后续读侧只展示它，写侧也只以它为基准。文件自带的
+  outline 只在**第一次写入**时用来导入。
+- 损坏的 sidecar（JSON 坏、`version` 不对、`media` 与文件不符、条目结构错、id 重复……）→
+  `INVALID_ARGUMENT`，文案包含路径与每一个具体问题；**绝不覆盖**它，也不会拿文件自带目录顶替。
+- 用户手工编辑 sidecar 是合法输入：只要结构合法就按原样接受（存储条目只做结构校验，不按当前
+  页数 / 时长重新卡范围；旧条目不能因为文件变短而卡死写入）。
+- 并发：没有锁与合并。两个写调用同时改同一个文件时，后写者胜出（sidecar 最后写入者胜出）。
+
+### 15.5 id 规则与首次导入
+
+- id 前缀固定 `b`：`b1`、`b2`、…；`isEntryId` 只认 `^b[1-9]\d*$`（没有 `b0`）。
+- **首次写入**（sidecar 不存在）：用与读侧完全相同的 derive 助手，把文件自带目录按文件顺序导入成
+  `b1…bN`，再应用本次操作。PDF 跳过没有物理页码的条目；视频 / 录音按章节顺序；图片没有可导入的
+  原生目录（导入数恒为 0）。导入条目的 `title` 缺省为 `Page N` / `Chapter N`。
+- 新增条目的 id = **操作前**条目里的 max + 1；同一次调用里连续新增会继续递增（不复用、不重排）。
+- `update` 不改 id；`remove` 不重排剩余 id（删掉 `b2` 后不会把 `b3` 变成 `b2`）。
+- 想换 id 只能 `remove` 再 `add`（会拿到新的 max+1）。
+
+### 15.6 操作顺序与「全有或全无」
+
+1. 读 sidecar（不存在 = 首次写入；损坏 = 立即失败，什么都不写）。
+2. 首次写入时导入文件自带目录。然后按 **remove → update → add** 应用本次操作。
+3. 所有问题一次性收集：重复 id、未知 id、`update` 与 `remove` 同一个 id、字段非法、越界页 /
+   越界时间……全部列出来，文案形如：
+
+```text
+media_bookmark refused the request, so nothing was written:
+  - remove[0]: unknown id "b9" (known: b1, b2, b3)
+  - add[1]: page 99 is outside 1..28
+Fix the listed problems and call again. Nothing was written: no sidecar, no embed target.
+```
+
+任何一条错误都意味着**没有 sidecar、没有嵌入、没有临时文件残留**。
+
+### 15.7 嵌入目标
+
+写入前先算好嵌入目标；每次写入都嵌入（没有 `embed` 开关）：
+
+| 媒体 | 嵌入目标 | 行为 |
+|---|---|---|
+| PDF | 源 PDF 本身（**原地**） | 用 `mutool run pdf-outline-writer.js` 重写 outline；不出副本 |
+| 视频 / 录音 | `<dir>/<basename>.mmgrep.bookmark.vtt` | WEBVTT；cue id = b1…；cue 文本 = title；缺省 `end` = 下一条 `start`，最后一条 = 媒体时长。**源媒体字节不变** |
+| 图片 | 无（`(none — sidecar only)`） | 只写 sidecar |
+
+写工具是 0.3.0 对「不写用户文件」的明确例外：sidecar / VTT 只落在源文件旁边、只写 `*.mmgrep.*`，
+PDF 本身则被原地改写（不出副本）。
+
+### 15.8 检查与原子性
+
+顺序固定：**校验与合并 → 嵌入并跑完全部检查 → 原子写 sidecar → 回读 sidecar**。
+
+- 临时文件与目标同目录（`.<basename>.mmgrep-tmp-<pid>-<rand>.pdf` + 计划 JSON），成功后
+  `rename` 覆盖目标；失败删除临时文件，原文件字节不变。
+- PDF outline 的检查项（顺序固定，任一失败即中止）：
+
+| check | 内容 |
+|---|---|
+| `writer-exit` | mutool 退出码 0，临时 PDF 非空 |
+| `qpdf-check` | `qpdf --check` 退出 0（或 3 = 只有警告）；没装 qpdf 时用 mutool 重新打开代替 |
+| `page-text` | 页数、首页 / 中间页 / 末页文本与原文件一致 |
+| `outline-readback` | 回读 outline 与 sidecar 逐项一致（标题、层级、物理页） |
+
+- VTT 的检查项：`vtt-readback`（用自家解析器回读比对）、`media-unchanged`（源媒体哈希不变）；
+  最后一条没有 `end` 且拿不到媒体时长时另加 `vtt-duration`。
+- 嵌入失败 / 某项 check 失败 → `INTERNAL`，文案 `embedding failed for "<target>", so the sidecar
+  was not written:` + 失败项；sidecar 不写。
+- sidecar 用「临时文件 → rename」原子写；写完回读，条目 JSON 不一致 → `INTERNAL`
+  （`read back a different sidecar than it wrote`）。
+- sidecar 写失败时错误里注明「嵌入已经完成」——文件本体可能已经被改动，需要用户决定是否重试。
+- 加密 / 签名 PDF → `UNSUPPORTED_MEDIA_TYPE`（提示先解密 / 去签名，不尝试写）；缺 `mutool` →
+  `TOOL_NOT_FOUND` + 安装提示。
+- 不做回滚 / 历史 / 外部改动检测；用户在 Acrobat 等处改的 outline 会在下一次写入时被 sidecar 覆盖。
+
+### 15.9 返回结构
+
+文本形如：
+
+```text
+Bookmarks written for "/abs/a.pdf" (pdf): 3 entries; imported 2 from the file's own outline.
+applied: added b3
+sidecar: /abs/a.pdf.mmgrep.bookmark.json
+embed target: /abs/a.pdf (in place)
+checks: writer-exit: ok (mupdf 1.x); qpdf-check: ok; page-text: ok (6 pages identical); outline-readback: ok (3 entries); sidecar-readback: ok (3 entries)
+
+OUTLINE (3 entries, physical pages):
+b1  p.1  Introduction
+  b2  p.3  Methods
+b3  p.9  Results
+```
+
+`structuredContent`：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `path` | string | resolved 绝对路径 |
+| `media` | `"pdf"` \| `"video"` \| `"audio"` \| `"image"` | 书签媒体类型 |
+| `sidecarPath` | string | sidecar 绝对路径 |
+| `created` | boolean | 本次是否首次创建 sidecar |
+| `imported` | integer | 首次写入时从文件自带目录导入的条目数 |
+| `applied.remove` / `applied.update` / `applied.add` | integer | 三种操作实际生效的条数 |
+| `embed.target` | string | 嵌入目标；没有嵌入器时是 `(none — sidecar only)` |
+| `embed.checks[]` | array | 每项 `{name, ok, detail}` |
+| `checks[]` | array | 汇总检查项（含 `sidecar-readback`） |
+| `outline.source` | `"sidecar"` | 结果里的目录永远来自 sidecar |
+| `outline.available` | boolean | 恒为 true（删光所有条目时 `total = 0`，sidecar 仍为空数组、仍是唯一真相源，见 §15.10） |
+| `outline.total` / `outline.entries` | integer / array | 完整目录，条目已带 id |
+
+工具的 annotation 是 `{readOnlyHint: false, destructiveHint: true, idempotentHint: false,
+openWorldHint: false}`。
+
+### 15.10 读侧行为（probe / overview / locate）
+
+`media_probe`、`media_overview`（`view: "outline"` / `"auto"`）与 `media_locate` 展示**同一份**目录，
+来源按优先级取第一个可用的，不合并、不去重：
+
+1. **bookmark sidecar**（存在且可读时永远优先）；
+2. 文件自带目录：PDF 书签 / 视频、录音的容器章节；
+3. 文档 heading 生成（**仅 media_overview**，请求范围里 ≥5 个 heading 时）。
+
+行格式处处一致：PDF `b1  p.1  Introduction`（层级用行首两空格缩进，最多 6 层），视频 / 录音
+`b1  00:12:34  Opening`；没有作者 / agent 之分。首行给出 source 与条数，例如：
+
+```text
+outline: sidecar — 3 entries — use the outline to pick a range
+outline: PDF outline — 68 entries — full outline in structuredContent.outline and manifest.json
+outline: container chapters — 4 chapters — use the outline to pick a range
+outline: generated from headings — 6 entries (best-effort: built from block structure; full outline in structuredContent.outline and manifest.json)
+```
+
+- 有 sidecar 时，目录块**最后一行**是 `full detail: <sidecar path>`（probe 的 `How to read:` 与
+  overview 的 `note:` 在目录块之后）。
+- 没有 sidecar 时，读侧用共享 derive 助手按文件自带目录顺序推导 b1…bN，**与 media_bookmark 首次
+  导入完全一致**；probe 文本最多展示 2 层 / 60 条，其余 `+N more`，完整目录在
+  `structuredContent.outline`（overview 还写进 `manifest.json`）。
+- sidecar 损坏 → 回退到文件自带目录（或 overview 的 heading 生成），文本里给一行
+  `note: the bookmark sidecar "<path>" could not be read (...) — showing <来源> instead.`，
+  **不抛错**；`structuredContent.outline.sidecarError` 同样给出短原因。
+- sidecar 合法但条目为空 → 以 sidecar 为准（`source: "sidecar"`、`available: false`、不显示文件自带
+  目录）：用户删光了书签，不能把旧 outline 又拿出来。
+- 只读工具**从不**创建、修改或删除 sidecar / VTT，也不会留下临时文件。
+- 图片：probe 只在有 sidecar 时展示目录；overview / locate 同理。
+
+### 15.11 错误码
+
+| 码 | 场景 |
+|---|---|
+| `INVALID_ARGUMENT` | `path` / 参数 / 条目校验失败；sidecar 损坏；三种操作全空；`update` 想改 id；未知 id；页 / 时间越界 |
+| `UNSUPPORTED_MEDIA_TYPE` | 该书签媒体类型不支持（如 Office）；PDF 加密 / 带签名 |
+| `TOOL_NOT_FOUND` | 没有 `mutool`（写 PDF 用；文案带安装提示）；`qpdf` 缺失时可回退，不单独报错 |
+| `INTERNAL` | 嵌入失败 / 某项 check 失败 / sidecar 写失败 / sidecar 回读不一致 |
+| `PATH_NOT_FOUND` / `PATH_NOT_FILE` / `PATH_NOT_READABLE` | 见 §2.4 |
+
+---
+
+## 16. `media_annotate` — 增删改媒体批注（0.3.0）
+
+> 0.3.0 新增的写工具。批注的唯一真相源是源文件旁的 `<file>.mmgrep.annotation.json`。每次写入同时
+> 嵌入：PDF 原地写真正的批注对象（**不重写页面正文**），视频 / 录音只写
+> `<file>.mmgrep.annotation.vtt`，图片只有 sidecar。批注与书签互不引用（两套 sidecar、两套 id）。
+
+### 16.1 工具描述（英文，含中文触发词）
+
+```text
+Write annotations (notes, comments, sticky notes, marked areas) into a local media file so they
+survive across sessions and are visible to humans in the file itself: real PDF annotation objects for a
+PDF, a sidecar VTT for video/audio, and a sidecar JSON for every supported media type.
+(写入批注 / 注释 / 评论 / 标注：PDF 原地写真正的批注对象；视频、音频写同名
+.mmgrep.annotation.vtt；所有类型都写 <file>.mmgrep.annotation.json 侧车。
+中文触发词：批注、注释、评论、标注、annotate、comment、note。)
+
+The sidecar "<file>.mmgrep.annotation.json" is the single source of truth. The first write (no sidecar
+yet) imports every note-like annotation of a PDF — Text, FreeText, Square, Circle, Line, Polygon,
+PolyLine, Highlight, Underline, Squiggly, StrikeOut, Stamp, Caret and Ink, in page order — as n1…nN,
+including its raw geometry and original author, then applies this call. Link annotations, form widgets
+and popups are never imported or touched. Entries are anchored per media type:
+- PDF: page (1-based PHYSICAL page) + type ("text" = sticky note, "square" = rectangle area; "square"
+  also needs rect {x,y,width,height} as fractions 0..1 of the page). Other annotation types cannot be
+  created in this version, but imported ones are kept verbatim (including raw geometry) and can be
+  updated (note) or removed.
+- video/audio: start (seconds, < duration) and optional end (default start + 5 s, clipped to the end of
+  the media). No page, no rect, no type.
+- image: rect only (fractions of the image); no page, start/end or type.
+- every entry: note (plain text, 1..4000 characters, newlines allowed) and, for PDF, type.
+
+Ids are n1, n2, …; new ids are max+1 and are never reused by this call; update keeps the id.
+One call can mix add / remove / update; they are applied remove → update → add, all-or-nothing: if
+anything is invalid, nothing is written and every problem is listed at once (unknown id, bad field,
+page/time out of range, duplicate ids, malformed entry, …).
+
+The author is resolved once per call: the "author" argument, else the MCP client's name, else
+"MultiMediaGrep". The model name is never used. Imported annotations keep their original
+author; update never changes it.
+
+WARNING — this tool modifies files:
+- A PDF is modified IN PLACE: annotation objects are written into the PDF file itself, no copy is made
+  (the page content is not rewritten). Video and audio files are never modified — only the VTT is written.
+- Files are written NEXT TO the source: a *.mmgrep.* sidecar for every media type, plus
+  *.mmgrep.annotation.vtt for video/audio. They are not written into the cache directory.
+- When a sidecar already exists, external edits to the file's own annotations are OVERWRITTEN on the next
+  write. To change an annotation, use update; the sidecar wins over the file.
+- Protect your originals with git (or a backup) before calling this tool.
+
+The result lists every written annotation in the same shape the read side uses ("n1 (p.12): note",
+"n1 (00:12:34–00:12:39): note"), plus the sidecar path, the embed target, and every check result.
+(批注 / 注释 / 评论 / 标注 / annotate / comment / note)
+```
+
+### 16.2 参数
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|---|---|:---:|---|---|
+| `path` | string | ✅ | — | 本地绝对路径（PDF / 图片 / 视频 / 录音） |
+| `add` | array | ❌ | `[]` | 新增批注；不许带 `id`；`author` 由 server 解析 |
+| `remove` | string[] | ❌ | `[]` | 要删除的 id（`n1`、`n12` …） |
+| `update` | array | ❌ | `[]` | `{id, ...至少一个可改字段}`；不能改 id、不能改 author |
+| `author` | string | ❌ | — | 覆盖本次调用的作者名；≤200 字符 |
+
+不传 `author` 时按：MCP `initialize` 的 `clientInfo.name`（如 `claude-code`）→ 都没有时
+`"MultiMediaGrep"`。**不使用模型名、不读环境变量**。导入的批注保留原作者；`update` 不改 author。
+
+### 16.3 条目结构（按媒体）
+
+**PDF**（`media: "pdf"`）：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|:---:|---|
+| `type` | `"text"` \| `"square"` | ✅ | 新建只支持这两种；其他类型（highlight / ink / …）只能从现有 PDF 导入 |
+| `note` | string | ✅ | 纯文本，1–4000 字符；可多行 |
+| `page` | integer | ✅ | 1-based **物理**页码；知道 `pageCount` 时校验上界 |
+| `rect` | object | ❌ | `{x, y, width, height}`，0..1 比例、左上原点（与 `media_zoom` 的 `crop` 同一空间）；`square` **必填**；`text` 可省略（省略时放页面左上角留白并逐条错开）；四边都必须在 `[0,1]` 内且 `x+width ≤ 1`、`y+height ≤ 1` |
+
+**视频 / 录音**（`media: "video"` \| `"audio"`）：`note`（必填）、`start`（秒，必填，≥0，< 时长）、
+`end`（可选，默认 `start + 5` 秒并截到媒体时长，必须 `> start`）。没有页面、rect 或 type。
+
+**图片**（`media: "image"`）：`note` + 可选 `rect`；只有 sidecar（图片没有原生批注面）。
+
+### 16.4 sidecar
+
+- 路径：`/abs/a.pdf` → `/abs/a.pdf.mmgrep.annotation.json`。
+- 结构（`version` 固定 1）：
+
+```json
+{
+  "version": 1,
+  "media": "pdf",
+  "entries": [
+    { "id": "n1", "type": "text", "note": "check this number", "author": "claude-code",
+      "page": 3, "rect": { "x": 0.1, "y": 0.2, "width": 0.2, "height": 0.05 } }
+  ]
+}
+```
+
+- 位置排序：PDF 按 `page` → `rect.y` → `rect.x`（没有 rect 的排后）→ id；视频 / 录音按 `start` → id；
+  图片保持写入顺序。
+- sidecar 一旦存在就是唯一真相源；损坏 → `INVALID_ARGUMENT`，绝不覆盖；存储条目只做结构校验
+  （旧条目不能因为文件页数 / 时长变化而卡死写入）。
+- 并发同 bookmark：后写者胜出。
+
+### 16.5 id 规则与首次导入
+
+- id 前缀固定 `n`：`n1`、`n2`、…；`isEntryId` 只认 `^n[1-9]\d*$`。
+- **首次写入**导入 PDF 里的全部**注释类批注**：Text、FreeText、Square、Circle、Line、Polygon、
+  PolyLine、Highlight、Underline、Squiggly、StrikeOut、Stamp、Caret、Ink。按 page → rect.y →
+  rect.x 排序后连续编号 `n1…nN`；`note` 缺省 `(no note)`，`author` 缺省 `unknown`；`rect` 从批注
+  几何换算成 0..1；每条保留原始几何（`raw`）供写入时匹配。
+- **Link、表单 Widget、Popup 从不导入、从不修改**；FileAttachment / Movie / Screen / Sound /
+  PrinterMark / TrapNet / Watermark / Redact 也不导入、不修改。
+- 视频 / 录音 / 图片没有可导入的原生批注（导入数恒为 0）。
+- 新增 id = 操作前 max + 1，同一调用内递增，不复用；`update` 不改 id；`remove` 不重排。
+- 每次写入**整体替换** PDF 的注释类批注为 sidecar 内容；未改动条目按 raw 匹配保留原对象与外观流，
+  只重建改动过的条目。v1 不能新建的类型（highlight / ink / …）导入后可以改 note、可以删，几何原样
+  保存以便往返。
+
+### 16.6 操作顺序与「全有或全无」
+
+同 bookmark：读 sidecar → 首次写入导入 → **remove → update → add** → 一次性列出所有问题 →
+任何错误都不写 sidecar、不嵌入、不留临时文件。`update` 与 `remove` 不能指向同一个 id；`update`
+不能改 author；`rect` / `square` / `end > start` 等跨字段规则在合并后统一校验。
+
+### 16.7 嵌入目标
+
+| 媒体 | 嵌入目标 | 行为 |
+|---|---|---|
+| PDF | 源 PDF 本身（**原地**） | `mutool run pdf-annotation-writer.js preflight\|read\|write`；写真正的 Text / Square 批注对象；页面正文不重写 |
+| 视频 / 录音 | `<dir>/<basename>.mmgrep.annotation.vtt` | WEBVTT；cue id = n1…；cue 正文 = note（多行保留，空行换成只含一个空格的行）；缺省 end = start + 5s（截到时长）；源媒体字节不变 |
+| 图片 | 无（`(none — sidecar only)`） | 只写 sidecar |
+
+新建 Text 是标准 PDF 便签（带 `/Popup`），图标 20×20pt；Square 的 `/Rect` 每边放宽 1pt；没有 rect 的
+Text 放在页面左上角留白（边距 12pt、逐条下移 26pt）。
+
+### 16.8 检查与原子性
+
+顺序同 bookmark：校验与合并 → 嵌入 + 全部检查 → 原子写 sidecar → 回读。
+
+| check | 内容 |
+|---|---|
+| `writer-exit` | mutool 退出码 0，临时 PDF 非空；detail 带 created / updated / kept / deleted 计数 |
+| `qpdf-check` | 同 bookmark（0 或 3 通过；无 qpdf 用 mutool 重开） |
+| `page-text` | 页数、首页 / 中间页 / 末页文本与原文件一致 |
+| `annotation-readback` | 回读批注与 sidecar 逐条一致（Text 只比左上角；Square 留 2pt 容差） |
+| `other-annotations` | Link / 表单 Widget / Popup 写入前后完全一致 |
+| `vtt-readback` | VTT 版本才用：回读 cue 与 sidecar 比对 |
+| `media-unchanged` | VTT 版本才用：源媒体哈希不变 |
+| `vtt-end-default` | VTT 版本才用：缺省 end 已按规则补上 |
+
+失败语义同 bookmark：嵌入失败 → `INTERNAL` 且 sidecar 不写；sidecar 写失败注明嵌入已完成；
+sidecar 回读不一致 → `INTERNAL`。加密 / 签名 PDF 拒绝；缺 mutool → `TOOL_NOT_FOUND` + 安装提示。
+
+### 16.9 返回结构
+
+```text
+Annotations written for "/abs/a.pdf" (pdf): 2 entries; imported 1 from the file's own annotations.
+author: claude-code
+applied: added n2
+sidecar: /abs/a.pdf.mmgrep.annotation.json
+embed target: /abs/a.pdf (in place)
+checks: writer-exit: ok (mupdf 1.x, created 1, updated 0, kept 1, deleted 0); qpdf-check: ok; page-text: ok (6 pages identical); annotation-readback: ok (2 entries); other-annotations: ok (links/widgets/popups unchanged); sidecar-readback: ok (2 entries)
+
+ANNOTATIONS (2 entries, physical pages):
+n1 (p.3): check this number
+n2 (p.12): 这里的公式与正文不一致
+```
+
+`structuredContent`：`path` / `media` / `sidecarPath` / `created` / `imported` / `applied` /
+`author` / `embed` / `checks` / `annotations`（`{source: "sidecar", available: true, total, entries}`）。
+annotation 同 bookmark：`destructiveHint: true`。
+
+### 16.10 读侧行为（probe / overview / locate）
+
+来源优先级：**annotation sidecar → 文件自带 PDF 批注**；不合并。sidecar 损坏时回退并给短原因；
+sidecar 合法但为空时以 sidecar 为准（不回退）。
+
+- `media_probe`：只给条数与 sidecar 路径，不展开 note：
+
+```text
+annotations: 2 (sidecar)
+annotation sidecar: /abs/a.pdf.mmgrep.annotation.json
+```
+
+没有批注时 `annotations: 0 (none)`（文件自带批注时是 `annotations: 3 (the file's own annotations)`）。
+
+- `media_overview`：在请求范围旁输出批注块，行格式与 `media_annotate` 结果一致：
+
+```text
+annotations (2 of 2 in pages 1-12, sidecar):
+n1 (p.3): check this number
+n2 (p.12): 这里的公式与正文不一致
+full detail: /abs/a.pdf.mmgrep.annotation.json
+```
+
+最多 20 条 / 2000 字符，其余 `+N more annotations (all annotations in structuredContent.annotations)`；
+`structuredContent.annotations` 带完整条目、source、`totalInRange` 与 sidecar 路径。视频 / 录音用
+`n1 (00:12:34–00:12:39): note`，图片用 `n1: note`。
+
+- `media_locate`：除了媒体文字，也在批注 `note` 里搜关键词；命中单独成段，永远不计入媒体命中数，
+  并明确标注这是**批注**、不是媒体内容：
+
+```text
+annotation matches for "deimmunization" (1):
+  n2 (p.12): check this number
+note: the lines above are ANNOTATIONS — notes written next to the media (sidecar or the file itself),
+not media content. They are not part of the transcript or the page text.
+```
+
+`structuredContent.annotationMatches[]` 每项 `{kind: "annotation", id, media, page, startMs, endMs,
+startSec, endSec, text, author, hits, fuzzy, source: "annotation", origin, line}`。
+
+- 只读工具**从不**创建 / 修改 / 删除 annotation sidecar 或 VTT。
+
+### 16.11 错误码
+
+同 §15.11；另外：
+
+| 码 | 场景 |
+|---|---|
+| `INVALID_ARGUMENT` | `type` 不是 `text` / `square`（新建）；`square` 缺 `rect`；`rect` 越界；`note` 为空 / 超 4000 字；`author` 超 200 字；`end ≤ start` |
+| `UNSUPPORTED_MEDIA_TYPE` | 批注不支持该媒体（Office）；PDF 加密 / 带签名 |
+| `TOOL_NOT_FOUND` | 没有 `mutool`（写 PDF 批注；读 PDF 批注时缺它只降级为「读不到」，不报错） |
+
+---

@@ -229,7 +229,8 @@ test('注册：media_annotate 是第 6 个工具，带破坏性注解、警告�
     assert.match(annotate.description, /git/);
     assert.match(annotate.description, /n1, n2/);
     assert.match(annotate.description, /4000/);
-    assert.match(annotate.description, /9z5\.38\.2/);
+    // 0.3.0 起 reader 已接上：描述不再提「for now empty」，而是说明导入全部注释类批注
+    assert.match(annotate.description, /imports every note-like annotation/i);
   });
 });
 

@@ -7,6 +7,8 @@
 export const SERVER_INSTRUCTIONS = `MultiMediaGrep gives you eyes and ears over LOCAL media files: video, audio recordings and
 documents. It never downloads anything and never calls an LLM — you always pass a local
 absolute path, and it prepares images and text for your own multimodal model to look at.
+Read with media_probe → media_overview → media_zoom / media_locate; write with
+media_bookmark / media_annotate.
 
 READING ORDER
 1. media_probe first — cheap, no image tokens. Gives duration / page count / tracks and
@@ -17,10 +19,15 @@ READING ORDER
    output of a bad OCR pass: call media_overview({ path, ocr: "force" }) to re-recognize the
    requested pages with the OCR provider (this needs MMGREP_OCR_PROVIDER configured). Forced
    pages are tagged "ocr" and cached separately from the default "auto".
-   The probe also shows the file's own outline when it has one: PDF bookmarks (PHYSICAL page
-   numbers — the same 1-based numbers media_overview accepts — plus the printed page label
-   when the PDF defines one) and chapter markers in video/audio files (title + start/end
-   timestamps). Use it to pick a range instead of reading the whole file.
+   The probe shows ONE outline from the first available source: the bookmark sidecar
+   ("<file>.mmgrep.bookmark.json", written by media_bookmark), otherwise the file's own
+   outline — PDF bookmarks (PHYSICAL page numbers — the same 1-based numbers media_overview
+   accepts — plus the printed page label when the PDF defines one) or chapter markers in
+   video/audio files (title + start/end timestamps). Every entry carries an id (b1…bN); those
+   are the ids media_bookmark accepts. Use the outline to pick a range instead of reading the
+   whole file. When a sidecar exists, its last outline line is "full detail: <sidecar path>".
+   The probe also reports the file's ANNOTATIONS (the count and the annotation sidecar path).
+   The notes themselves are shown by media_overview and searched by media_locate.
 2. media_overview — the main read. Video: numbered storyboard grids plus a time-aligned text
    index. Audio: a timestamped transcript. Document: page thumbnails plus page text.
    The full text of the requested range is written to disk, and the result text ends with a
@@ -36,17 +43,46 @@ READING ORDER
    fit — is sampled evenly from complete units, with a "preview: sampled ..." line naming what
    was inlined and the pages/ranges not represented. In a skim that does not fit, all headings
    are kept and sentences are sampled; only when even the headings do not fit are they sampled.
-   A file's own outline (PDF bookmarks / video-audio chapters) is another starting point.
-   With view "auto" (default), a range that fits still returns the full text; when it does not
-   fit and an outline exists, the outline comes first and the rest of the budget goes to the
-   text preview. A document without bookmarks gets an outline generated from its headings
-   (at least 5), labelled "outline: generated from headings". view "outline" returns only the
-   outline; for video/audio without chapters it says "no chapters" and generates nothing —
-   write your own outline from the overview in that case. view "text" forces the text pipeline.
+   The outline comes from the same single source as the probe: the bookmark sidecar first, then
+   the file's own PDF bookmarks / video-audio chapters. A document without either may get an
+   outline generated from its headings (at least 5), labelled "outline: generated from
+   headings"; video/audio without chapters is NEVER given a generated outline. With view "auto"
+   (default), a range that fits still returns the full text; when it does not fit and an outline
+   exists, the outline comes first and the rest of the budget goes to the text preview. view
+   "outline" returns only that outline. view "text" forces the text pipeline. When a sidecar
+   exists, its last outline line is "full detail: <sidecar path>".
+   The result also shows the ANNOTATIONS of the requested range, right next to the pages /
+   time range they belong to: the annotation sidecar when one exists, otherwise the file's own
+   PDF annotations. One per line, starting with its id ("n3 (p.12): note" for PDFs,
+   "n3 (00:12:34–00:12:39): note" for video/audio) — those are the ids media_annotate accepts.
+   The author is in structuredContent.annotations only. When an annotation sidecar exists, the
+   block ends with "full detail: <sidecar path>".
 3. media_zoom — only for parts that matter. One frame of a video (at, or a start/end window)
    or one page of a document, optionally cropped.
 4. media_locate — "where was X said" (timestamp) or "on which page" (page number). Text only
-   by default; includeFrame adds one picture at the best match.
+   by default; includeFrame adds one picture at the best match. It carries the same single
+   outline in structuredContent.outline, and it also searches annotation notes: annotation
+   hits are marked as annotations, never as media content.
+
+WRITING — bookmarks and annotations
+- media_bookmark writes the outline (PDF bookmarks, video/audio chapters, or the sidecar for an
+  image). media_annotate writes notes and comments. Call them only when the user asks you to
+  change a file, after reading it.
+- The sidecar next to the source is the single source of truth:
+  "<file>.mmgrep.bookmark.json" and "<file>.mmgrep.annotation.json". Each write also embeds:
+  a PDF's outline / annotation objects are rewritten IN PLACE — the PDF file itself changes,
+  no copy is made, and the page content is not rewritten. A video or audio file is never
+  modified: only "<file>.mmgrep.bookmark.vtt" / "<file>.mmgrep.annotation.vtt" is written.
+  An image gets the sidecar only.
+- The first write imports the file's own outline / annotations as b1…bN / n1…nN, then applies
+  the call. Afterwards the sidecar wins: external edits to the file's own outline / annotations
+  are overwritten by the next write. One call can mix add / remove / update (applied remove →
+  update → add) and is all-or-nothing: if anything is invalid, nothing is written and every
+  problem is listed at once. ids never change; new ids are max+1 and are never reused. Protect
+  your originals with git (or a backup) before calling a write tool.
+- The result lists the full outline / annotations in the read-side format, then the sidecar
+  path, the embed target and every check result. Read-only tools never create or modify a
+  sidecar.
 
 TEXT SOURCE ORDER — subtitles first, ASR only as a fallback
 1. a subtitle you select explicitly (subtitle: a file path, a track index, or a language code),
@@ -97,6 +133,12 @@ FORMATS
   of content.md (segments.jsonl and manifest.json sit in the same directory). Read those instead
   of asking for more inline text. If the export failed, the line says "full text: NOT written —
   <reason>" and the inline preview is all you have.
+- Annotation positions use the same units as the read tools: PDF page plus rect
+  {x, y, width, height} as fractions 0..1 of the page (top-left origin, the same space as
+  media_zoom crop); video/audio start/end in seconds, with end defaulted to start + 5 s and
+  clipped to the media duration; an image uses rect only.
+- Outline and annotation ids are stable: b1…bN for outlines, n1…nN for annotations. Pass them
+  back to media_bookmark / media_annotate unchanged.
 
 TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文档 / 转写 / 字幕 /
 关键帧 / 放大 / 提取文字 / 定位 / 截图), so Chinese requests match them too.`;

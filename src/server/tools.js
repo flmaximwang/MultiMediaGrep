@@ -216,8 +216,9 @@ author is in structuredContent.annotations only; the note text is shown as writt
 (批注按请求范围展示：行首 n1…nN 就是 media_annotate 的 id)
 
 Always call media_probe first: it tells you how long the file is, whether a subtitle source
-exists, which transcript source applies, and whether the file carries a built-in outline
-(PDF bookmarks / chapters), for free. Long media must be narrowed with
+exists, which transcript source applies, and which outline applies (bookmark sidecar first,
+then the file's own PDF bookmarks / video-audio chapters, or headings for a document), for
+free. Long media must be narrowed with
 start/end (video, audio) or pages (document) — one giant grid of a two-hour film gives you
 illegible cells and spoils the ending. Follow the continuation hint in the result to page
 through the rest.`;
@@ -275,9 +276,9 @@ speaker's exact words.
 
 The result also carries the same single outline as media_probe / media_overview in
 structuredContent.outline: the bookmark sidecar first, then the file's own PDF bookmarks or
-chapter markers. Its ids (b1…bN) are the ids media_bookmark accepts, and when a sidecar exists
-the last outline line is "full detail: <sidecar path>". Locate is read-only: it never creates or
-modifies a sidecar.
+chapter markers. Its entries carry the ids media_bookmark accepts (b1…bN), and
+structuredContent.outline.sidecarPath / sidecarError point at the bookmark sidecar when one
+exists. Locate is read-only: it never creates or modifies a sidecar.
 (定位结果也带同一份目录：sidecar 优先，其次文件自带目录；line 首 b1…bN 可用于 media_bookmark)
 
 It also searches the ANNOTATION text: the notes written next to the media (annotation
@@ -314,7 +315,7 @@ After the write, media_probe / media_overview / media_locate show this outline (
 file's native one. The result contains the full outline, the sidecar path, the embed target, and every
 check result. (书签 / 目录 / 章节 / bookmark / outline / chapter)`;
 
-export const ANNOTATE_DESCRIPTION = `Write annotations (notes, comments, sticky notes, highlighted areas) into a local media file so they
+export const ANNOTATE_DESCRIPTION = `Write annotations (notes, comments, sticky notes, marked areas) into a local media file so they
 survive across sessions and are visible to humans in the file itself: real PDF annotation objects for a
 PDF, a sidecar VTT for video/audio, and a sidecar JSON for every supported media type.
 (写入批注 / 注释 / 评论 / 标注：PDF 原地写真正的批注对象；视频、音频写同名
@@ -322,11 +323,14 @@ PDF, a sidecar VTT for video/audio, and a sidecar JSON for every supported media
 中文触发词：批注、注释、评论、标注、annotate、comment、note。)
 
 The sidecar "<file>.mmgrep.annotation.json" is the single source of truth. The first write (no sidecar
-yet) imports the file's own annotations (9z5.38.2 wires the reader; for now the list is empty), then
-applies this call. Entries are anchored per media type:
+yet) imports every note-like annotation of a PDF — Text, FreeText, Square, Circle, Line, Polygon,
+PolyLine, Highlight, Underline, Squiggly, StrikeOut, Stamp, Caret and Ink, in page order — as n1…nN,
+including its raw geometry and original author, then applies this call. Link annotations, form widgets
+and popups are never imported or touched. Entries are anchored per media type:
 - PDF: page (1-based PHYSICAL page) + type ("text" = sticky note, "square" = rectangle area; "square"
   also needs rect {x,y,width,height} as fractions 0..1 of the page). Other annotation types cannot be
-  created in this version, but imported ones are kept verbatim, including their raw geometry.
+  created in this version, but imported ones are kept verbatim (including raw geometry) and can be
+  updated (note) or removed.
 - video/audio: start (seconds, < duration) and optional end (default start + 5 s, clipped to the end of
   the media). No page, no rect, no type.
 - image: rect only (fractions of the image); no page, start/end or type.
