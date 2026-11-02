@@ -8,10 +8,11 @@
 //   - 首次写入从 probe.annotationOutline 导入 n1…nN（页 → rect.y → rect.x），与读侧派生一致；
 //   - 视频缺省 end = start + 5 s（截到时长）；
 //   - 损坏 sidecar 绝不覆盖；嵌入失败 / 检查项失败 → sidecar 不变、无临时文件；
-//   - 默认 PDF 嵌入器是 9z5.38.2 的占位：TOOL_NOT_FOUND 且什么都不写；
-//     视频 / 音频嵌入器从 9z5.38.3 起是真实现（写 .mmgrep.annotation.vtt，不改媒体）；
+//   - 默认 PDF / VTT 嵌入器都已实现（9z5.38.2 / 9z5.38.3）：读不懂的 PDF →
+//     INTERNAL（无 mutool 时 TOOL_NOT_FOUND），且什么都不写；
 //   - 图片 / 无嵌入器时只写 sidecar；导入的 raw / 不可新建类型原样保留。
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -32,6 +33,10 @@ import {
 /* ------------------------------------------------------------------ *
  * 测试夹具
  * ------------------------------------------------------------------ */
+
+function toolPresent(bin, args) {
+  return spawnSync(bin, args, { stdio: 'ignore' }).error === undefined;
+}
 
 const PDF_BYTES = Buffer.from('%PDF-1.7\n% annotations are fake\n');
 const MP4_BYTES = Buffer.concat([Buffer.alloc(4), Buffer.from('ftypisom'), Buffer.alloc(8)]);
@@ -611,11 +616,13 @@ test('embedder: null 明确只写 sidecar（不嵌入、不报错）', async (t)
 });
 
 /* ------------------------------------------------------------------ *
- * 默认嵌入器：PDF 仍是 9z5.38.2 的占位（TOOL_NOT_FOUND 且什么都不写）；
- * 视频 / 音频从 9z5.38.3 起是真实现（写 .mmgrep.annotation.vtt，不改媒体）
+ * 默认嵌入器（PDF 9z5.38.2 / VTT 9z5.38.3 都已实现）：读不懂的 PDF → INTERNAL，
+ * 什么都不写；VTT 的真实写入见 test/media/annotation-vtt-embedder.test.js
  * ------------------------------------------------------------------ */
 
-test('默认 PDF 嵌入器（占位）：TOOL_NOT_FOUND，不写 sidecar、无临时文件', async (t) => {
+test('默认 PDF 嵌入器：读不懂的 PDF → INTERNAL，不写 sidecar、无临时文件', {
+  skip: toolPresent('mutool', ['-v']) ? false : 'mutool (mupdf-tools) is not installed',
+}, async (t) => {
   const ws = await makeWorkspace();
   t.after(ws.cleanup);
 
@@ -626,8 +633,8 @@ test('默认 PDF 嵌入器（占位）：TOOL_NOT_FOUND，不写 sidecar、无�
     operations: { add: [{ type: 'text', note: 'x', page: 1 }] },
     context: { author: 'Agent' },
   }));
-  assert.equal(error.code, 'TOOL_NOT_FOUND');
-  assert.match(error.message, /MultiMediaGrep-9z5\.38\.2/);
+  assert.equal(error.code, 'INTERNAL');
+  assert.match(error.message, /cannot read the PDF/);
   assert.equal(existsSync(annotationEngine.sidecarPath(ws.pdf)), false);
   assert.deepEqual(await listTemps(ws.dir), []);
 });

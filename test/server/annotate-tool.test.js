@@ -488,7 +488,7 @@ test('非法操作：一次列出所有错误、什么都不写、不调嵌入�
   }, { annotationEmbedders: annotationEmbedders({ pdf }) });
 });
 
-test('默认嵌入器：PDF 仍是 9z5.38.2 的占位（TOOL_NOT_FOUND）；视频从 9z5.38.3 起写真实 VTT', async (t) => {
+test('默认嵌入器：PDF 与视频都走真实嵌入器（假 PDF 读不懂 → INTERNAL / 无 mutool 时 TOOL_NOT_FOUND）', async (t) => {
   const ws = await makeWorkspace();
   t.after(ws.cleanup);
 
@@ -497,9 +497,12 @@ test('默认嵌入器：PDF 仍是 9z5.38.2 的占位（TOOL_NOT_FOUND）；视�
       name: 'media_annotate',
       arguments: { path: ws.files.pdf, add: [{ type: 'text', note: 'x', page: 1 }] },
     });
+    // 9z5.38.2 之后 PDF 由真实嵌入器处理：这个夹具是个读不懂的假 PDF，
+    // 装了 mutool 时是 INTERNAL（"cannot read the PDF"），没装时是
+    // TOOL_NOT_FOUND + 安装提示。两种都算「明确报错、什么都没写」。
     assert.equal(pdf.isError, true);
-    assert.equal(errorCode(pdf), 'TOOL_NOT_FOUND');
-    assert.match(errorText(pdf), /MultiMediaGrep-9z5\.38\.2/);
+    assert.ok(['INTERNAL', 'TOOL_NOT_FOUND'].includes(errorCode(pdf)), errorText(pdf));
+    if (errorCode(pdf) === 'TOOL_NOT_FOUND') assert.match(errorText(pdf), /mupdf-tools/);
     assert.equal(existsSync(`${ws.files.pdf}.mmgrep.annotation.json`), false);
 
     // 9z5.38.3：视频嵌入器是真实现 → 写 sidecar + <源文件>.mmgrep.annotation.vtt
