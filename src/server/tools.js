@@ -1,4 +1,4 @@
-// src/server/tools.js —— 4 个 MCP 工具的定义与 handler
+// src/server/tools.js —— 5 个 MCP 工具的定义与 handler
 //
 // 分工（重要）：
 //   - 本文件负责**参数校验 + 分派 + 结果信封**（content blocks / structuredContent / 文本清单）。
@@ -20,6 +20,12 @@ import { exportAnalysis } from '../export/index.js';
 import { detectMediaType } from '../media/detect.js';
 import { DOC_SNIPPET_RADIUS, buildSnippet, countHits } from '../media/match.js';
 import { ROLLING_SUBTITLE_WARNING } from '../media/subtitles.js';
+import {
+  BOOKMARK_ID_PREFIX,
+  bookmarkEngine,
+  embedderFor as bookmarkEmbedderFor,
+  formatEntry as formatBookmarkEntry,
+} from '../media/bookmark/index.js';
 import {
   METHOD_MATRIX,
   ToolError,
@@ -212,6 +218,31 @@ Each match is tagged with its source. A match whose source is "asr" came from ma
 transcription, so the wording may be wrong (names, numbers, jargon) — do not present it as the
 speaker's exact words.`;
 
+export const BOOKMARK_DESCRIPTION = `Write bookmarks (an outline, chapters) into a local media file so they survive across sessions and are
+visible to humans in the file itself: the PDF outline for a PDF, a sidecar VTT for video/audio, and a
+sidecar JSON for every supported media type.
+(写入书签 / 目录 / 章节：PDF 改写文件自带目录；视频、音频写同名 .mmgrep.bookmark.vtt；
+所有类型都写 <file>.mmgrep.bookmark.json 侧车。中文触发词：书签、目录、章节、bookmark、outline、chapter。)
+
+The sidecar "<file>.mmgrep.bookmark.json" is the single source of truth. The first write (no sidecar yet)
+imports the file's own outline — PDF bookmarks, or video/audio chapter markers — as b1…bN in file order,
+then applies this call. New ids are max+1 and are never reused; update keeps the id. One call can mix
+add / remove / update; they are applied remove → update → add, all-or-nothing: if anything is invalid,
+nothing is written and every problem is listed at once (unknown id, bad field, page/time out of range,
+duplicate ids, malformed entry, …). An image has no native outline and gets the sidecar only; text and
+Office documents are not supported.
+
+WARNING — this tool modifies files:
+- A PDF's outline is rewritten IN PLACE: the PDF file itself is modified in place, no copy is made.
+- Files are written NEXT TO the source: a *.mmgrep.* sidecar for every media type, plus
+  *.mmgrep.bookmark.vtt for video/audio. They are not written into the cache directory.
+- When a sidecar already exists, external edits to the file's own outline are OVERWRITTEN on the next write.
+- Protect your originals with git (or a backup) before calling this tool.
+
+After the write, media_probe / media_overview / media_locate show this outline (ids b1…bN) instead of the
+file's native one. The result contains the full outline, the sidecar path, the embed target, and every
+check result. (书签 / 目录 / 章节 / bookmark / outline / chapter)`;
+
 /* ------------------------------------------------------------------ *
  * 参数 schema
  *
@@ -319,6 +350,30 @@ const INCLUDE_FRAME_PARAM = z.boolean().optional().describe(
   'Also return one picture at the best match (default false). Applicable to video and document only. (是否附带最佳匹配处的画面)',
 );
 
+// media_bookmark 的条目参数。字段全部 optional + passthrough：真正的语义校验
+// （必填、范围、未知字段、重复 id……）由引擎统一收集后**一次报全**，而不是让 zod
+// 在第一处错误就短路。顶层仍然 .strict()，未知的顶层参数照样拒绝。
+const BOOKMARK_ENTRY_INPUT = z.object({
+  id: z.string().optional().describe('Existing bookmark id (b1, b2, …). Required for update; add must not include an id.'),
+  title: z.string().optional().describe('Bookmark title. Required for add (non-empty); optional for update.'),
+  page: z.number().optional().describe('PDF only: 1-based PHYSICAL page number — the same numbers media_overview accepts. Required for add.'),
+  start: z.number().optional().describe('Video/audio only: start time in seconds. Required for add.'),
+  end: z.number().optional().describe('Video/audio only: end time in seconds (must be greater than start). Omit it to let the reader use the next bookmark / media duration.'),
+  level: z.number().optional().describe('PDF only: outline nesting level, 1-based (default 1). Not applicable to video/audio/image.'),
+}).passthrough();
+
+const BOOKMARK_ADD_PARAM = z.array(BOOKMARK_ENTRY_INPUT).optional().describe(
+  'Entries to add. Each gets a new id (max+1); do not pass "id". (新增书签：title + page（PDF）或 start/end（视频/音频）)',
+);
+
+const BOOKMARK_REMOVE_PARAM = z.array(z.string()).optional().describe(
+  'Bookmark ids to remove, e.g. ["b2"]. Unknown or duplicate ids are errors and nothing is written. (删除书签：b1、b2 …)',
+);
+
+const BOOKMARK_UPDATE_PARAM = z.array(BOOKMARK_ENTRY_INPUT).optional().describe(
+  'Entries to update: pass "id" plus at least one of title / page / start / end / level. The id never changes. (更新书签：保留 id，只改字段)',
+);
+
 /** 每个工具的 zod raw shape（`.strict()`：未知参数直接拒绝，不静默吞掉） */
 export const TOOL_SHAPES = Object.freeze({
   media_probe: {
@@ -362,6 +417,12 @@ export const TOOL_SHAPES = Object.freeze({
     pages: PAGES_PARAM,
     ocr: OCR_PARAM,
     includeFrame: INCLUDE_FRAME_PARAM,
+  },
+  media_bookmark: {
+    path: PATH_PARAM,
+    add: BOOKMARK_ADD_PARAM,
+    remove: BOOKMARK_REMOVE_PARAM,
+    update: BOOKMARK_UPDATE_PARAM,
   },
 });
 
@@ -3056,15 +3117,164 @@ function buildDocumentMatches(matches, query) {
 }
 
 /* ------------------------------------------------------------------ *
+ * media_bookmark —— 书签写入（sidecar 引擎 + 嵌入器）
+ *
+ * 流程全在 src/media/bookmark/：sidecar 是唯一真相源，写入顺序是
+ * 「嵌入成功 → 原子写 sidecar」，嵌入失败时 sidecar 不变（见 engine.js）。
+ * 本层只负责：路径/媒体判定、把 MCP 参数交给引擎、把结果变成文本 + structuredContent。
+ * ------------------------------------------------------------------ */
+
+/** document probe 的 container → 图片（图片没有自带目录，只写 sidecar） */
+const BOOKMARK_IMAGE_CONTAINERS = new Set(['png', 'jpeg', 'jpg', 'gif', 'tiff', 'tif', 'webp', 'bmp']);
+
+/** 探测结果 → 书签媒体类型（pdf / video / audio / image），其它一律拒绝 */
+function bookmarkMediaType(base, probed) {
+  const mediaType = refineMediaType(probed, base.mediaType);
+  if (mediaType === 'video' || mediaType === 'audio') return mediaType;
+  if (mediaType === 'document') {
+    const container = typeof probed?.container === 'string' ? probed.container.toLowerCase() : '';
+    if (container === 'pdf') return 'pdf';
+    if (BOOKMARK_IMAGE_CONTAINERS.has(container)) return 'image';
+    throw new ToolError(
+      'UNSUPPORTED_MEDIA_TYPE',
+      `media_bookmark does not support this document (container: ${container || 'unknown'}).`,
+      'Bookmarks need a native outline or a page position, so only PDF, image, video and audio are supported. '
+        + 'For a text or Office document, convert it to PDF first.',
+    );
+  }
+  throw new ToolError(
+    'UNSUPPORTED_MEDIA_TYPE',
+    `media_bookmark does not support ${mediaType} media.`,
+    'Supported media: PDF, image, video and audio.',
+  );
+}
+
+function summarizeBookmarkApplied(applied) {
+  const parts = [];
+  if (applied.remove.length > 0) parts.push(`removed ${applied.remove.join(', ')}`);
+  if (applied.update.length > 0) parts.push(`updated ${applied.update.join(', ')}`);
+  if (applied.add.length > 0) parts.push(`added ${applied.add.join(', ')}`);
+  return parts.length > 0 ? parts.join('; ') : 'no changes';
+}
+
+function formatBookmarkChecks(checks) {
+  if (!Array.isArray(checks) || checks.length === 0) return 'no checks';
+  return checks
+    .map((check) => `${check.name}: ${check.ok ? 'ok' : 'FAILED'}${check.detail ? ` (${check.detail})` : ''}`)
+    .join('; ');
+}
+
+function formatBookmarkOutline(media, entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return '(no bookmarks)';
+  return entries
+    .map((entry) => formatBookmarkEntry(entry, { media, idPrefix: BOOKMARK_ID_PREFIX }))
+    .join('\n');
+}
+
+async function handleBookmark(args, call) {
+  const base = await resolveMedia(args);
+  const probed = await internalProbe(base, {}, call);
+  const media = bookmarkMediaType(base, probed);
+
+  // 注入点：测试 / 9z5.38.1 可以传自己的注册表；undefined = 默认注册表，null = 明确只写 sidecar
+  const embedder = call.bookmarkEmbedders === undefined
+    ? undefined
+    : bookmarkEmbedderFor(media, call.bookmarkEmbedders);
+
+  const result = await bookmarkEngine.execute({
+    filePath: base.path,
+    media,
+    probe: probed,
+    operations: { add: args.add, remove: args.remove, update: args.update },
+    embedder,
+    signal: call.signal,
+  });
+
+  const lines = [
+    `Bookmarks written for "${result.path}" (${result.media}): ${result.outline.total} entries`
+      + `${result.created ? `; imported ${result.imported} from the file's own outline` : ''}.`,
+    `applied: ${summarizeBookmarkApplied(result.applied)}`,
+    `sidecar: ${result.sidecarPath}`,
+    `embed target: ${result.embed.target ?? '(none — sidecar only)'}`,
+    `checks: ${formatBookmarkChecks(result.checks)}`,
+    '',
+    `OUTLINE (${result.outline.total} entries${result.media === 'pdf' ? ', physical pages' : ''}):`,
+    formatBookmarkOutline(result.media, result.outline.entries),
+  ];
+
+  return {
+    content: [{ type: 'text', text: lines.join('\n') }],
+    structuredContent: {
+      path: result.path,
+      media: result.media,
+      sidecarPath: result.sidecarPath,
+      created: result.created,
+      imported: result.imported,
+      applied: result.applied,
+      embed: result.embed,
+      checks: result.checks,
+      outline: result.outline,
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * 注册
  * ------------------------------------------------------------------ */
 
-/** 4 个工具的定义表（顺序即注册顺序） */
+/** 只读工具（probe / overview / zoom / locate）：不写文件、不联网 */
+const READ_ONLY_ANNOTATIONS = Object.freeze({ readOnlyHint: true, openWorldHint: false });
+
+/** 写工具（bookmark）：改写源文件 / 在源文件旁写 sidecar，不可逆、非幂等 */
+const BOOKMARK_ANNOTATIONS = Object.freeze({
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: false,
+});
+
+/** 5 个工具的定义表（顺序即注册顺序） */
 export const TOOL_DEFINITIONS = Object.freeze([
-  { name: 'media_probe', title: 'Probe media', description: PROBE_DESCRIPTION, shape: TOOL_SHAPES.media_probe, handler: handleProbe },
-  { name: 'media_overview', title: 'Overview', description: OVERVIEW_DESCRIPTION, shape: TOOL_SHAPES.media_overview, handler: handleOverview },
-  { name: 'media_zoom', title: 'Zoom', description: ZOOM_DESCRIPTION, shape: TOOL_SHAPES.media_zoom, handler: handleZoom },
-  { name: 'media_locate', title: 'Locate', description: LOCATE_DESCRIPTION, shape: TOOL_SHAPES.media_locate, handler: handleLocate },
+  {
+    name: 'media_probe',
+    title: 'Probe media',
+    description: PROBE_DESCRIPTION,
+    shape: TOOL_SHAPES.media_probe,
+    handler: handleProbe,
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'media_overview',
+    title: 'Overview',
+    description: OVERVIEW_DESCRIPTION,
+    shape: TOOL_SHAPES.media_overview,
+    handler: handleOverview,
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'media_zoom',
+    title: 'Zoom',
+    description: ZOOM_DESCRIPTION,
+    shape: TOOL_SHAPES.media_zoom,
+    handler: handleZoom,
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'media_locate',
+    title: 'Locate',
+    description: LOCATE_DESCRIPTION,
+    shape: TOOL_SHAPES.media_locate,
+    handler: handleLocate,
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'media_bookmark',
+    title: 'Bookmark',
+    description: BOOKMARK_DESCRIPTION,
+    shape: TOOL_SHAPES.media_bookmark,
+    handler: handleBookmark,
+    annotations: BOOKMARK_ANNOTATIONS,
+  },
 ]);
 
 /**
@@ -3113,6 +3323,8 @@ export function createCallContext(runtime, extra, toolName) {
     logger: runtime.logger,
     cache: runtime.cache ?? null,
     dispatcher: runtime.dispatcher,
+    // media_bookmark 的嵌入器注册表：undefined = 默认注册表，null = 明确只写 sidecar
+    bookmarkEmbedders: runtime.bookmarkEmbedders,
     signal: extra?.signal ?? null,
     onProgress,
     backendCtx: {
@@ -3129,10 +3341,10 @@ export function createCallContext(runtime, extra, toolName) {
 }
 
 /**
- * 把 4 个工具注册到 McpServer。
+ * 把 5 个工具注册到 McpServer。
  *
  * @param {import('@modelcontextprotocol/sdk/server/mcp.js').McpServer} server
- * @param {object} runtime { config, logger, cache, asrProvider, ocrProvider, typesetProvider, backends, dispatcher }
+ * @param {object} runtime { config, logger, cache, asrProvider, ocrProvider, typesetProvider, backends, dispatcher, bookmarkEmbedders }
  */
 export function registerTools(server, runtime) {
   for (const definition of TOOL_DEFINITIONS) {
@@ -3143,7 +3355,7 @@ export function registerTools(server, runtime) {
         title: definition.title,
         description: definition.description,
         inputSchema,
-        annotations: { readOnlyHint: true, openWorldHint: false },
+        annotations: definition.annotations ?? { readOnlyHint: true, openWorldHint: false },
       },
       guardToolHandler(
         definition.name,
