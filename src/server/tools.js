@@ -33,6 +33,7 @@ import {
   annotationEngine,
   annotationEmbedderFor,
   formatAnnotation,
+  formatAnnotationClock,
   normalizeAuthor,
 } from '../media/annotation/index.js';
 import {
@@ -55,6 +56,16 @@ import {
   renderOutlineBlock,
   resolveReadOutline,
 } from './outline-view.js';
+// 9z5.38.4：读取侧的批注（sidecar → 文件自带批注；只读，绝不写文件）。
+import {
+  annotationSummary,
+  annotationsInRange,
+  formatAnnotationMatches,
+  formatProbeAnnotations,
+  renderAnnotationBlock,
+  resolveReadAnnotations,
+  searchAnnotations,
+} from './annotation-view.js';
 import {
   DEFAULT_MAX_IMAGE_TOKENS,
   DEFAULT_MAX_TEXT_INLINE_CHARS,
@@ -107,6 +118,15 @@ outline line is "full detail: <sidecar path>": read that file for the complete o
 The text shows at most 2 levels / 60 entries; structuredContent.outline has every entry, the
 source and the sidecar path. Read-only: probing never creates or modifies a sidecar.
 (读取侧只展示一份目录：sidecar 优先，其次文件自带目录；行首 b1…bN 就是 media_bookmark 的 id)
+
+It also reports the ANNOTATIONS of the file: how many there are and where they live — the
+annotation sidecar ("<file>.mmgrep.annotation.json", written by media_annotate) when one
+exists, otherwise the file's own annotations (PDF annotation objects). Probe reports the
+COUNT and the sidecar path only; the notes themselves are shown by media_overview, next to
+the page / time range they belong to ("n3 (p.12): note" for PDFs, "n3 (00:12:34–00:12:39):
+note" for video/audio). media_locate can also search the annotation text. Read-only:
+probing never creates or modifies a sidecar.
+(读取侧也展示批注：条数 + 侧车路径；note 本身在 overview 里按页 / 时间范围展示)
 
 This server never downloads anything and never calls an LLM: you always pass a local absolute
 path, and it only prepares images and text for your own model to look at.`;
@@ -186,6 +206,15 @@ a sidecar exists its last outline line is "full detail: <sidecar path>" — read
 complete bookmark detail.
 (目录：sidecar 优先，其次文件自带目录，最后才是 heading 生成；view:auto 放不下时先出目录；view:outline 只出目录；view:text 只出文本)
 
+The result also carries the ANNOTATIONS of the requested range, right next to the page /
+time range they belong to: the annotation sidecar ("<file>.mmgrep.annotation.json", written
+by media_annotate) when one exists, otherwise the file's own annotations (PDF annotation
+objects). One annotation per line, in the same shape media_annotate writes
+("n3 (p.12): note" for PDFs, "n3 (00:12:34–00:12:39): note" for video/audio). The line
+starts with the annotation id (n1, n2, …) — these are the ids media_annotate accepts. The
+author is in structuredContent.annotations only; the note text is shown as written.
+(批注按请求范围展示：行首 n1…nN 就是 media_annotate 的 id)
+
 Always call media_probe first: it tells you how long the file is, whether a subtitle source
 exists, which transcript source applies, and whether the file carries a built-in outline
 (PDF bookmarks / chapters), for free. Long media must be narrowed with
@@ -249,7 +278,15 @@ structuredContent.outline: the bookmark sidecar first, then the file's own PDF b
 chapter markers. Its ids (b1…bN) are the ids media_bookmark accepts, and when a sidecar exists
 the last outline line is "full detail: <sidecar path>". Locate is read-only: it never creates or
 modifies a sidecar.
-(定位结果也带同一份目录：sidecar 优先，其次文件自带目录；line 首 b1…bN 可用于 media_bookmark)`;
+(定位结果也带同一份目录：sidecar 优先，其次文件自带目录；line 首 b1…bN 可用于 media_bookmark)
+
+It also searches the ANNOTATION text: the notes written next to the media (annotation
+sidecar "<file>.mmgrep.annotation.json", or the file's own PDF annotations) are searched
+too, and annotation hits are reported in their own "annotation matches" section. They are
+marked as annotations (kind "annotation" plus the id, n1, n2, …) and are NEVER counted as
+media content hits — the match count above them counts transcript / page matches only. An
+annotation hit is a note somebody wrote; it is not something the media says.
+(定位也搜批注文本；批注命中单独成段，不计入媒体命中数)`;
 
 
 export const BOOKMARK_DESCRIPTION = `Write bookmarks (an outline, chapters) into a local media file so they survive across sessions and are
@@ -1765,6 +1802,8 @@ function formatProbeText(result) {
   }
   // 9z5.33：内置目录（PDF 书签 / 章节）——most valuable next-step hint for long media。
   lines.push(...formatProbeOutline(result));
+  // 9z5.38.4：批注只报条数 + 侧车路径（note 本身由 overview 按范围展示）。
+  lines.push(...formatProbeAnnotations(result));
 
   const recommended = result.recommended ?? {};
   if (result.outline?.available) {
@@ -1795,6 +1834,7 @@ const SUBTITLE_SOURCE_NOTE = 'note: source is subtitle — from a subtitle file/
 function formatOverviewText({
   mediaType, base, window, pages, pageCount = null, durationSec, segments, transcript, imageDescriptors, textOnly, budget, hasAudio,
   fullTextNote = null, continuationNote = null, warnings = [], view = 'auto', outline = null,
+  annotations = null, annotationEntries = null, annotationRange = null,
 }) {
   const lines = [];
   const attrs = [`path="${base.path}"`, `type="${mediaType}"`];
@@ -1833,6 +1873,15 @@ function formatOverviewText({
     if (mediaType === 'audio') attrs.push(`segments="${transcript.segmentCount}"`);
   }
   lines.push(`<overview ${attrs.join(' ')} />`);
+
+  // 9z5.38.4：批注紧跟在「页 / 时间范围」后面——同一段 attrs 里就是 ranges，
+  // 批注条目挂在它下面（`n3 (p.12): note` / `n3 (00:12:34–00:12:39): note`）。
+  const annotationBlock = renderAnnotationBlock(annotations, {
+    entries: annotationEntries,
+    rangeLabel: annotationRange,
+    maxChars: Math.max(1, Math.floor(inlineCharLimit(budget.maxInlineChars) * 0.25)),
+  });
+  if (annotationBlock.text) lines.push(annotationBlock.text);
 
   if (transcript.source === 'none' && segments.length === 0) {
     lines.push(`transcript: NONE (${transcript.reason ?? 'no transcript source is available for this file'})`);
@@ -2001,6 +2050,22 @@ function formatPageRangeLabel(pages) {
   return contiguous ? `${sorted[0]}-${sorted[sorted.length - 1]}` : sorted.join(',');
 }
 
+/**
+ * 9z5.38.4：批注块的「范围」标签——批注挂在哪个页 / 时间段后面就说哪个。
+ * 时间用批注自己的 HH:MM:SS（和批注条目里的时间同形）。
+ */
+function annotationRangeLabel({ mediaType, pages, window, durationSec }) {
+  if (mediaType === 'document') {
+    if (!Array.isArray(pages) || pages.length === 0) return 'the whole document';
+    return `pages ${formatPageRangeLabel(pages)}`;
+  }
+  if (window) {
+    const endSec = window.endSec ?? durationSec ?? window.startSec;
+    return `${formatAnnotationClock(window.startSec)}–${formatAnnotationClock(endSec)}`;
+  }
+  return 'the whole media';
+}
+
 function formatZoomText({ base, mediaType, target, image, cropLabel }) {
   const attrs = [`path="${base.path}"`, `kind="${target.kind}"`];
   if (target.kind === 'frame') {
@@ -2120,11 +2185,14 @@ function trimToBytes(text, maxBytes) {
   return out;
 }
 
-function formatLocateText({ query, matches, totalSegments, mediaType, morePages = null }) {
+function formatLocateText({ query, matches, totalSegments, mediaType, morePages = null, annotationMatches = [] }) {
   const header = `matches for "${query}" (${matches.length} of ${totalSegments} ${mediaType === 'document' ? 'pages' : 'segments'}):`;
+  // 9z5.38.4：批注命中单独成段，永远不计入上面的媒体命中数。
+  const annotationLines = formatAnnotationMatches(annotationMatches, { query });
   if (matches.length === 0) {
-    return `no line matched "${query}" among ${totalSegments} ${mediaType === 'document' ? 'page texts' : 'transcript segments'}. `
+    const empty = `no line matched "${query}" among ${totalSegments} ${mediaType === 'document' ? 'page texts' : 'transcript segments'}. `
       + 'Try shorter keywords, or a phrase that appears verbatim.';
+    return [empty, ...annotationLines].join('\n');
   }
   const lines = [header];
   if (mediaType === 'document') {
@@ -2135,7 +2203,7 @@ function formatLocateText({ query, matches, totalSegments, mediaType, morePages 
       lines.push(documentMorePagesLine(morePages));
     }
     lines.push(DOC_LOCATE_FOOTER);
-    return lines.join('\n');
+    return [...lines, ...annotationLines].join('\n');
   }
   for (const match of matches) {
     const position = match.page !== null && match.page !== undefined
@@ -2144,7 +2212,7 @@ function formatLocateText({ query, matches, totalSegments, mediaType, morePages 
     lines.push(`  ${position}  (${Number(match.score ?? 0).toFixed(2)})  ${quoteBySource(match.text, match.source)}`);
   }
   lines.push('Feed any of these windows to media_zoom({ path, start, end }) — no need to re-read the whole file.');
-  return lines.join('\n');
+  return [...lines, ...annotationLines].join('\n');
 }
 
 /**
@@ -2212,6 +2280,15 @@ async function handleProbe(args, call) {
     container: normalized.container,
     probeOutline: normalized.outline,
   });
+  // 9z5.38.4：读取侧的批注——sidecar 优先，其次文件自带的批注。
+  // probe 只报条数 + 侧车路径（不倒每一条 note）。只读，绝不创建 sidecar。
+  const annotations = await resolveReadAnnotations({
+    filePath: base.path,
+    mediaType,
+    container: normalized.container,
+    probe: normalized,
+  });
+  normalized.annotations = annotationSummary(annotations);
 
   return {
     content: [{ type: 'text', text: formatProbeText(normalized) }],
@@ -2450,6 +2527,16 @@ async function handleOverview(args, call) {
     segments,
     includeGenerated: true,
   });
+  // 9z5.38.4：批注同样在落盘与格式化之前装配——只取**请求范围**里的批注，
+  // 挂在该范围的页 / 时间段旁边。只读，绝不创建 sidecar。
+  const annotations = await resolveReadAnnotations({
+    filePath: base.path,
+    mediaType,
+    container: probe.container,
+    probe,
+  });
+  const annotationEntries = annotationsInRange(annotations, { pages, window });
+  const annotationRange = annotationRangeLabel({ mediaType, pages, window, durationSec });
   const rawImages = Array.isArray(result.images) ? result.images : [];
   const { blocks, descriptors } = plan
     ? collectImages(rawImages, plan, call.config)
@@ -2517,6 +2604,9 @@ async function handleOverview(args, call) {
     continuationNote: continuation?.note ?? null,
     view,
     outline,
+    annotations,
+    annotationEntries,
+    annotationRange,
   });
 
   const structuredContent = {
@@ -2524,6 +2614,12 @@ async function handleOverview(args, call) {
     path: base.path,
     view,
     outline,
+    // 9z5.38.4：请求范围里的批注（作者在结构化结果里，文本里只有纯 note）。
+    annotations: {
+      ...annotationSummary(annotations),
+      totalInRange: annotationEntries.length,
+      entries: annotationEntries,
+    },
     window: {
       startMs: window?.startMs ?? null,
       endMs: window?.endMs ?? null,
@@ -2944,12 +3040,28 @@ async function handleLocate(args, call) {
     : null;
   const shownMatches = plan ? plan.matches : matches;
 
+  // 9z5.38.4：locate 也搜批注的 note 文本。批注命中**不计入**媒体命中数，
+  // 单独成段（kind:"annotation" + id），并明说它们是批注而不是媒体内容。
+  const annotations = await resolveReadAnnotations({
+    filePath: base.path,
+    mediaType,
+    container: probe.container,
+    probe,
+  });
+  const annotationEntries = annotationsInRange(annotations, { pages, window });
+  const annotationMatches = searchAnnotations(
+    { ...annotations, entries: annotationEntries },
+    args.query,
+    { max },
+  );
+
   const text = formatLocateText({
     query: args.query,
     matches: shownMatches,
     totalSegments,
     mediaType,
     morePages: plan ? plan.morePages : null,
+    annotationMatches,
   });
 
   // 9z5.37.6：locate 也展示同一份目录（只读；不生成 heading 目录）。文本仍是
@@ -2966,6 +3078,9 @@ async function handleLocate(args, call) {
     path: base.path,
     query: args.query,
     outline,
+    // 9z5.38.4：批注摘要 + 批注命中（与媒体命中分开，绝不混在一起计数）。
+    annotations: annotationSummary(annotations),
+    annotationMatches,
     transcriptSource,
     transcriptOrigin,
     matches: shownMatches,
