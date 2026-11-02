@@ -1,4 +1,4 @@
-// test/server/tools.test.js —— 4 个工具的参数校验、分派、返回信封与错误模型
+// test/server/tools.test.js —— 5 个工具的参数校验、分派、返回信封与错误模型
 //
 // 用本地 stub 后端（不碰 ffmpeg / 网络），通过 InMemoryTransport 走完整 MCP 协议：
 // listTools / callTool / notifications/progress 都是真实的 SDK 行为。
@@ -188,13 +188,13 @@ function errorCode(result) {
  * 工具目录
  * ------------------------------------------------------------------ */
 
-test('listTools：4 个工具、描述带中文触发词、schema 完整', async () => {
+test('listTools：6 个工具、描述带中文触发词、schema 完整', async () => {
   const workspace = await makeWorkspace();
   try {
     await withClient(workspace, async (client) => {
       const listed = await client.listTools();
       assert.deepEqual(listed.tools.map((tool) => tool.name), [
-        'media_probe', 'media_overview', 'media_zoom', 'media_locate',
+        'media_probe', 'media_overview', 'media_zoom', 'media_locate', 'media_bookmark', 'media_annotate',
       ]);
       const byName = Object.fromEntries(listed.tools.map((tool) => [tool.name, tool]));
 
@@ -202,6 +202,7 @@ test('listTools：4 个工具、描述带中文触发词、schema 完整', async
       assert.match(byName.media_overview.description, /生成媒体总览/);
       assert.match(byName.media_zoom.description, /取本地视频/);
       assert.match(byName.media_locate.description, /定位：/);
+      assert.match(byName.media_bookmark.description, /书签/);
 
       for (const tool of listed.tools) {
         assert.equal(tool.inputSchema.type, 'object');
@@ -222,6 +223,37 @@ test('listTools：4 个工具、描述带中文触发词、schema 完整', async
       assert.deepEqual(Object.keys(byName.media_locate.inputSchema.properties).sort(), [
         'end', 'includeFrame', 'max', 'ocr', 'pages', 'path', 'query', 'segment', 'start', 'subtitle', 'transcript',
       ]);
+      assert.deepEqual(Object.keys(byName.media_bookmark.inputSchema.properties).sort(), [
+        'add', 'path', 'remove', 'update',
+      ]);
+      // 写工具：破坏性 / 非幂等；只读工具保持只读
+      assert.deepEqual(byName.media_bookmark.annotations, {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      });
+
+      // media_annotate：第 6 个工具，schema 与 media_bookmark 同构（path + author + 三种操作）
+      assert.deepEqual(Object.keys(byName.media_annotate.inputSchema.properties).sort(), [
+        'add', 'author', 'path', 'remove', 'update',
+      ]);
+      assert.deepEqual(byName.media_annotate.annotations, {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      });
+      assert.match(byName.media_annotate.description, /批注/);
+      assert.match(byName.media_annotate.description, /注释/);
+      assert.match(byName.media_annotate.description, /评论/);
+      assert.match(byName.media_annotate.description, /annotate/i);
+      assert.match(byName.media_annotate.description, /comment/i);
+      assert.match(byName.media_annotate.description, /note/i);
+      assert.match(byName.media_annotate.description, /IN PLACE/);
+      assert.match(byName.media_annotate.description, /\*\.mmgrep\.\*/);
+      assert.match(byName.media_annotate.description, /OVERWRITTEN/);
+      assert.match(byName.media_annotate.description, /git/);
 
       // 参数 describe 里标注了适用媒体类型
       const overview = byName.media_overview.inputSchema.properties;

@@ -9,7 +9,7 @@
 //     剩余预算走 .20 抽样（不再重复列 heading）；
 //   - 任何 view / 任何 maxInlineChars 下 text 长度都不超过上限。
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -17,6 +17,7 @@ import { test } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
+import { deriveEntriesFromProbe } from '../../src/media/bookmark/index.js';
 import { createPlaceholderBackend } from '../../src/server/backends.js';
 import { createLogger, loadConfig } from '../../src/server/config.js';
 import { createServer } from '../../src/server/index.js';
@@ -100,6 +101,15 @@ function videoBackend({ chapters = false, segments = null } = {}) {
         outline: chapters ? chaptersOutline() : noChaptersOutline(),
       };
     },
+    async locate() {
+      return {
+        matches: [],
+        totalSegments: list.length,
+        transcript: { source: 'subtitle', origin: 'file' },
+        frame: null,
+        warnings: [],
+      };
+    },
     async overview() {
       return {
         segments: list,
@@ -111,8 +121,17 @@ function videoBackend({ chapters = false, segments = null } = {}) {
   };
 }
 
-/** 6 headings, each followed by one paragraph (contract-v2 blocks) */
-function documentBackend({ headingCount = 6 } = {}) {
+/** PDF bookmarks copied into the probe outline (physical page + level + label) */
+const PDF_NATIVE = [
+  { title: 'Chapter One', level: 1, page: 1, label: '1' },
+  { title: 'Section 1.1', level: 2, page: 2, label: '2' },
+  { title: 'Subsection 1.1.1', level: 3, page: 3, label: '3' },
+  { title: 'Chapter Two', level: 1, page: 5, label: '5' },
+  { title: 'Section 2.1', level: 2, page: 6, label: '6' },
+];
+
+/** document stub：默认没有书签，可注入 PDF 书签；overview 给 blocks，locate 给空结果 */
+function documentBackend({ headingCount = 6, outlineEntries = [] } = {}) {
   const headings = Array.from({ length: headingCount }, (_, i) => ({
     type: 'heading',
     level: 1,
@@ -128,13 +147,30 @@ function documentBackend({ headingCount = 6 } = {}) {
         container: 'pdf',
         subtitleTracks: [],
         audioTracks: [],
-        outline: {
-          available: false,
-          source: null,
-          total: 0,
-          entries: [],
-          reason: 'this PDF has no bookmarks (no outline).',
-        },
+        outline: outlineEntries.length > 0
+          ? {
+            available: true,
+            source: 'pdf-bookmarks',
+            total: outlineEntries.length,
+            entries: outlineEntries,
+            reason: null,
+          }
+          : {
+            available: false,
+            source: null,
+            total: 0,
+            entries: [],
+            reason: 'this PDF has no bookmarks (no outline).',
+          },
+      };
+    },
+    async locate() {
+      return {
+        matches: [],
+        totalSegments: 0,
+        transcript: { source: 'text', origin: 'textlayer' },
+        frame: null,
+        warnings: [],
       };
     },
     async overview(input) {
@@ -171,11 +207,12 @@ function documentBackend({ headingCount = 6 } = {}) {
   };
 }
 
-async function withClient(workspace, backends, fn) {
+async function withClient(workspace, backends, fn, { bookmarkEmbedders } = {}) {
   const server = createServer({
     config: workspace.config,
     logger: SILENT_LOGGER,
     cache: workspace.cache,
+    bookmarkEmbedders,
     backends: {
       document: backends.document ?? createPlaceholderBackend('document'),
       video: backends.video ?? createPlaceholderBackend('video'),
@@ -192,10 +229,30 @@ async function withClient(workspace, backends, fn) {
   }
 }
 
+const probe = (client, file) => client.callTool({ name: 'media_probe', arguments: { path: file } });
 const overview = (client, file, args = {}) => client.callTool({
   name: 'media_overview',
   arguments: { path: file, images: 0, ...args },
 });
+
+const sidecarFile = (file) => `${file}.mmgrep.bookmark.json`;
+const listDir = async (dir) => (await readdir(dir)).sort();
+
+/** 假 PDF 嵌入器：绝不写真实 PDF，只记录最终条目（与 9z5.37.1 的注入点一致） */
+function fakePdfEmbedder() {
+  const calls = [];
+  return {
+    media: 'pdf',
+    calls,
+    async embed(input) {
+      calls.push(input);
+      return {
+        target: input.filePath,
+        checks: [{ name: 'fake-pdf-outline', ok: true, detail: `${input.entries.length} entries` }],
+      };
+    },
+  };
+}
 
 test('视频有章节 + 放不下：目录先出，余量给抽样文本', async () => {
   const workspace = await makeWorkspace(1800);
@@ -206,15 +263,16 @@ test('视频有章节 + 放不下：目录先出，余量给抽样文本', async
       const data = result.structuredContent;
 
       assert.ok(text.length <= 1800, `text is ${text.length} chars`);
-      assert.match(text, /^outline: 3 chapters — full outline in structuredContent\.outline and manifest\.json$/m);
-      assert.match(text, /^- Opening  00:00\.000-02:00\.000$/m);
+      assert.match(text, /^outline: container chapters — 3 chapters — full outline in structuredContent\.outline and manifest\.json$/m);
+      assert.match(text, /^b1  00:00  Opening$/m);
+      assert.match(text, /^b2  02:00  Middle$/m);
       assert.match(text, /^hint: pick a range with start\/end, e\.g\. media_overview\(\{ path, start: 0, end: 120 \}\)\.$/m);
       assert.equal(data.preview.mode, 'sampled');
       assert.equal(data.preview.outlineSource, 'chapters');
       assert.equal(data.preview.outlineInlined, 3);
       assert.equal(data.preview.outlineTotal, 3);
       assert.ok(data.preview.units > 0);
-      assert.ok(text.indexOf('outline: 3 chapters') < text.indexOf('preview: sampled'));
+      assert.ok(text.indexOf('outline: container chapters') < text.indexOf('preview: sampled'));
     });
   } finally {
     await workspace.cleanup();
@@ -236,7 +294,7 @@ test('视频有章节但放得下：给全文（tier 1），不插目录', async
       const text = result.content[0].text;
       const data = result.structuredContent;
       assert.equal(data.preview.mode, 'whole');
-      assert.doesNotMatch(text, /^outline: 3 chapters/m);
+      assert.doesNotMatch(text, /^outline: container chapters/m);
       assert.match(text, /note: complete text of this window \(nothing omitted\)/);
       assert.equal(data.outline.source, 'chapters');
       assert.equal(data.preview.outlineInlined, 0);
@@ -318,7 +376,7 @@ test('文档 heading < 5 + view:outline：明说没有目录，不生成内容',
       assert.equal(data.segments.length, 0);
       assert.match(text, /^outline: none — this document has no PDF bookmarks/m);
       assert.match(text, /fewer than 5 headings/);
-      assert.doesNotMatch(text, /^- \d+\. Section/m);
+      assert.doesNotMatch(text, /^b\d+  p\.\d+  \d+\. Section/m);
     });
   } finally {
     await workspace.cleanup();
@@ -340,5 +398,229 @@ test('任何 view / 任何 maxInlineChars 下 video 文本都不超过上限', a
     } finally {
       await workspace.cleanup();
     }
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * 4. 读取侧统一目录（9z5.37.6）：sidecar → 文件自带目录 → heading 生成
+ * ------------------------------------------------------------------ */
+
+test('无 sidecar：probe 用文件自带 PDF 目录，派生 id 与 derive 一致，且不创建 sidecar', async () => {
+  const workspace = await makeWorkspace(24000);
+  try {
+    await withClient(workspace, { document: documentBackend({ outlineEntries: PDF_NATIVE }) }, async (client) => {
+      const before = await listDir(workspace.dir);
+      const result = await probe(client, workspace.pdf);
+      assert.notEqual(result.isError, true);
+      const text = result.content[0].text;
+      const data = result.structuredContent;
+
+      assert.equal(data.outline.available, true);
+      assert.equal(data.outline.source, 'pdf-bookmarks');
+      assert.equal(data.outline.generated, false);
+      assert.equal(data.outline.total, PDF_NATIVE.length);
+      assert.equal(data.outline.sidecarPath, null);
+
+      // 不复制 derive 逻辑：读侧的 id 必须与 media_bookmark 首次导入完全相同。
+      assert.deepEqual(
+        data.outline.entries.map(({ id, title, page, level }) => ({ id, title, page, level })),
+        deriveEntriesFromProbe('pdf', { available: true, entries: PDF_NATIVE }),
+      );
+
+      // 统一行格式：bN + 物理页；PDF level 用缩进表达。
+      assert.match(text, /^outline: PDF outline — 5 entries — use the outline to pick a range$/m);
+      assert.match(text, /^b1  p\.1  Chapter One$/m);
+      assert.match(text, /^ {2}b2  p\.2  Section 1\.1$/m);
+      // probe 文本最多 2 层：level 3 只在 structuredContent
+      assert.doesNotMatch(text, /Subsection 1\.1\.1/);
+      assert.ok(data.outline.entries.some((entry) => entry.id === 'b3' && entry.level === 3));
+
+      // overview view:outline 展示全部层级（level 3 → 4 个空格）。
+      const outlineOnly = await overview(client, workspace.pdf, { view: 'outline' });
+      const outlineText = outlineOnly.content[0].text;
+      assert.match(
+        outlineText,
+        /^outline: PDF outline — 5 entries — full outline in structuredContent\.outline and manifest\.json$/m,
+      );
+      assert.match(outlineText, /^ {4}b3  p\.3  Subsection 1\.1\.1$/m);
+      assert.match(outlineText, /^ {2}b5  p\.6  Section 2\.1$/m);
+
+      // locate 展示同一份目录（不做第二份 / 不合并）。
+      const located = await client.callTool({
+        name: 'media_locate',
+        arguments: { path: workspace.pdf, query: 'claim' },
+      });
+      assert.notEqual(located.isError, true);
+      assert.equal(located.structuredContent.outline.source, 'pdf-bookmarks');
+      assert.deepEqual(located.structuredContent.outline.entries.map((entry) => entry.id), [
+        'b1', 'b2', 'b3', 'b4', 'b5',
+      ]);
+
+      assert.deepEqual(await listDir(workspace.dir), before, 'read-only tools must not create a sidecar');
+    });
+  } finally {
+    await workspace.cleanup();
+  }
+});
+
+test('有 sidecar：三个工具展示同一份 sidecar 目录，首行来源、末行 full detail，且不写文件', async () => {
+  const workspace = await makeWorkspace(24000);
+  try {
+    const sidecarPath = sidecarFile(workspace.mp4);
+    const sidecar = {
+      version: 1,
+      media: 'video',
+      entries: [
+        { id: 'b1', title: 'Intro', start: 0, end: 60 },
+        { id: 'b2', title: 'Deep dive', start: 754, end: 1400 },
+      ],
+    };
+    await writeFile(sidecarPath, `${JSON.stringify(sidecar, null, 2)}\n`);
+    const before = await listDir(workspace.dir);
+    const sidecarBefore = await readFile(sidecarPath, 'utf8');
+
+    await withClient(workspace, { video: videoBackend({ chapters: true }) }, async (client) => {
+      const probeResult = await probe(client, workspace.mp4);
+      assert.notEqual(probeResult.isError, true);
+      const probeText = probeResult.content[0].text;
+      const probeData = probeResult.structuredContent;
+
+      // sidecar 优先于文件自带的章节
+      assert.equal(probeData.outline.available, true);
+      assert.equal(probeData.outline.source, 'sidecar');
+      assert.equal(probeData.outline.total, 2);
+      assert.equal(probeData.outline.sidecarPath, sidecarPath);
+      assert.deepEqual(probeData.outline.entries.map(({ id, title }) => ({ id, title })), [
+        { id: 'b1', title: 'Intro' },
+        { id: 'b2', title: 'Deep dive' },
+      ]);
+      assert.match(probeText, /^outline: sidecar — 2 entries — use the outline to pick a range$/m);
+      assert.match(probeText, /^b1  00:00  Intro$/m);
+      assert.match(probeText, /^b2  12:34  Deep dive$/m);
+      assert.doesNotMatch(probeText, /Opening|Middle|Wrap Up/);
+      // 末行 full detail：在条目之后、How to read 之前。
+      assert.match(probeText, new RegExp(`^full detail: ${sidecarPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+      assert.ok(probeText.indexOf('full detail: ') > probeText.indexOf('b2  12:34'));
+      assert.ok(probeText.indexOf('full detail: ') < probeText.indexOf('How to read:'));
+
+      const overviewResult = await overview(client, workspace.mp4, { view: 'outline' });
+      const overviewText = overviewResult.content[0].text;
+      const overviewData = overviewResult.structuredContent;
+      assert.equal(overviewData.outline.source, 'sidecar');
+      assert.deepEqual(overviewData.outline.entries.map((entry) => entry.id), ['b1', 'b2']);
+      assert.match(overviewText, /^outline: sidecar — 2 entries — full outline in structuredContent\.outline and manifest\.json$/m);
+      assert.ok(overviewText.indexOf('full detail: ') > overviewText.indexOf('b2  12:34'));
+      assert.ok(overviewText.indexOf('full detail: ') < overviewText.indexOf('note: view="outline"'));
+
+      const locateResult = await client.callTool({
+        name: 'media_locate',
+        arguments: { path: workspace.mp4, query: 'topic' },
+      });
+      assert.notEqual(locateResult.isError, true);
+      assert.equal(locateResult.structuredContent.outline.source, 'sidecar');
+      assert.equal(locateResult.structuredContent.outline.sidecarPath, sidecarPath);
+      assert.deepEqual(locateResult.structuredContent.outline.entries.map((entry) => entry.id), ['b1', 'b2']);
+    });
+
+    // 只读工具没有创建/修改任何文件（包括临时文件）
+    assert.deepEqual(await listDir(workspace.dir), before);
+    assert.equal(await readFile(sidecarPath, 'utf8'), sidecarBefore);
+  } finally {
+    await workspace.cleanup();
+  }
+});
+
+test('无 sidecar：读侧派生 id 与 media_bookmark 首次导入一致', async () => {
+  const workspace = await makeWorkspace(24000);
+  try {
+    const embedder = fakePdfEmbedder();
+    await withClient(
+      workspace,
+      { document: documentBackend({ outlineEntries: PDF_NATIVE }) },
+      async (client) => {
+        const before = await probe(client, workspace.pdf);
+        const derived = before.structuredContent.outline.entries;
+        assert.deepEqual(derived.map((entry) => entry.id), ['b1', 'b2', 'b3', 'b4', 'b5']);
+
+        // 首次写入 = 导入文件自带目录 + add；导入的 id 必须与上面完全一致。
+        const written = await client.callTool({
+          name: 'media_bookmark',
+          arguments: { path: workspace.pdf, add: [{ title: 'Appendix', page: 6, level: 1 }] },
+        });
+        assert.notEqual(written.isError, true);
+        const writtenData = written.structuredContent;
+        assert.equal(writtenData.created, true);
+        assert.equal(writtenData.imported, PDF_NATIVE.length);
+        assert.deepEqual(writtenData.outline.entries.map((entry) => entry.id), [
+          'b1', 'b2', 'b3', 'b4', 'b5', 'b6',
+        ]);
+        assert.deepEqual(
+          writtenData.outline.entries.slice(0, PDF_NATIVE.length),
+          derived.map(({ id, title, page, level }) => ({ id, title, page, level })),
+        );
+        assert.equal(embedder.calls.length, 1);
+
+        // 写入后再读：source=sidecar，条目与写入结果完全一致（同一份目录）。
+        const after = await probe(client, workspace.pdf);
+        const afterData = after.structuredContent;
+        assert.equal(afterData.outline.source, 'sidecar');
+        assert.equal(afterData.outline.sidecarPath, sidecarFile(workspace.pdf));
+        assert.deepEqual(
+          afterData.outline.entries.map(({ id, title, page, level }) => ({ id, title, page, level })),
+          writtenData.outline.entries,
+        );
+        assert.match(after.content[0].text, /^outline: sidecar — 6 entries — use the outline to pick a range$/m);
+        assert.match(after.content[0].text, /^b6  p\.6  Appendix$/m);
+      },
+      { bookmarkEmbedders: { pdf: embedder } },
+    );
+  } finally {
+    await workspace.cleanup();
+  }
+});
+
+test('损坏的 sidecar：回退到文件自带目录并说明原因，不抛错、不改文件', async () => {
+  const workspace = await makeWorkspace(24000);
+  try {
+    const sidecarPath = sidecarFile(workspace.mp4);
+    const broken = '{ "version": 1, "media": "video", "entries": [\n';
+    await writeFile(sidecarPath, broken);
+    const before = await listDir(workspace.dir);
+    const bytesBefore = await readFile(sidecarPath, 'utf8');
+
+    await withClient(workspace, { video: videoBackend({ chapters: true }) }, async (client) => {
+      const probeResult = await probe(client, workspace.mp4);
+      assert.notEqual(probeResult.isError, true, 'a corrupted sidecar must never fail a read-only call');
+      const text = probeResult.content[0].text;
+      const data = probeResult.structuredContent;
+
+      assert.equal(data.outline.available, true);
+      assert.equal(data.outline.source, 'chapters');
+      assert.equal(data.outline.total, 3);
+      assert.equal(data.outline.sidecarPath, sidecarPath);
+      assert.match(data.outline.sidecarError, /could not be read/);
+      assert.ok(data.outline.sidecarError.includes(sidecarPath));
+      assert.match(text, /^outline: container chapters — 3 chapters — use the outline to pick a range$/m);
+      assert.match(text, /^b1  00:00  Opening$/m, 'ids still come from the file outline');
+      assert.match(text, /^note: the bookmark sidecar .* could not be read.* — showing container chapters instead\.$/m);
+      assert.doesNotMatch(text, /^full detail:/m);
+
+      const overviewResult = await overview(client, workspace.mp4, { view: 'outline' });
+      assert.equal(overviewResult.structuredContent.outline.source, 'chapters');
+      assert.match(overviewResult.content[0].text, /could not be read/);
+
+      const locateResult = await client.callTool({
+        name: 'media_locate',
+        arguments: { path: workspace.mp4, query: 'topic' },
+      });
+      assert.notEqual(locateResult.isError, true);
+      assert.equal(locateResult.structuredContent.outline.source, 'chapters');
+      assert.ok(locateResult.structuredContent.outline.sidecarError.includes(sidecarPath));
+    });
+
+    assert.deepEqual(await listDir(workspace.dir), before);
+    assert.equal(await readFile(sidecarPath, 'utf8'), bytesBefore);
+  } finally {
+    await workspace.cleanup();
   }
 });

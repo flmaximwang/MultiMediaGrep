@@ -88,7 +88,7 @@ test('video：probe / overview / zoom / locate 走真 server', { skip, timeout: 
   await withServer(async ({ client }) => {
     const listed = await client.listTools();
     assert.deepEqual(listed.tools.map((tool) => tool.name), [
-      'media_probe', 'media_overview', 'media_zoom', 'media_locate',
+      'media_probe', 'media_overview', 'media_zoom', 'media_locate', 'media_bookmark', 'media_annotate',
     ]);
 
     const probe = await call(client, 'media_probe', { path: ASSETS.scene });

@@ -2,7 +2,7 @@
 //
 // 分层：
 //   createRuntime()  —— 读配置、装缓存、装 provider、装后端（失败一律降级，不崩）
-//   createServer()   —— 建 McpServer、写入 instructions、注册 4 个工具
+//   createServer()   —— 建 McpServer、写入 instructions、注册 5 个工具
 //   src/index.js     —— 入口：connect(StdioServerTransport)，日志只走 stderr
 //
 // 测试可以只调用 createServer({ config, backends, ... }) 注入 stub 后端，不需要真的起进程。
@@ -209,6 +209,9 @@ export async function createRuntime(options = {}) {
     providerErrors: providers.providerErrors ?? {},
     backends,
     dispatcher,
+    // 嵌入器注册表（测试 / 9z5.38.x 注入点；undefined = 默认注册表，null = 只写 sidecar）
+    bookmarkEmbedders: options.bookmarkEmbedders,
+    annotationEmbedders: options.annotationEmbedders,
   };
 }
 
@@ -244,6 +247,8 @@ export function createServer(runtimeOrOptions = {}) {
     providerErrors: source.providerErrors ?? {},
     backends,
     dispatcher,
+    bookmarkEmbedders: source.bookmarkEmbedders,
+    annotationEmbedders: source.annotationEmbedders,
   };
 
   const server = new McpServer(

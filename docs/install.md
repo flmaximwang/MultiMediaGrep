@@ -26,25 +26,40 @@ mutool -v      # 或 mutool（mupdf-tools）
 gs --version   # 或 ghostscript
 ```
 
+要**写** PDF 的目录 / 批注（`media_bookmark` / `media_annotate`）时，`mutool`（mupdf-tools，≥ 1.28）
+是**必需**的；读 PDF 自带的批注也用它（缺了不会报错，只是 probe 的批注行会说明读不到）：
+
+```bash
+mutool -v      # 写 PDF 的 outline / 批注对象、读取 PDF 批注
+```
+
 安装：
 
 ```bash
 # macOS
-brew install ffmpeg poppler
+brew install ffmpeg poppler qpdf mupdf-tools
 
 # Debian / Ubuntu
-sudo apt install ffmpeg poppler-utils
+sudo apt install ffmpeg poppler-utils qpdf mupdf-tools
 
 # Windows（winget）
 winget install Gyan.FFmpeg
+# PDF 另装 poppler（无官方 winget 包时用 scoop install poppler）；
+# 写 PDF / 读批注另装 mupdf-tools（或从 mupdf.com 下载 mutool）
 ```
 
 > **工具放在 `PATH` 之外怎么办**：用 `MMGREP_FFMPEG_PATH` / `MMGREP_FFPROBE_PATH` 给绝对路径。
 > PDF 工具没有对应的环境变量——它们按 `PATH` 找。
 
-**PDF 书签（内置目录）另需 `qpdf`**：`pdftotext` / `pdfinfo` 读不了 outline。没装 qpdf 时
+**PDF 书签（读侧目录）另需 `qpdf`**：`pdftotext` / `pdfinfo` 读不了 outline。没装 qpdf 时
 `media_probe` 仍能正常返回，只会在 `outline:` 行说明「PDF bookmarks cannot be read: qpdf is not installed」，
-overview / zoom / locate 不受影响。
+overview / zoom / locate 不受影响。写 PDF 时 qpdf 只用于**写入后校验**：没装 qpdf 会退回用 `mutool`
+重新打开临时文件来校验，写入本身仍能完成。
+
+**写工具（0.3.0 起）**：`media_bookmark` / `media_annotate` 会真的改文件——PDF 原地写 outline /
+批注对象（需要 `mutool`），视频 / 录音文件本身不动、只写同名 `.mmgrep.bookmark.vtt` /
+`.mmgrep.annotation.vtt`，所有支持的类型都会在源文件旁写 `<file>.mmgrep.*.json` sidecar。
+动原件前先 `git commit`（或备份）；写入失败时源文件保持原样。完整语义见契约 §15 / §16。
 
 **可执行文件不在 PATH 里时的表现**：server 仍然能启动，但每个要抽帧/转码的调用都会返回
 `TOOL_NOT_FOUND`（见 §6）。启动横幅里不会报错——**错误是调用时才给的**，不是启动时给的。
@@ -172,7 +187,7 @@ npx -y github:flmaximwang/MultiMediaGrep
 npm i -g github:flmaximwang/MultiMediaGrep
 
 # C) 只装 release 里的运行时包（不含 test/ 与 fixtures/，体积最小）
-npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.2.0/multimediagrep-mcp-0.2.0.tgz
+npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.3.0/multimediagrep-mcp-0.3.0.tgz
 ```
 
 三种装法在宿主配置里的写法一样，只是 `command` / `args` 不同：
@@ -452,7 +467,7 @@ provider 的解析结果**按页缓存**（键含源文件内容 sha256 + provid
 
 默认 `~/.cache/multimediagrep`（`MMGREP_CACHE_DIR` 可改；`~` 会展开，相对路径按进程 cwd 解析）。
 
-**绝不在你的源文件旁边写任何东西**——所有抽帧、页图、转写、全文落盘都在缓存目录里。
+读工具**绝不在你的源文件旁边写任何东西**——所有抽帧、页图、转写、全文落盘都在缓存目录里。唯一的例外是写工具（`media_bookmark` / `media_annotate`）：它们会在源文件旁写 `*.mmgrep.*` sidecar / VTT，PDF 还会被原地改写，见 §1「写工具（0.3.0 起）」与契约 §15 / §16。
 
 ### 4.2 目录结构
 
@@ -496,7 +511,7 @@ rm -rf ~/.cache/multimediagrep/ab/abcdef.../
 
 ---
 
-## 5. 用起来：probe → overview → zoom → locate
+## 5. 用起来：probe → overview → zoom → locate（+ 写）
 
 调用顺序是契约里写死的用法指引（也在 server instructions 里下发给 agent）：
 
@@ -506,8 +521,14 @@ rm -rf ~/.cache/multimediagrep/ab/abcdef.../
 | 2. 主体阅读 | `media_overview` | 0–4 张（默认 2 张：视频 9 格/张，文档 6 格/张） |
 | 3. 只放大有用的部分 | `media_zoom` | 1 张（~1900 token，**最贵**） |
 | 4. 「那句话在哪」 | `media_locate` | 0（`includeFrame: true` 才 +1 张） |
+| 5. 写目录 / 章节（可选，会改文件） | `media_bookmark` | 0 |
+| 6. 写批注 / 注释（可选，会改文件） | `media_annotate` | 0 |
 
 > 只需要字幕文字时，用 `media_overview` + `images: 0` + `transcript: "subtitle"`（或带 `subtitle` 显式选择来源）：零图片，只回转写段落。
+
+**写之前先读。** 写工具返回的是完整目录 / 批注（同一套 `b1…` / `n1…` id）+ sidecar 路径 + 嵌入目标 +
+每一项检查结果。PDF 原地改写（不出副本，正文不动）；视频 / 录音文件从不修改，只写同名 VTT；
+所有类型都在源文件旁写 sidecar，之后 probe / overview / locate 读的就是 sidecar。
 
 **长素材先收窄**：超过 30 分钟的视频、超过 30 页的文档，先用 `start`/`end` 或 `pages` 取一小段，
 再跟着结果里的 `continuation.nextStartMs` / `continuation.nextPage` 一段段往下走。
@@ -516,8 +537,10 @@ rm -rf ~/.cache/multimediagrep/ab/abcdef.../
 `full text: <content.md 绝对路径> (segments.jsonl, manifest.json in the same directory)` 一行；
 内联文字分三档：whole（请求范围整体放得下）、skim（文档有 blocks 时：全部 heading + 段首句）、
 sampled（完整单元等距抽样，并写明未覆盖页）；`view:"outline"` 时只出目录。
-`view:"auto"` 在放不下且有目录（PDF 书签 / 视频章节 / 文档 ≥5 个 heading）时先出目录；
-视频/录音没有章节时 `view:"outline"` 只给「no chapters」，不生成内容。
+`view:"auto"` 在放不下且有目录时先出目录。目录只有**一份**，来源优先级：
+`<file>.mmgrep.bookmark.json` sidecar → 文件自带（PDF 书签 / 视频章节）→ 文档 ≥5 个 heading 时生成；
+视频/录音没有章节时 `view:"outline"` 只给「no chapters」，不生成内容。有 sidecar 时目录末行是
+`full detail: <sidecar 路径>`。probe 会报批注条数，overview 把批注挂在页 / 时间段旁，locate 也会搜批注 note。
 
 单次调用的硬上限（超了报 `BUDGET_EXCEEDED`，**不会静默截断**）：
 4 张图 / 每张 16 格 / 单次共 64 格 / 单图最长边 1600 px / 单图 ≤ 2,000,000 像素；
@@ -549,6 +572,12 @@ sampled（完整单元等距抽样，并写明未覆盖页）；`view:"outline"`
 | `INVALID_ARGUMENT: path must be an absolute local path; got "videos/a.mp4". …` | 传了相对路径 | 传绝对路径 |
 | `NOT_A_LOCAL_PATH: path must be a local absolute file path; URLs are not accepted …` | 传了 URL | **本 server 不下载**：先把文件取到本地，再传本地路径 |
 | `UNSUPPORTED_MEDIA_TYPE`（Office 文档） | `.docx/.pptx/.xlsx` 等暂不支持 | 先转 PDF：`soffice --headless --convert-to pdf <file>` |
+| `TOOL_NOT_FOUND: ... mutool ...` | 写 PDF 的目录 / 批注需要 mupdf-tools（读 PDF 批注缺它不报错，只在 probe 的批注行说明读不到） | `brew install mupdf-tools` / `apt install mupdf-tools`，确认 `mutool` 在 `PATH` 上 |
+| `UNSUPPORTED_MEDIA_TYPE: ... encrypted ...` / `... signed ...` | 加密或签名 PDF 不能原地写 | 先解密 / 去除签名再调用写工具；只读工具不受影响 |
+| `INVALID_ARGUMENT: media_bookmark refused the request, so nothing was written`（或 media_annotate） | 操作校验失败 | 看列出的每一条问题（未知 id、字段错、页码 / 时间越界、重复 id…）；**没有写任何东西**，修好后重试 |
+| `INTERNAL: embedding failed for "<target>", so the sidecar was not written` | 嵌入 / 写入后校验失败 | 源文件保持原样、sidecar 未写；看 `check "name" failed: detail`。常见原因：缺 mutool / qpdf 校验失败 / 磁盘只读 |
+| probe / overview 的目录回退并显示 `note: ... could not be read ... — showing ... instead` | sidecar 损坏 | 修好或删除 `<file>.mmgrep.bookmark.json`；删除后读侧回退到文件自带目录，写工具会重建 sidecar |
+| 批注块显示 `note: ... could not be read ...` | annotation sidecar 损坏 | 修好或删除 `<file>.mmgrep.annotation.json`；写工具不会覆盖损坏的 sidecar |
 | stdout 出现非 JSON-RPC 内容，client 报解析错 | 有东西往 stdout 写了 | 本 server 的日志一律走 stderr；如果你自己套了 wrapper，注意别把日志打到 stdout |
 | 环境变量写错了但 server 没崩 | 设计如此 | 非法值回落默认值 + 记一条 warning；`MMGREP_LOG_LEVEL=debug` 能看到更多 |
 

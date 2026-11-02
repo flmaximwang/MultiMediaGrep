@@ -36,6 +36,7 @@ import {
   normalizeBlocks,
   textToBlocks,
 } from '../../providers/doc/builtin.js';
+import { annotationOutlineFromInventory, createPdfAnnotationReader } from '../../media/annotation/pdf-annotations.js';
 import { createPdfSupport, normalizePageText } from './pdf.js';
 import { assessTextLayerQuality } from './text-quality.js';
 import {
@@ -1627,6 +1628,9 @@ export function createDocumentBackend(ctx = {}) {
     signal: ctx.signal ?? undefined,
   });
   const pdfSupport = ctx.pdfSupport ?? createPdfSupport();
+  // 9z5.38.2：PDF 自带批注的读取器（sidecar 首次写入的导入来源）。
+  // 注入点留给测试；读不到时 readInventory 返回 available:false + reason，绝不抛错。
+  const annotationReader = ctx.annotationReader ?? createPdfAnnotationReader();
   const inspectCache = new Map();
   // builtin typeset 是本地实现、不需要凭据：直接持有 backend 的调用方（测试 / 嵌入）
   // 只要 config 里是 builtin，就不必再手动注入 provider 实例。
@@ -1664,6 +1668,18 @@ export function createDocumentBackend(ctx = {}) {
           ? 'PDF bookmarks cannot be read: this PDF support does not implement readOutline.'
           : `this media type has no bookmarks (only PDF documents define an outline; this is ${info.kind === 'text' ? 'a plain-text file' : 'an image'}).`,
       };
+    // 9z5.38.2：PDF 自带的批注对象（Text / Square / Highlight / Ink / Stamp / FreeText …）。
+    // 它们是 media_annotate 首次写入时的导入来源；Link / 表单 Widget / Popup 不算批注，
+    // 永远不会出现在这里（也不会被写入）。非 PDF 媒体没有 PDF 批注对象。
+    const annotationOutline = info.kind === 'pdf'
+      ? annotationOutlineFromInventory(await annotationReader.readInventory(input.path, { signal: c.signal }))
+      : {
+        available: false,
+        source: null,
+        total: 0,
+        entries: [],
+        reason: 'only PDF documents carry PDF annotation objects; this media has none.',
+      };
 
     return {
       mediaType: 'document',
@@ -1693,6 +1709,7 @@ export function createDocumentBackend(ctx = {}) {
         entries: bookmarks.entries,
         reason: bookmarks.reason,
       },
+      annotationOutline,
       subtitleTracks: [],
       audioTracks: [],
       capabilities: {

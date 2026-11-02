@@ -14,21 +14,51 @@
 | 一个 **MCP server**（默认 stdio，可选 Streamable HTTP），只吃**本地绝对路径** | 不下载、不检索、不登录、不替你取数（取数属于 IntelligenceAtlas） |
 | 只做「材料化」：出图 + 出带时间码/页码的文本清单 | 不调 LLM：不做总结、不做问答、不做转述 |
 | ASR 与文档解析/OCR 走**你自己配**的外部服务与 key | 不内置本地 ASR / OCR 模型（mlx-whisper、rapidocr 都不再维护） |
-| 缓存只写自己的缓存目录 | **绝不在你的文件旁边写任何东西** |
+| 缓存只写自己的缓存目录；写工具只在源文件旁写 `*.mmgrep.*` sidecar / VTT（外加 PDF 原地改写） | 不写别的状态：没有服务器数据库、没有版本历史；唯一例外是写工具的 `*.mmgrep.*` 与 PDF 原地改写（见「会写你的文件」） |
 
 失败也是明说的：没配 ASR 就只给画面，扫描件没配 OCR 就只给页图，并在结果里写清楚原因——
 **宁可说「没有文字」，也不编一段台词。**
 
-## 工具（4 个，按动作命名，跨媒体复用）
+## 工具（6 个，按动作命名，跨媒体复用）
 
 | 工具 | 干什么 |
 |---|---|
-| `media_probe` | 探媒体：时长/分辨率/页数/编码、可用轨道、文字层可靠不可靠、能否做 ASR/OCR、文件自带的目录（PDF 书签 / 章节）。不花图片 token |
-| `media_overview` | 总览：视频出分镜宫格图，录音出带时间轴转写，文档出页面图 + 每页文本；**额外返回全文落盘路径**。内联文字是预览（whole / skim / sampled 三档，另有 outline 目录视图），`view` 可控目录，`ocr: "force"` 可对坏文字层重新识别；`images: 0` + `transcript: "subtitle"` 可只读字幕 |
+| `media_probe` | 探媒体：时长/分辨率/页数/编码、可用轨道、文字层可靠不可靠、能否做 ASR/OCR、一份目录（sidecar / PDF 书签 / 章节）与批注条数。不花图片 token |
+| `media_overview` | 总览：视频出分镜宫格图，录音出带时间轴转写，文档出页面图 + 每页文本；**额外返回全文落盘路径**。内联文字是预览（whole / skim / sampled 三档，另有 outline 目录视图），`view` 可控目录，`ocr: "force"` 可对坏文字层重新识别；`images: 0` + `transcript: "subtitle"` 可只读字幕；批注挂在页 / 时间段旁 |
 | `media_zoom` | 特写：取指定时间点/区间的单帧或文档某页，可裁切放大，用于读字（约 1900 token/张，最贵） |
-| `media_locate` | 定位：给一句文本/关键词，返回它在视频/录音里的时间戳；文档返回页码 + 命中次数 + 命中附近的片段（不倾倒整页） |
+| `media_locate` | 定位：给一句文本/关键词，返回它在视频/录音里的时间戳；文档返回页码 + 命中次数 + 命中附近的片段（不倾倒整页）；也会搜批注 note |
+| `media_bookmark` | **写**书签 / 目录 / 章节：PDF 原地改写 outline；视频、录音写 `<file>.mmgrep.bookmark.vtt`；所有类型写 `<file>.mmgrep.bookmark.json` sidecar（唯一真相源）。一次可 add / remove / update，全有或全无 |
+| `media_annotate` | **写**批注 / 注释 / 评论：PDF 原地写真正的批注对象（可新建 `text` / `square`，其它注释类批注导入后可改可删）；视频、录音写 `<file>.mmgrep.annotation.vtt`；所有类型写 `<file>.mmgrep.annotation.json` sidecar。author 默认取 MCP client 名 |
 
-用法指引（先 probe → 再 overview → 只 zoom 重要部分 → 长素材先收窄范围）写在工具描述与 server instructions 里。
+前四个只读；后两个会**真的改文件**，调用前先看下一节。
+用法指引（先 probe → 再 overview → 只 zoom 重要部分 → 长素材先收窄范围；写之前先定位）写在工具描述与 server instructions 里。
+
+## 会写你的文件（0.3.0 起）
+
+`media_bookmark` / `media_annotate` 是对「不写用户文件」的明确例外：只写 `*.mmgrep.*` sidecar / VTT，外加 PDF 文件本身的原地修改——
+
+- **PDF 原地修改**：outline / 批注对象直接写进源 PDF，不生成副本（页面正文不重写）。
+- **视频、录音文件从不修改**：只写同名 `.mmgrep.bookmark.vtt` / `.mmgrep.annotation.vtt`。
+- **源文件旁会多出 sidecar**：`<file>.mmgrep.bookmark.json` / `<file>.mmgrep.annotation.json`。
+  它们是唯一真相源；sidecar 一旦存在，文件自带的目录 / 批注在下次写入时会被 sidecar 覆盖。
+- **先保护原件**：动文件前先 `git commit`（或另做备份）。写入失败时源文件保持原样：
+  临时文件 → 校验 → rename，任何一项检查失败都不会留下半成品。
+
+## 0.3.0 有什么新东西（API 无破坏性变更）
+
+- **新增两个写工具**：`media_bookmark`（目录 / 章节 / 书签）与 `media_annotate`（批注 / 注释 / 评论）。
+  四个原有工具的参数与调用方式不变；没有新增环境变量，也没有服务器状态。唯一需要跟着改的是目录**文本
+  格式**：0.2.0 的 `- 标题 — page N` 统一成 `b1  p.1  标题` / `b1  00:12:34  标题`（见下）。
+- **sidecar 是唯一真相源**：每次写入在源文件旁写 `<file>.mmgrep.bookmark.json` /
+  `<file>.mmgrep.annotation.json`；条目带稳定 id（`b1…` / `n1…`），首次写入自动导入文件自带的目录 / 批注。
+- **同时嵌入文件本身**：PDF 原地改写 outline / 写入真正的批注对象（不出副本，正文不动）；
+  视频、录音文件从不修改，只写同名 `.mmgrep.bookmark.vtt` / `.mmgrep.annotation.vtt`；图片只有 sidecar。
+- **读侧统一**：`media_probe` / `media_overview` / `media_locate` 只展示一份目录，来源优先级为
+  sidecar → 文件自带（PDF 书签 / 章节）→ heading 生成（仅 overview）；行格式统一为
+  `b3  p.12  标题` / `b3  00:12:34  标题`，有 sidecar 时目录末行是 `full detail: <sidecar 路径>`。
+  probe 报批注条数，overview 把批注挂在页 / 时间段旁，locate 也会搜批注 note。
+- **外部依赖**：写 PDF（outline / 批注）与读 PDF 批注需要 `mutool`（mupdf-tools）；读 PDF 书签仍用 `qpdf`（可选）。
+- 完整的写入语义、检查项与升级说明见 [`docs/RELEASE-NOTES-v0.3.0.md`](docs/RELEASE-NOTES-v0.3.0.md)。
 
 ## 0.2.0 有什么新东西（有破坏性变更）
 
@@ -59,15 +89,16 @@
 | **Node.js ≥ 20**（ESM，零构建步骤） | 必需 | 起不来 |
 | **ffmpeg + ffprobe**（同一个发行版里通常一起装） | 视频 / 录音 / 文档**都需要** | 返回 `TOOL_NOT_FOUND: ffprobe is required but was not found on PATH…`；视频/录音连 `media_probe` 都跑不了，文档的 `media_probe` 还能用但出不了页图 |
 | **poppler**（`pdftoppm` / `pdftotext` / `pdfinfo`）**或** `mutool`（mupdf-tools）**或** `gs`（ghostscript） | 只有读 **PDF** 时需要 | PDF 相关调用返回 `TOOL_NOT_FOUND`，提示装 `poppler-utils` / `mupdf-tools` / `ghostscript`；纯视频 / 录音不受影响 |
+| **mupdf-tools**（`mutool`，mupdf ≥ 1.28） | 写 **PDF** 的目录 / 批注时需要；读 PDF 自带的批注也用它 | 写 PDF 时返回 `TOOL_NOT_FOUND: ... mutool ...`，提示 `brew install mupdf-tools` / `apt-get install mupdf-tools`；读批注缺它不报错，只在 probe 的批注行说明读不到；只读书签、只看页图不受影响 |
 
 安装示例：
 
 ```bash
 # macOS
-brew install ffmpeg poppler        # 文档需要 poppler；只要视频可省略 poppler
+brew install ffmpeg poppler qpdf mupdf-tools   # 文档需要 poppler；写 PDF / 读批注需要 mupdf-tools
 
 # Debian / Ubuntu
-sudo apt install ffmpeg poppler-utils
+sudo apt install ffmpeg poppler-utils qpdf mupdf-tools
 
 # Windows（winget）
 winget install Gyan.FFmpeg          # PDF 另装 poppler（无官方 winget 包时用 scoop install poppler）
@@ -75,7 +106,9 @@ winget install Gyan.FFmpeg          # PDF 另装 poppler（无官方 winget 包�
 
 可选：把可执行文件放在 `PATH` 之外时，用 `MMGREP_FFMPEG_PATH` / `MMGREP_FFPROBE_PATH` 指定绝对路径。
 
-读 **PDF 书签**（probe 的内置目录）另需 `qpdf`；缺了只是读不到目录，正文与页图不受影响。
+读 **PDF 书签**（probe 的目录）另需 `qpdf`；写 PDF 时它只用于写入后校验（没有 qpdf 会改用 `mutool`
+重新打开）。缺了 qpdf 只是读不到书签，正文与页图不受影响；写 PDF 的目录 / 批注与读 PDF 批注所需的
+`mutool` 见上表。
 
 **外部服务（可选）**：ASR（ElevenLabs 或任何 OpenAI `/audio/transcriptions` 兼容服务）与文档解析（MinerU）
 由你用环境变量配置。文档解析拆成 OCR / typeset 两个角色：OCR 默认 `none`，typeset 默认本地 `builtin`（不联网）——
@@ -94,7 +127,7 @@ npx -y multimediagrep-mcp
 > 通常由 MCP client 自动拉起。想确认它起没起得来，就手动跑一次，看 stderr 有没有启动横幅：
 >
 > ```
-> [mmgrep] info: multimediagrep@0.2.0 ready on stdio
+> [mmgrep] info: multimediagrep@0.3.0 ready on stdio
 > [mmgrep] info: cache: /Users/you/.cache/multimediagrep (max 10737418240 bytes)
 > [mmgrep] info: asr: none (no API key) · ocr: none · typeset: builtin
 > [mmgrep] info: backends: video=ready audio=ready document=ready
@@ -112,7 +145,7 @@ node src/index.js
 # 3) 从 GitHub 装（npm 还没发布时）
 npx -y github:flmaximwang/MultiMediaGrep            # 临时拉取并启动
 npm i -g github:flmaximwang/MultiMediaGrep           # 装成本地命令 multimediagrep-mcp
-npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.2.0/multimediagrep-mcp-0.2.0.tgz   # 只装 release 里的运行时包
+npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.3.0/multimediagrep-mcp-0.3.0.tgz   # 只装 release 里的运行时包
 ```
 
 > 从 GitHub 源码装会把整个仓库拉下来（源码与文档），首次安装比 npm 慢；
@@ -280,8 +313,8 @@ HTTP 端点常被多个调用方共用，provider 的 key 不必都写死在 ser
 1. **装起来**（宿主负责拉起它，不用自己开端口）：
    - Claude Code：`claude mcp add --scope user multimediagrep -- npx -y github:flmaximwang/MultiMediaGrep`
    - 其它 client：把 [`examples/mcp-config.json`](examples/mcp-config.json) 里的 `command` / `args` 换成上面那条命令即可。
-2. **确认环境**：宿主里需要 `ffmpeg` + `ffprobe` 在 PATH 上；读 PDF 还要 `poppler` / `mutool` / `gs` 任意一个。
-   缺了会返回 `TOOL_NOT_FOUND`，不会静默出错。
+2. **确认环境**：宿主里需要 `ffmpeg` + `ffprobe` 在 PATH 上；读 PDF 还要 `poppler` / `mutool` / `gs` 任意一个；
+   写 PDF 的目录 / 批注、读 PDF 批注还要 `mutool`（mupdf-tools）。缺了会返回 `TOOL_NOT_FOUND`，不会静默出错。
 3. **先探后看**（省图片 token）：
    - `media_probe({ path })` → 类型、时长、有没有字幕轨、能不能 ASR/OCR。**不花任何图片 token**，先做这一步。
    - `media_overview({ path })` → 视频出分镜宫格图 + 时间对齐文本；录音出带时间轴转写；文档出页图 + 每页文字。
@@ -289,10 +322,12 @@ HTTP 端点常被多个调用方共用，provider 的 key 不必都写死在 ser
    - `media_zoom({ path, at })` → 只在「画面上有字要读」时用，最贵（约 1900 token/张）。
    - `media_locate({ path, query })` → 「那句话在哪说的」，纯文本、零图片。
    - 想指定字幕来源时给 `media_probe` / `media_overview` / `media_locate` 传 `subtitle`：本地字幕文件绝对路径、字幕轨 index（非负整数），或语言码（如 `zh` / `en`）；显式指定不可用会直接报错，不会静默换成别的来源。
-4. **记住三件事**：
+   - 要**写**目录 / 批注时才用 `media_bookmark({ path, add: [...] })` / `media_annotate({ path, add: [...] })`：PDF 原地改，视频 / 录音只写同名 VTT，所有类型都在源文件旁写 `*.mmgrep.*` sidecar。
+4. **记住四件事**：
    - 只吃**本地绝对路径**，它不下载任何东西；
    - server 自己不调 LLM，理解由你的模型完成；
-   - **字幕优先于 ASR**：字幕通常比 ASR 准，但**可能是自动生成的**（专名、数字要核对画面）；ASR 是机器转写（人名、数字容易错，别当原话引用）。
+   - **字幕优先于 ASR**：字幕通常比 ASR 准，但**可能是自动生成的**（专名、数字要核对画面）；ASR 是机器转写（人名、数字容易错，别当原话引用）；
+   - **写工具会改文件**：动原件前先 `git commit`（或备份）；sidecar 一旦存在就是唯一真相源。
 5. **长素材先收窄**：视频/录音用 `start`/`end`，文档用 `pages`（如 `"3-10,15"`），再跟着结果里的 `continuation` 往下走。
 
 没有 ASR key 也能用：只是拿不到文字层（文件自带字幕就照样出文本）。
@@ -400,12 +435,23 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 > 一次 overview 硬上限是 4 张图、每张 16 格、单次共 64 格、单图最长边 1600px——
 > 一张「两小时电影的大宫格」既看不清又剧透。
 
+**5. 写（可选，会修改文件）**
+
+```json
+{ "path": "/abs/path/demo.mp4", "add": [{ "title": "Opening", "start": 0, "end": 12 }] }
+```
+
+写入 sidecar `<file>.mmgrep.bookmark.json` 与 `<file>.mmgrep.bookmark.vtt`；之后 probe / overview / locate
+的目录都来自 sidecar（末行 `full detail: <sidecar 路径>`）。批注同理用 `media_annotate` 写
+`<file>.mmgrep.annotation.json` / `.annotation.vtt`。PDF 会原地改写 outline / 批注对象，视频 / 录音文件本身不动。
+
 ---
 
 ## 依赖、许可与上游致谢
 
 - **运行时依赖**：`@modelcontextprotocol/sdk`（MIT）、`zod`（MIT）。没有构建步骤，纯 ESM。
-- **系统依赖**：ffmpeg / ffprobe（不打包、不链接，按独立子进程调用）、poppler 或 mutool 或 gs（只读 PDF 时用）。
+- **系统依赖**：ffmpeg / ffprobe（不打包、不链接，按独立子进程调用）、poppler 或 mutool 或 gs（只读 PDF 时用）；
+  mutool（mupdf-tools）还用于原地写 PDF 的 outline / 批注、以及读取 PDF 批注；qpdf 可选，用于读 PDF 书签与写入后校验。
 - **可选外部服务**：ElevenLabs（ASR）、MinerU（文档解析）。都是用户自备 key，代码里不含它们的凭据。
 - **许可**：本项目 **Apache-2.0**（[`LICENSE`](LICENSE)）。
 - **派生源码**：`src/backend/video/` 下的 `geometry.js`、`frames.js`、`sheet.js`、`shots.js`

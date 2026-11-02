@@ -1,4 +1,4 @@
-// src/server/tools.js —— 4 个 MCP 工具的定义与 handler
+// src/server/tools.js —— 6 个 MCP 工具的定义与 handler
 //
 // 分工（重要）：
 //   - 本文件负责**参数校验 + 分派 + 结果信封**（content blocks / structuredContent / 文本清单）。
@@ -21,6 +21,22 @@ import { detectMediaType } from '../media/detect.js';
 import { DOC_SNIPPET_RADIUS, buildSnippet, countHits } from '../media/match.js';
 import { ROLLING_SUBTITLE_WARNING } from '../media/subtitles.js';
 import {
+  BOOKMARK_ID_PREFIX,
+  bookmarkEngine,
+  embedderFor as bookmarkEmbedderFor,
+  formatEntry as formatBookmarkEntry,
+} from '../media/bookmark/index.js';
+import {
+  ANNOTATION_ID_PREFIX,
+  DEFAULT_ANNOTATION_AUTHOR,
+  MAX_AUTHOR_CHARS,
+  annotationEngine,
+  annotationEmbedderFor,
+  formatAnnotation,
+  formatAnnotationClock,
+  normalizeAuthor,
+} from '../media/annotation/index.js';
+import {
   METHOD_MATRIX,
   ToolError,
   createDispatcher,
@@ -31,6 +47,25 @@ import {
 } from '../media/interface.js';
 import { splitSentences } from '../media/sentences.js';
 import { guardToolHandler } from './errors.js';
+import {
+  OUTLINE_IMAGE_CONTAINERS,
+  formatProbeOutline,
+  noOutlineMessage,
+  outlinePageArg,
+  outlineTimeArg,
+  renderOutlineBlock,
+  resolveReadOutline,
+} from './outline-view.js';
+// 9z5.38.4：读取侧的批注（sidecar → 文件自带批注；只读，绝不写文件）。
+import {
+  annotationSummary,
+  annotationsInRange,
+  formatAnnotationMatches,
+  formatProbeAnnotations,
+  renderAnnotationBlock,
+  resolveReadAnnotations,
+  searchAnnotations,
+} from './annotation-view.js';
 import {
   DEFAULT_MAX_IMAGE_TOKENS,
   DEFAULT_MAX_TEXT_INLINE_CHARS,
@@ -73,12 +108,25 @@ For audio it also reports a quick health check — average level, speech ratio a
 call on it. A recording that is effectively silent is reported as such and is never sent to ASR
 (no hallucinated transcript).
 
-It also reports the file's own outline when it has one: PDF bookmarks (each entry carries the
-PHYSICAL page number — the same 1-based page numbers media_overview accepts — and, when the PDF
-defines page labels, the printed label too, e.g. "xii") and chapter markers in video/audio files
-(title + start/end timestamps). The text output shows at most 2 levels / 60 entries; the full
-outline is in structuredContent.outline. Use it to pick a range instead of reading the whole
-file. (内置目录：PDF 书签带物理页与打印页标签；视频/音频列出章节时间戳。文本最多 2 层 / 60 条)
+It also shows ONE outline for the file, from the first available source: the bookmark sidecar
+("<file>.mmgrep.bookmark.json", written by media_bookmark) when one exists, otherwise the
+file's own outline — PDF bookmarks (PHYSICAL page numbers, the same 1-based numbers
+media_overview accepts) or chapter markers in video/audio (title + start/end timestamps).
+Every line carries a bookmark id ("b3  p.12  title" for PDFs, "b3  00:12:34  title" for
+video/audio) — these are the ids media_bookmark accepts. When a sidecar exists, the last
+outline line is "full detail: <sidecar path>": read that file for the complete outline.
+The text shows at most 2 levels / 60 entries; structuredContent.outline has every entry, the
+source and the sidecar path. Read-only: probing never creates or modifies a sidecar.
+(读取侧只展示一份目录：sidecar 优先，其次文件自带目录；行首 b1…bN 就是 media_bookmark 的 id)
+
+It also reports the ANNOTATIONS of the file: how many there are and where they live — the
+annotation sidecar ("<file>.mmgrep.annotation.json", written by media_annotate) when one
+exists, otherwise the file's own annotations (PDF annotation objects). Probe reports the
+COUNT and the sidecar path only; the notes themselves are shown by media_overview, next to
+the page / time range they belong to ("n3 (p.12): note" for PDFs, "n3 (00:12:34–00:12:39):
+note" for video/audio). media_locate can also search the annotation text. Read-only:
+probing never creates or modifies a sidecar.
+(读取侧也展示批注：条数 + 侧车路径；note 本身在 overview 里按页 / 时间范围展示)
 
 This server never downloads anything and never calls an LLM: you always pass a local absolute
 path, and it only prepares images and text for your own model to look at.`;
@@ -139,24 +187,38 @@ drops a whole page silently: pages that could not be represented are listed, and
 over-long unit is truncated with a trailing "…[+N chars]". Read content.md when you need the
 complete text.
 
-VIEW — the view parameter controls the inline text (default "auto"). Many files carry a real
-outline: PDF bookmarks, or chapter markers in video/audio. (1) "auto": if the requested range
-fits, you get the full text; if it does not fit and the file has an outline, the outline comes
-first (page numbers for PDFs, timestamps for chapters) and the rest of the budget goes to the
-text preview; if there is no outline, you get the normal skim/sampled preview. A document
-without bookmarks gets an outline GENERATED FROM ITS HEADINGS when the range has at least 5
-headings, labelled "outline: generated from headings" (best-effort). (2) "outline": return only
-the outline — generated from headings for a document without bookmarks; for video/audio without
-chapters you get an explicit "no chapters" message and NOTHING is generated, because this server
-never invents an outline from content. In that case read the overview (or a start/end window)
-and write your own outline from the time-aligned text and storyboard grids. (3) "text": ignore
-the outline and force the text pipeline. The full outline is always in structuredContent.outline
-and, for an overview that writes an export, in manifest.json.
-(目录：view:auto 放不下时先出目录；view:outline 只出目录；view:text 只出文本。视频/音频没有章节时不生成目录)
+VIEW — the view parameter controls the inline text (default "auto"). The result carries ONE
+outline from the first available source: the bookmark sidecar ("<file>.mmgrep.bookmark.json",
+written by media_bookmark) when one exists, otherwise the file's own outline (PDF bookmarks, or
+chapter markers in video/audio); a document without bookmarks may get an outline GENERATED FROM
+ITS HEADINGS when the range has at least 5 headings, labelled "outline: generated from
+headings" (best-effort). (1) "auto": if the requested range fits, you get the full text; if it
+does not fit and there is an outline, the outline comes first (ids b1…bN with page numbers for
+PDFs, timestamps for chapters) and the rest of the budget goes to the text preview; if there is
+no outline, you get the normal skim/sampled preview. (2) "outline": return only the outline —
+generated from headings for a document without bookmarks; for video/audio without chapters you
+get an explicit "no chapters" message and NOTHING is generated, because this server never
+invents an outline from content. In that case read the overview (or a start/end window) and
+write your own outline from the time-aligned text and storyboard grids. (3) "text": ignore the
+outline and force the text pipeline. The full outline (entries, source, sidecar path) is always
+in structuredContent.outline and, for an overview that writes an export, in manifest.json. When
+a sidecar exists its last outline line is "full detail: <sidecar path>" — read that file for the
+complete bookmark detail.
+(目录：sidecar 优先，其次文件自带目录，最后才是 heading 生成；view:auto 放不下时先出目录；view:outline 只出目录；view:text 只出文本)
+
+The result also carries the ANNOTATIONS of the requested range, right next to the page /
+time range they belong to: the annotation sidecar ("<file>.mmgrep.annotation.json", written
+by media_annotate) when one exists, otherwise the file's own annotations (PDF annotation
+objects). One annotation per line, in the same shape media_annotate writes
+("n3 (p.12): note" for PDFs, "n3 (00:12:34–00:12:39): note" for video/audio). The line
+starts with the annotation id (n1, n2, …) — these are the ids media_annotate accepts. The
+author is in structuredContent.annotations only; the note text is shown as written.
+(批注按请求范围展示：行首 n1…nN 就是 media_annotate 的 id)
 
 Always call media_probe first: it tells you how long the file is, whether a subtitle source
-exists, which transcript source applies, and whether the file carries a built-in outline
-(PDF bookmarks / chapters), for free. Long media must be narrowed with
+exists, which transcript source applies, and which outline applies (bookmark sidecar first,
+then the file's own PDF bookmarks / video-audio chapters, or headings for a document), for
+free. Long media must be narrowed with
 start/end (video, audio) or pages (document) — one giant grid of a two-hour film gives you
 illegible cells and spoils the ending. Follow the continuation hint in the result to page
 through the rest.`;
@@ -210,7 +272,91 @@ says so instead of guessing. Use media_overview if you only need the visuals.
 
 Each match is tagged with its source. A match whose source is "asr" came from machine
 transcription, so the wording may be wrong (names, numbers, jargon) — do not present it as the
-speaker's exact words.`;
+speaker's exact words.
+
+The result also carries the same single outline as media_probe / media_overview in
+structuredContent.outline: the bookmark sidecar first, then the file's own PDF bookmarks or
+chapter markers. Its entries carry the ids media_bookmark accepts (b1…bN), and
+structuredContent.outline.sidecarPath / sidecarError point at the bookmark sidecar when one
+exists. Locate is read-only: it never creates or modifies a sidecar.
+(定位结果也带同一份目录：sidecar 优先，其次文件自带目录；line 首 b1…bN 可用于 media_bookmark)
+
+It also searches the ANNOTATION text: the notes written next to the media (annotation
+sidecar "<file>.mmgrep.annotation.json", or the file's own PDF annotations) are searched
+too, and annotation hits are reported in their own "annotation matches" section. They are
+marked as annotations (kind "annotation" plus the id, n1, n2, …) and are NEVER counted as
+media content hits — the match count above them counts transcript / page matches only. An
+annotation hit is a note somebody wrote; it is not something the media says.
+(定位也搜批注文本；批注命中单独成段，不计入媒体命中数)`;
+
+
+export const BOOKMARK_DESCRIPTION = `Write bookmarks (an outline, chapters) into a local media file so they survive across sessions and are
+visible to humans in the file itself: the PDF outline for a PDF, a sidecar VTT for video/audio, and a
+sidecar JSON for every supported media type.
+(写入书签 / 目录 / 章节：PDF 改写文件自带目录；视频、音频写同名 .mmgrep.bookmark.vtt；
+所有类型都写 <file>.mmgrep.bookmark.json 侧车。中文触发词：书签、目录、章节、bookmark、outline、chapter。)
+
+The sidecar "<file>.mmgrep.bookmark.json" is the single source of truth. The first write (no sidecar yet)
+imports the file's own outline — PDF bookmarks, or video/audio chapter markers — as b1…bN in file order,
+then applies this call. New ids are max+1 and are never reused; update keeps the id. One call can mix
+add / remove / update; they are applied remove → update → add, all-or-nothing: if anything is invalid,
+nothing is written and every problem is listed at once (unknown id, bad field, page/time out of range,
+duplicate ids, malformed entry, …). An image has no native outline and gets the sidecar only; text and
+Office documents are not supported.
+
+WARNING — this tool modifies files:
+- A PDF's outline is rewritten IN PLACE: the PDF file itself is modified in place, no copy is made.
+- Files are written NEXT TO the source: a *.mmgrep.* sidecar for every media type, plus
+  *.mmgrep.bookmark.vtt for video/audio. They are not written into the cache directory.
+- When a sidecar already exists, external edits to the file's own outline are OVERWRITTEN on the next write.
+- Protect your originals with git (or a backup) before calling this tool.
+
+After the write, media_probe / media_overview / media_locate show this outline (ids b1…bN) instead of the
+file's native one. The result contains the full outline, the sidecar path, the embed target, and every
+check result. (书签 / 目录 / 章节 / bookmark / outline / chapter)`;
+
+export const ANNOTATE_DESCRIPTION = `Write annotations (notes, comments, sticky notes, marked areas) into a local media file so they
+survive across sessions and are visible to humans in the file itself: real PDF annotation objects for a
+PDF, a sidecar VTT for video/audio, and a sidecar JSON for every supported media type.
+(写入批注 / 注释 / 评论 / 标注：PDF 原地写真正的批注对象；视频、音频写同名
+.mmgrep.annotation.vtt；所有类型都写 <file>.mmgrep.annotation.json 侧车。
+中文触发词：批注、注释、评论、标注、annotate、comment、note。)
+
+The sidecar "<file>.mmgrep.annotation.json" is the single source of truth. The first write (no sidecar
+yet) imports every note-like annotation of a PDF — Text, FreeText, Square, Circle, Line, Polygon,
+PolyLine, Highlight, Underline, Squiggly, StrikeOut, Stamp, Caret and Ink, in page order — as n1…nN,
+including its raw geometry and original author, then applies this call. Link annotations, form widgets
+and popups are never imported or touched. Entries are anchored per media type:
+- PDF: page (1-based PHYSICAL page) + type ("text" = sticky note, "square" = rectangle area; "square"
+  also needs rect {x,y,width,height} as fractions 0..1 of the page). Other annotation types cannot be
+  created in this version, but imported ones are kept verbatim (including raw geometry) and can be
+  updated (note) or removed.
+- video/audio: start (seconds, < duration) and optional end (default start + 5 s, clipped to the end of
+  the media). No page, no rect, no type.
+- image: rect only (fractions of the image); no page, start/end or type.
+- every entry: note (plain text, 1..4000 characters, newlines allowed) and, for PDF, type.
+
+Ids are n1, n2, …; new ids are max+1 and are never reused by this call; update keeps the id.
+One call can mix add / remove / update; they are applied remove → update → add, all-or-nothing: if
+anything is invalid, nothing is written and every problem is listed at once (unknown id, bad field,
+page/time out of range, duplicate ids, malformed entry, …).
+
+The author is resolved once per call: the "author" argument, else the MCP client's name, else
+"${DEFAULT_ANNOTATION_AUTHOR}". The model name is never used. Imported annotations keep their original
+author; update never changes it.
+
+WARNING — this tool modifies files:
+- A PDF is modified IN PLACE: annotation objects are written into the PDF file itself, no copy is made
+  (the page content is not rewritten). Video and audio files are never modified — only the VTT is written.
+- Files are written NEXT TO the source: a *.mmgrep.* sidecar for every media type, plus
+  *.mmgrep.annotation.vtt for video/audio. They are not written into the cache directory.
+- When a sidecar already exists, external edits to the file's own annotations are OVERWRITTEN on the next
+  write. To change an annotation, use update; the sidecar wins over the file.
+- Protect your originals with git (or a backup) before calling this tool.
+
+The result lists every written annotation in the same shape the read side uses ("n1 (p.12): note",
+"n1 (00:12:34–00:12:39): note"), plus the sidecar path, the embed target, and every check result.
+(批注 / 注释 / 评论 / 标注 / annotate / comment / note)`;
 
 /* ------------------------------------------------------------------ *
  * 参数 schema
@@ -258,11 +404,13 @@ const PAGES_PARAM = z.string().optional().describe(
 
 const VIEW_PARAM = z.enum(['auto', 'outline', 'text']).optional().describe(
   'What to put in the inline text. "auto" (default): the full text of the requested range when it fits; otherwise, '
-  + 'when the file has a built-in outline (PDF bookmarks, video/audio chapters) or the document has at least 5 headings, '
-  + 'the outline comes first and the remaining budget goes to a text preview; files without an outline use the normal '
-  + 'skim/sampled preview. "outline": return only the outline (generated from headings for a document without bookmarks; '
-  + 'an explicit "no chapters" message for video/audio — this server never invents an outline from content). '
-  + '"text": force the text pipeline and ignore any outline. (返回内容：auto 自动；outline 只出目录；text 只出文本)',
+  + 'when there is an outline (the bookmark sidecar when it exists, otherwise PDF bookmarks / video-audio chapters, '
+  + 'or ≥ 5 document headings), the outline comes first and the remaining budget goes to a text preview; files '
+  + 'without an outline use the normal skim/sampled preview. "outline": return only that same single outline '
+  + '(generated from headings for a document without bookmarks; an explicit "no chapters" message for video/audio — '
+  + 'this server never invents an outline from content). "text": force the text pipeline and ignore any outline. '
+  + 'The sidecar wins over the file\'s own outline, and its last outline line is "full detail: <sidecar path>". '
+  + '(返回内容：auto 自动；outline 只出目录（sidecar 优先）；text 只出文本)',
 );
 
 const OCR_PARAM = z.enum(['auto', 'force']).optional().describe(
@@ -319,6 +467,68 @@ const INCLUDE_FRAME_PARAM = z.boolean().optional().describe(
   'Also return one picture at the best match (default false). Applicable to video and document only. (是否附带最佳匹配处的画面)',
 );
 
+// media_bookmark 的条目参数。字段全部 optional + passthrough：真正的语义校验
+// （必填、范围、未知字段、重复 id……）由引擎统一收集后**一次报全**，而不是让 zod
+// 在第一处错误就短路。顶层仍然 .strict()，未知的顶层参数照样拒绝。
+const BOOKMARK_ENTRY_INPUT = z.object({
+  id: z.string().optional().describe('Existing bookmark id (b1, b2, …). Required for update; add must not include an id.'),
+  title: z.string().optional().describe('Bookmark title. Required for add (non-empty); optional for update.'),
+  page: z.number().optional().describe('PDF only: 1-based PHYSICAL page number — the same numbers media_overview accepts. Required for add.'),
+  start: z.number().optional().describe('Video/audio only: start time in seconds. Required for add.'),
+  end: z.number().optional().describe('Video/audio only: end time in seconds (must be greater than start). Omit it to let the reader use the next bookmark / media duration.'),
+  level: z.number().optional().describe('PDF only: outline nesting level, 1-based (default 1). Not applicable to video/audio/image.'),
+}).passthrough();
+
+const BOOKMARK_ADD_PARAM = z.array(BOOKMARK_ENTRY_INPUT).optional().describe(
+  'Entries to add. Each gets a new id (max+1); do not pass "id". (新增书签：title + page（PDF）或 start/end（视频/音频）)',
+);
+
+const BOOKMARK_REMOVE_PARAM = z.array(z.string()).optional().describe(
+  'Bookmark ids to remove, e.g. ["b2"]. Unknown or duplicate ids are errors and nothing is written. (删除书签：b1、b2 …)',
+);
+
+const BOOKMARK_UPDATE_PARAM = z.array(BOOKMARK_ENTRY_INPUT).optional().describe(
+  'Entries to update: pass "id" plus at least one of title / page / start / end / level. The id never changes. (更新书签：保留 id，只改字段)',
+);
+
+// media_annotate 的条目参数。同样是 optional + passthrough + 引擎一次报全：
+// 必填、范围、按媒体类型的字段适用性、未知字段都由 annotation 适配器收集。
+const ANNOTATE_RECT_INPUT = z.object({
+  x: z.number().optional().describe('Left edge as a fraction of the page/image width, 0..1.'),
+  y: z.number().optional().describe('Top edge as a fraction of the page/image height, 0..1.'),
+  width: z.number().optional().describe('Width as a fraction, > 0, and x + width <= 1.'),
+  height: z.number().optional().describe('Height as a fraction, > 0, and y + height <= 1.'),
+}).passthrough();
+
+const ANNOTATE_ENTRY_INPUT = z.object({
+  id: z.string().optional().describe('Existing annotation id (n1, n2, …). Required for update; add must not include an id.'),
+  type: z.string().optional().describe('PDF only, required for add: "text" (sticky note) or "square" (rectangle area). "square" also needs rect.'),
+  note: z.string().optional().describe('The annotation text: plain text, 1..4000 characters, newlines allowed. Required for add; optional for update.'),
+  page: z.number().optional().describe('PDF only: 1-based PHYSICAL page number — the same numbers media_overview accepts. Required for add.'),
+  start: z.number().optional().describe('Video/audio only: start time in seconds (>= 0 and < duration). Required for add.'),
+  end: z.number().optional().describe('Video/audio only: end time in seconds (must be greater than start and <= duration). Omit it to default to start + 5 s, clipped to the media duration.'),
+  rect: ANNOTATE_RECT_INPUT.optional().describe('PDF "square" or image: rectangle {x, y, width, height} as fractions 0..1 of the page/image.'),
+}).passthrough();
+
+const ANNOTATE_ADD_PARAM = z.array(ANNOTATE_ENTRY_INPUT).optional().describe(
+  'Annotations to add. Each gets a new id (max+1); do not pass "id". '
+  + '(新增批注：note + type/page（PDF）或 start/end（视频/音频）或 rect（图片）)',
+);
+
+const ANNOTATE_REMOVE_PARAM = z.array(z.string()).optional().describe(
+  'Annotation ids to remove, e.g. ["n2"]. Unknown or duplicate ids are errors and nothing is written. (删除批注：n1、n2 …)',
+);
+
+const ANNOTATE_UPDATE_PARAM = z.array(ANNOTATE_ENTRY_INPUT).optional().describe(
+  'Annotations to update: pass "id" plus at least one of note / type / page / rect / start / end. The id and the author never change. (更新批注：保留 id，只改内容 / 位置)',
+);
+
+const AUTHOR_PARAM = z.string().optional().describe(
+  'Who is writing these annotations (stored in the sidecar and, for PDF, in the annotation). '
+  + `Defaults to the MCP client's name, then "${DEFAULT_ANNOTATION_AUTHOR}". `
+  + 'Imported annotations keep their original author; update never changes it. (批注作者)',
+);
+
 /** 每个工具的 zod raw shape（`.strict()`：未知参数直接拒绝，不静默吞掉） */
 export const TOOL_SHAPES = Object.freeze({
   media_probe: {
@@ -362,6 +572,19 @@ export const TOOL_SHAPES = Object.freeze({
     pages: PAGES_PARAM,
     ocr: OCR_PARAM,
     includeFrame: INCLUDE_FRAME_PARAM,
+  },
+  media_bookmark: {
+    path: PATH_PARAM,
+    add: BOOKMARK_ADD_PARAM,
+    remove: BOOKMARK_REMOVE_PARAM,
+    update: BOOKMARK_UPDATE_PARAM,
+  },
+  media_annotate: {
+    path: PATH_PARAM,
+    author: AUTHOR_PARAM,
+    add: ANNOTATE_ADD_PARAM,
+    remove: ANNOTATE_REMOVE_PARAM,
+    update: ANNOTATE_UPDATE_PARAM,
   },
 });
 
@@ -1422,83 +1645,12 @@ function planOverviewPreview({
   };
 }
 
-/* ---------------- overview 的目录装配（9z5.33） ----------------
+/* ---------------- overview 的目录装配（9z5.37.6） ----------------
  *
- * 顺序：内置目录（PDF 书签 / 章节）优先；文档没有书签时才从契约 v2 blocks 的
- * heading 生成（>= 5 条）。视频/录音**不生成**：没有章节就返回 available=false
- * 与一句人话原因，view:"outline" 时把原因当正文返回。
+ * 读取侧的目录统一在 ./outline-view.js 里装配：sidecar → 文件自带目录
+ * （PDF 书签 / 章节）→ 从 blocks 的 heading 生成（文档，>= 5 条）。
+ * 这里只负责把结果交给格式化 / 落盘，不再重复实现来源优先级。
  */
-const GENERATED_OUTLINE_MIN_HEADINGS = 5;
-function buildBuiltInOverviewOutline(mediaType, probeOutline) {
-  if (!probeOutline || typeof probeOutline !== 'object' || !probeOutline.available) return null;
-  const entries = Array.isArray(probeOutline.entries) ? probeOutline.entries : [];
-  if (entries.length === 0) return null;
-  return {
-    available: true,
-    source: probeOutline.source ?? (mediaType === 'document' ? 'pdf-bookmarks' : 'chapters'),
-    generated: false,
-    total: entries.length,
-    entries,
-    reason: null,
-  };
-}
-
-/** 从契约 v2 blocks 的 heading 生成目录；少于 5 条不算目录（9z5.33 拍板）。 */
-function buildGeneratedOverviewOutline(mediaType, segments) {
-  if (mediaType !== 'document') return null;
-  const entries = [];
-  for (const segment of Array.isArray(segments) ? segments : []) {
-    const page = segment?.page ?? segment?.index ?? null;
-    for (const block of Array.isArray(segment?.blocks) ? segment.blocks : []) {
-      if (block?.type !== 'heading') continue;
-      const title = String(block.text ?? '').trim();
-      if (!title) continue;
-      const level = Number.isInteger(block.level) && block.level > 0 ? Math.min(block.level, 6) : 1;
-      entries.push({ level, title, page });
-    }
-  }
-  if (entries.length < GENERATED_OUTLINE_MIN_HEADINGS) return null;
-  return {
-    available: true,
-    source: 'headings',
-    generated: true,
-    total: entries.length,
-    entries,
-    reason: null,
-  };
-}
-
-function buildOverviewOutline({ mediaType, probeOutline, segments }) {
-  const builtIn = buildBuiltInOverviewOutline(mediaType, probeOutline);
-  if (builtIn) return builtIn;
-  const generated = buildGeneratedOverviewOutline(mediaType, segments);
-  if (generated) return generated;
-  const reason = mediaType === 'document'
-    ? `this document has no PDF bookmarks (${probeOutline?.reason ?? 'no outline found'}) and fewer than ${GENERATED_OUTLINE_MIN_HEADINGS} headings in the requested pages`
-    : (probeOutline?.reason ?? 'this file has no chapters (no chapter metadata in the container)');
-  return {
-    available: false,
-    source: null,
-    generated: false,
-    total: 0,
-    entries: [],
-    reason,
-  };
-}
-
-/** view:"outline" 但没有目录时的正文（视频/录音必须明确说「没有章节」，不生成内容）。 */
-function noOutlineMessage(outline, mediaType) {
-  const reason = String(outline?.reason ?? '').trim().replace(/\.$/, '');
-  if (mediaType === 'document') {
-    return `outline: none — ${reason || 'no bookmarks and fewer than 5 headings'}. `
-      + 'This server does not invent an outline from unstructured text. Use view:"auto" or view:"text" '
-      + 'to read the text preview, or read content.md and write your own outline.';
-  }
-  return `outline: none — no chapters: ${reason || 'this file has no chapters (no chapter metadata in the container)'}. `
-    + 'This server never generates an outline for video or audio (it does not call an LLM). '
-    + 'Read media_overview({ path }) or a start/end window, then write your own outline from the '
-    + 'time-aligned text and the storyboard grids.';
-}
 
 /** 最后一道保险：任何情况下 text 长度 <= 上限（极端小上限时截断并标注） */
 function clampInlineText(text, limit) {
@@ -1572,150 +1724,12 @@ function formatTextLayerLine(result) {
   return 'text layer: yes.';
 }
 
-/* ---------------- 内置目录（9z5.33） ----------------
+/* ---------------- 内置目录（9z5.33 → 9z5.37.6） ----------------
  *
- * PDF 书签（outline）与视频/录音章节是文件自带的真实元数据，是 overview 最好
- * 的起点。probe 文本最多展示 2 层 / 60 条，其余写 "+N more"；完整目录进
- * structuredContent.outline（overview 还进 manifest.json）。
- *
- * 文档没有书签时，overview 可以从契约 v2 blocks 的 heading 生成目录（>= 5 条
- * 才算），并标注 "generated from headings"。视频/录音**不生成**目录：没有章节
- * 就是没有，server 不调 LLM。
+ * 目录的装配、行格式与预算渲染都搬到了 ./outline-view.js：读取侧统一展示一份
+ * 目录（sidecar → PDF 书签 / 章节 → heading 生成），行格式与 media_bookmark
+ * 完全一致。这里只保留 probe 文本的拼装与 overview 的预算分配。
  */
-const PROBE_OUTLINE_MAX_DEPTH = 2;
-const PROBE_OUTLINE_MAX_ENTRIES = 60;
-
-function isPdfPath(filePath) {
-  return /\.pdf$/i.test(String(filePath ?? ''));
-}
-
-function clampOutlineTitle(title, max = 120) {
-  const text = String(title ?? '').replace(/\s+/g, ' ').trim();
-  return text.length > max ? `${text.slice(0, max)}…` : text;
-}
-
-/** 书签 / 标题 / 章节条目 → 一行文本（层级只影响缩进） */
-function formatOutlineEntry(entry, mediaType) {
-  const level = Math.max(0, Math.min(Number(entry?.level) || 1, 6) - 1);
-  const indent = '  '.repeat(level);
-  if (mediaType === 'document') {
-    const page = Number.isInteger(entry?.page) ? `page ${entry.page}` : 'page ?';
-    const label = entry.label && entry.label !== String(entry.page) ? ` (label "${entry.label}")` : '';
-    return `${indent}- ${clampOutlineTitle(entry?.title)}  — ${page}${label}`;
-  }
-  const start = formatTimestamp(entry?.startMs);
-  const end = entry?.endMs === null || entry?.endMs === undefined ? '' : `-${formatTimestamp(entry.endMs)}`;
-  return `${indent}- ${clampOutlineTitle(entry?.title)}  ${start}${end}`;
-}
-
-/** 目录标题：probe 与 overview 的说法不同（probe 不写 manifest，overview 要指路） */
-function outlineHeader(outline, mediaType, target, total) {
-  const single = total === 1;
-  const unit = mediaType === 'document'
-    ? (single ? 'entry' : 'entries')
-    : (single ? 'chapter' : 'chapters');
-  if (target === 'probe') {
-    if (outline.generated) return `outline: generated from headings — ${total} ${unit} — use the outline to pick a range`;
-    return `outline: ${total} ${mediaType === 'document' ? `PDF bookmark${single ? '' : 's'}` : unit} — use the outline to pick a range`;
-  }
-  if (outline.generated) {
-    return `outline: generated from headings — ${total} ${unit} (best-effort: built from block structure; full outline in structuredContent.outline and manifest.json)`;
-  }
-  return `outline: ${total} ${mediaType === 'document' ? `PDF bookmark${single ? '' : 's'}` : unit} — full outline in structuredContent.outline and manifest.json`;
-}
-
-/** 文档目录的示例页码范围：第一条有页码的书签往后 4 页（不超过总页数） */
-function outlinePageArg(outline, pageCount) {
-  const entry = (outline?.entries ?? []).find((item) => Number.isInteger(item?.page));
-  if (!entry) return null;
-  const start = entry.page;
-  const end = Number.isInteger(pageCount) && pageCount >= start ? Math.min(pageCount, start + 4) : start + 4;
-  return end > start ? `${start}-${end}` : String(start);
-}
-
-/** 视频/录音目录的示例时间范围：第一章的起点到终点（没有终点时给 5 分钟） */
-function outlineTimeArg(outline) {
-  const entry = (outline?.entries ?? []).find((item) => Number.isFinite(item?.startMs));
-  if (!entry) return { start: 0, end: 300 };
-  const start = Number((entry.startMs / 1000).toFixed(2));
-  const endMs = Number.isFinite(entry.endMs) ? entry.endMs : entry.startMs + 300_000;
-  return { start, end: Number((Math.max(endMs, entry.startMs + 1000) / 1000).toFixed(2)) };
-}
-
-/**
- * 目录块渲染（带预算）。maxDepth / maxEntries 控展示量，maxChars 控字符预算。
- * 返回的 inlined 是**真正写进文本**的条目数；total 是目录条目总数。
- */
-function renderOutlineBlock(outline, {
-  mediaType, pageCount = null, target = 'overview', maxDepth = Infinity, maxEntries = Infinity, maxChars = Infinity,
-}) {
-  const entries = Array.isArray(outline?.entries) ? outline.entries : [];
-  const total = Number.isInteger(outline?.total) ? outline.total : entries.length;
-  const header = outlineHeader(outline, mediaType, target, total);
-  let footer = '';
-  if (target === 'overview') {
-    if (mediaType === 'document') {
-      const arg = outlinePageArg(outline, pageCount);
-      if (arg) footer = `hint: pick a range with pages, e.g. media_overview({ path, pages: "${arg}" }).`;
-    } else if (entries.length > 0) {
-      const arg = outlineTimeArg(outline);
-      footer = `hint: pick a range with start/end, e.g. media_overview({ path, start: ${arg.start}, end: ${arg.end} }).`;
-    }
-  }
-
-  const lines = [];
-  let used = header.length;
-  let inlined = 0;
-  for (const entry of entries) {
-    if (Number(entry?.level) > maxDepth) continue;
-    if (inlined >= maxEntries) break;
-    const line = formatOutlineEntry(entry, mediaType);
-    if (used + 1 + line.length > maxChars) break;
-    lines.push(line);
-    used += 1 + line.length;
-    inlined += 1;
-  }
-
-  const hidden = Math.max(0, total - inlined);
-  if (hidden > 0) {
-    const more = target === 'probe'
-      ? `  +${hidden} more (full outline in structuredContent.outline)`
-      : `  +${hidden} more entries (full outline in structuredContent.outline and manifest.json)`;
-    if (used + 1 + more.length <= maxChars || lines.length === 0) {
-      lines.push(more);
-      used += 1 + more.length;
-    }
-  } else if (inlined === 0 && total > 0 && target === 'overview') {
-    lines.push('  (no entry fits the inline budget; read the full outline in structuredContent.outline / manifest.json)');
-  }
-
-  let text = [header, ...lines].join('\n');
-  if (footer && text.length + 1 + footer.length <= maxChars) {
-    text += `\n${footer}`;
-  }
-  return { text, inlined, total, hidden };
-}
-
-/** probe 文本里的目录行：有目录就列，没有就明说（PDF / 章节）。 */
-function formatProbeOutline(result) {
-  const outline = result.outline;
-  if (!outline || typeof outline !== 'object') return [];
-  if (outline.available) {
-    const block = renderOutlineBlock(outline, {
-      mediaType: result.mediaType,
-      pageCount: result.pageCount,
-      target: 'probe',
-      maxDepth: PROBE_OUTLINE_MAX_DEPTH,
-      maxEntries: PROBE_OUTLINE_MAX_ENTRIES,
-    });
-    return block.text.split('\n');
-  }
-  if (result.mediaType === 'document') {
-    if (!isPdfPath(result.path)) return [];
-    return [`outline: none — ${outline.reason ?? 'this PDF has no bookmarks.'}`];
-  }
-  return [`chapters: none — ${outline.reason ?? 'this file has no chapters.'}`];
-}
 
 function formatProbeText(result) {
   const mediaType = result.mediaType;
@@ -1792,11 +1806,15 @@ function formatProbeText(result) {
   }
   // 9z5.33：内置目录（PDF 书签 / 章节）——most valuable next-step hint for long media。
   lines.push(...formatProbeOutline(result));
+  // 9z5.38.4：批注只报条数 + 侧车路径（note 本身由 overview 按范围展示）。
+  lines.push(...formatProbeAnnotations(result));
 
   const recommended = result.recommended ?? {};
   if (result.outline?.available) {
     // 有目录时先教 agent 用目录收窄范围（pages / start,end 两种写法）。
-    if (mediaType === 'document') {
+    if (result.outline.media === 'image') {
+      lines.push('How to read: use the outline to name regions; media_overview({ path }) or media_zoom({ path, page: 1 }) shows the picture.');
+    } else if (mediaType === 'document') {
       const arg = outlinePageArg(result.outline, result.pageCount) ?? '1-10';
       lines.push(`How to read: use the outline to pick a range, e.g. media_overview({ path, pages: "${arg}" }).`);
     } else {
@@ -1820,6 +1838,7 @@ const SUBTITLE_SOURCE_NOTE = 'note: source is subtitle — from a subtitle file/
 function formatOverviewText({
   mediaType, base, window, pages, pageCount = null, durationSec, segments, transcript, imageDescriptors, textOnly, budget, hasAudio,
   fullTextNote = null, continuationNote = null, warnings = [], view = 'auto', outline = null,
+  annotations = null, annotationEntries = null, annotationRange = null,
 }) {
   const lines = [];
   const attrs = [`path="${base.path}"`, `type="${mediaType}"`];
@@ -1858,6 +1877,15 @@ function formatOverviewText({
     if (mediaType === 'audio') attrs.push(`segments="${transcript.segmentCount}"`);
   }
   lines.push(`<overview ${attrs.join(' ')} />`);
+
+  // 9z5.38.4：批注紧跟在「页 / 时间范围」后面——同一段 attrs 里就是 ranges，
+  // 批注条目挂在它下面（`n3 (p.12): note` / `n3 (00:12:34–00:12:39): note`）。
+  const annotationBlock = renderAnnotationBlock(annotations, {
+    entries: annotationEntries,
+    rangeLabel: annotationRange,
+    maxChars: Math.max(1, Math.floor(inlineCharLimit(budget.maxInlineChars) * 0.25)),
+  });
+  if (annotationBlock.text) lines.push(annotationBlock.text);
 
   if (transcript.source === 'none' && segments.length === 0) {
     lines.push(`transcript: NONE (${transcript.reason ?? 'no transcript source is available for this file'})`);
@@ -1928,7 +1956,7 @@ function formatOverviewText({
   if (viewMode === 'outline') {
     // 只出目录：没有目录时给明确的「没有」说明，绝不生成视频/录音目录。
     const block = hasOutline
-      ? renderOutlineBlock(outline, { mediaType, pageCount, target: 'overview', maxChars: Math.max(1, capacity) })
+      ? renderOutlineBlock(outline, { pageCount, target: 'overview', maxChars: Math.max(1, capacity) })
       : { text: noOutlineMessage(outline, mediaType), inlined: 0, total: 0 };
     plan = {
       mode: 'outline',
@@ -1959,7 +1987,6 @@ function formatOverviewText({
     if (viewMode === 'auto' && hasOutline && firstPlan.preview.mode !== 'whole') {
       // 放不下且有目录：目录先占预算（最多一半），余量再交给 skim / 抽样。
       const block = renderOutlineBlock(outline, {
-        mediaType,
         pageCount,
         target: 'overview',
         maxChars: Math.max(1, Math.floor(capacity * 0.5)),
@@ -2025,6 +2052,22 @@ function formatPageRangeLabel(pages) {
   const sorted = [...pages].sort((a, b) => a - b);
   const contiguous = sorted.every((p, i) => i === 0 || p === sorted[i - 1] + 1);
   return contiguous ? `${sorted[0]}-${sorted[sorted.length - 1]}` : sorted.join(',');
+}
+
+/**
+ * 9z5.38.4：批注块的「范围」标签——批注挂在哪个页 / 时间段后面就说哪个。
+ * 时间用批注自己的 HH:MM:SS（和批注条目里的时间同形）。
+ */
+function annotationRangeLabel({ mediaType, pages, window, durationSec }) {
+  if (mediaType === 'document') {
+    if (!Array.isArray(pages) || pages.length === 0) return 'the whole document';
+    return `pages ${formatPageRangeLabel(pages)}`;
+  }
+  if (window) {
+    const endSec = window.endSec ?? durationSec ?? window.startSec;
+    return `${formatAnnotationClock(window.startSec)}–${formatAnnotationClock(endSec)}`;
+  }
+  return 'the whole media';
 }
 
 function formatZoomText({ base, mediaType, target, image, cropLabel }) {
@@ -2146,11 +2189,14 @@ function trimToBytes(text, maxBytes) {
   return out;
 }
 
-function formatLocateText({ query, matches, totalSegments, mediaType, morePages = null }) {
+function formatLocateText({ query, matches, totalSegments, mediaType, morePages = null, annotationMatches = [] }) {
   const header = `matches for "${query}" (${matches.length} of ${totalSegments} ${mediaType === 'document' ? 'pages' : 'segments'}):`;
+  // 9z5.38.4：批注命中单独成段，永远不计入上面的媒体命中数。
+  const annotationLines = formatAnnotationMatches(annotationMatches, { query });
   if (matches.length === 0) {
-    return `no line matched "${query}" among ${totalSegments} ${mediaType === 'document' ? 'page texts' : 'transcript segments'}. `
+    const empty = `no line matched "${query}" among ${totalSegments} ${mediaType === 'document' ? 'page texts' : 'transcript segments'}. `
       + 'Try shorter keywords, or a phrase that appears verbatim.';
+    return [empty, ...annotationLines].join('\n');
   }
   const lines = [header];
   if (mediaType === 'document') {
@@ -2161,7 +2207,7 @@ function formatLocateText({ query, matches, totalSegments, mediaType, morePages 
       lines.push(documentMorePagesLine(morePages));
     }
     lines.push(DOC_LOCATE_FOOTER);
-    return lines.join('\n');
+    return [...lines, ...annotationLines].join('\n');
   }
   for (const match of matches) {
     const position = match.page !== null && match.page !== undefined
@@ -2170,7 +2216,7 @@ function formatLocateText({ query, matches, totalSegments, mediaType, morePages 
     lines.push(`  ${position}  (${Number(match.score ?? 0).toFixed(2)})  ${quoteBySource(match.text, match.source)}`);
   }
   lines.push('Feed any of these windows to media_zoom({ path, start, end }) — no need to re-read the whole file.');
-  return lines.join('\n');
+  return [...lines, ...annotationLines].join('\n');
 }
 
 /**
@@ -2230,6 +2276,23 @@ async function handleProbe(args, call) {
   const result = (await call.dispatcher.call(base.mediaType, 'probe', input, call.backendCtx)) ?? {};
   const mediaType = refineMediaType(result, base.mediaType);
   const normalized = normalizeProbeResult(result, { ...base, mediaType }, call);
+  // 9z5.37.6：读取侧只展示一份目录——sidecar（存在且可用）优先，其次文件自带目录
+  // （PDF 书签 / 容器章节）。只读，绝不创建 sidecar。
+  normalized.outline = await resolveReadOutline({
+    filePath: base.path,
+    mediaType,
+    container: normalized.container,
+    probeOutline: normalized.outline,
+  });
+  // 9z5.38.4：读取侧的批注——sidecar 优先，其次文件自带的批注。
+  // probe 只报条数 + 侧车路径（不倒每一条 note）。只读，绝不创建 sidecar。
+  const annotations = await resolveReadAnnotations({
+    filePath: base.path,
+    mediaType,
+    container: normalized.container,
+    probe: normalized,
+  });
+  normalized.annotations = annotationSummary(annotations);
 
   return {
     content: [{ type: 'text', text: formatProbeText(normalized) }],
@@ -2458,11 +2521,26 @@ async function handleOverview(args, call) {
   // text 只内联预算内的部分。内置目录来自 probe（PDF 书签 / 章节），文档没有
   // 书签时才从 blocks 的 heading 生成（>= 5 条）。
   const view = args.view === 'outline' || args.view === 'text' ? args.view : 'auto';
-  const outline = buildOverviewOutline({
+  // 9z5.37.6：唯一的读取侧目录（sidecar → 文件自带 → heading 生成）。装配发生在
+  // 落盘与格式化之前：manifest.json 要拿到**完整**目录，text 只内联预算内的部分。
+  const outline = await resolveReadOutline({
+    filePath: base.path,
     mediaType,
+    container: probe.container,
     probeOutline: probe.outline,
     segments,
+    includeGenerated: true,
   });
+  // 9z5.38.4：批注同样在落盘与格式化之前装配——只取**请求范围**里的批注，
+  // 挂在该范围的页 / 时间段旁边。只读，绝不创建 sidecar。
+  const annotations = await resolveReadAnnotations({
+    filePath: base.path,
+    mediaType,
+    container: probe.container,
+    probe,
+  });
+  const annotationEntries = annotationsInRange(annotations, { pages, window });
+  const annotationRange = annotationRangeLabel({ mediaType, pages, window, durationSec });
   const rawImages = Array.isArray(result.images) ? result.images : [];
   const { blocks, descriptors } = plan
     ? collectImages(rawImages, plan, call.config)
@@ -2530,6 +2608,9 @@ async function handleOverview(args, call) {
     continuationNote: continuation?.note ?? null,
     view,
     outline,
+    annotations,
+    annotationEntries,
+    annotationRange,
   });
 
   const structuredContent = {
@@ -2537,6 +2618,12 @@ async function handleOverview(args, call) {
     path: base.path,
     view,
     outline,
+    // 9z5.38.4：请求范围里的批注（作者在结构化结果里，文本里只有纯 note）。
+    annotations: {
+      ...annotationSummary(annotations),
+      totalInRange: annotationEntries.length,
+      entries: annotationEntries,
+    },
     window: {
       startMs: window?.startMs ?? null,
       endMs: window?.endMs ?? null,
@@ -2957,18 +3044,47 @@ async function handleLocate(args, call) {
     : null;
   const shownMatches = plan ? plan.matches : matches;
 
+  // 9z5.38.4：locate 也搜批注的 note 文本。批注命中**不计入**媒体命中数，
+  // 单独成段（kind:"annotation" + id），并明说它们是批注而不是媒体内容。
+  const annotations = await resolveReadAnnotations({
+    filePath: base.path,
+    mediaType,
+    container: probe.container,
+    probe,
+  });
+  const annotationEntries = annotationsInRange(annotations, { pages, window });
+  const annotationMatches = searchAnnotations(
+    { ...annotations, entries: annotationEntries },
+    args.query,
+    { max },
+  );
+
   const text = formatLocateText({
     query: args.query,
     matches: shownMatches,
     totalSegments,
     mediaType,
     morePages: plan ? plan.morePages : null,
+    annotationMatches,
+  });
+
+  // 9z5.37.6：locate 也展示同一份目录（只读；不生成 heading 目录）。文本仍是
+  // 命中结果，目录只进 structuredContent，避免出现第二份/互相矛盾的时间轴。
+  const outline = await resolveReadOutline({
+    filePath: base.path,
+    mediaType,
+    container: probe.container,
+    probeOutline: probe.outline,
   });
 
   const structuredContent = {
     mediaType,
     path: base.path,
     query: args.query,
+    outline,
+    // 9z5.38.4：批注摘要 + 批注命中（与媒体命中分开，绝不混在一起计数）。
+    annotations: annotationSummary(annotations),
+    annotationMatches,
     transcriptSource,
     transcriptOrigin,
     matches: shownMatches,
@@ -3056,15 +3172,284 @@ function buildDocumentMatches(matches, query) {
 }
 
 /* ------------------------------------------------------------------ *
+ * media_bookmark —— 书签写入（sidecar 引擎 + 嵌入器）
+ *
+ * 流程全在 src/media/bookmark/：sidecar 是唯一真相源，写入顺序是
+ * 「嵌入成功 → 原子写 sidecar」，嵌入失败时 sidecar 不变（见 engine.js）。
+ * 本层只负责：路径/媒体判定、把 MCP 参数交给引擎、把结果变成文本 + structuredContent。
+ * ------------------------------------------------------------------ */
+
+/** 探测结果 → 书签媒体类型（pdf / video / audio / image），其它一律拒绝 */
+function bookmarkMediaType(base, probed) {
+  const mediaType = refineMediaType(probed, base.mediaType);
+  if (mediaType === 'video' || mediaType === 'audio') return mediaType;
+  if (mediaType === 'document') {
+    const container = typeof probed?.container === 'string' ? probed.container.toLowerCase() : '';
+    if (container === 'pdf') return 'pdf';
+    if (OUTLINE_IMAGE_CONTAINERS.has(container)) return 'image';
+    throw new ToolError(
+      'UNSUPPORTED_MEDIA_TYPE',
+      `media_bookmark does not support this document (container: ${container || 'unknown'}).`,
+      'Bookmarks need a native outline or a page position, so only PDF, image, video and audio are supported. '
+        + 'For a text or Office document, convert it to PDF first.',
+    );
+  }
+  throw new ToolError(
+    'UNSUPPORTED_MEDIA_TYPE',
+    `media_bookmark does not support ${mediaType} media.`,
+    'Supported media: PDF, image, video and audio.',
+  );
+}
+
+function summarizeApplied(applied) {
+  const parts = [];
+  if (applied.remove.length > 0) parts.push(`removed ${applied.remove.join(', ')}`);
+  if (applied.update.length > 0) parts.push(`updated ${applied.update.join(', ')}`);
+  if (applied.add.length > 0) parts.push(`added ${applied.add.join(', ')}`);
+  return parts.length > 0 ? parts.join('; ') : 'no changes';
+}
+
+function formatChecksSummary(checks) {
+  if (!Array.isArray(checks) || checks.length === 0) return 'no checks';
+  return checks
+    .map((check) => `${check.name}: ${check.ok ? 'ok' : 'FAILED'}${check.detail ? ` (${check.detail})` : ''}`)
+    .join('; ');
+}
+
+function formatBookmarkOutline(media, entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return '(no bookmarks)';
+  return entries
+    .map((entry) => formatBookmarkEntry(entry, { media, idPrefix: BOOKMARK_ID_PREFIX }))
+    .join('\n');
+}
+
+async function handleBookmark(args, call) {
+  const base = await resolveMedia(args);
+  const probed = await internalProbe(base, {}, call);
+  const media = bookmarkMediaType(base, probed);
+
+  // 注入点：测试 / 9z5.38.1 可以传自己的注册表；undefined = 默认注册表，null = 明确只写 sidecar
+  const embedder = call.bookmarkEmbedders === undefined
+    ? undefined
+    : bookmarkEmbedderFor(media, call.bookmarkEmbedders);
+
+  const result = await bookmarkEngine.execute({
+    filePath: base.path,
+    media,
+    probe: probed,
+    operations: { add: args.add, remove: args.remove, update: args.update },
+    embedder,
+    signal: call.signal,
+  });
+
+  const lines = [
+    `Bookmarks written for "${result.path}" (${result.media}): ${result.outline.total} entries`
+      + `${result.created ? `; imported ${result.imported} from the file's own outline` : ''}.`,
+    `applied: ${summarizeApplied(result.applied)}`,
+    `sidecar: ${result.sidecarPath}`,
+    `embed target: ${result.embed.target ?? '(none — sidecar only)'}`,
+    `checks: ${formatChecksSummary(result.checks)}`,
+    '',
+    `OUTLINE (${result.outline.total} entries${result.media === 'pdf' ? ', physical pages' : ''}):`,
+    formatBookmarkOutline(result.media, result.outline.entries),
+  ];
+
+  return {
+    content: [{ type: 'text', text: lines.join('\n') }],
+    structuredContent: {
+      path: result.path,
+      media: result.media,
+      sidecarPath: result.sidecarPath,
+      created: result.created,
+      imported: result.imported,
+      applied: result.applied,
+      embed: result.embed,
+      checks: result.checks,
+      outline: result.outline,
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * media_annotate —— 批注写入（sidecar 引擎 + 嵌入器）
+ *
+ * 与 media_bookmark 共用 src/media/bookmark/engine.js：批注自己的 schema、
+ * id 前缀 n、结果键 annotations 和错误文案都是引擎参数，流程不复制。
+ * 写入顺序仍然是「嵌入成功 → 原子写 sidecar」，嵌入失败时 sidecar 不变。
+ * ------------------------------------------------------------------ */
+
+/** 探测结果 → 批注媒体类型（pdf / video / audio / image），其它一律拒绝 */
+function annotationMediaType(base, probed) {
+  const mediaType = refineMediaType(probed, base.mediaType);
+  if (mediaType === 'video' || mediaType === 'audio') return mediaType;
+  if (mediaType === 'document') {
+    const container = typeof probed?.container === 'string' ? probed.container.toLowerCase() : '';
+    if (container === 'pdf') return 'pdf';
+    if (OUTLINE_IMAGE_CONTAINERS.has(container)) return 'image';
+    throw new ToolError(
+      'UNSUPPORTED_MEDIA_TYPE',
+      `media_annotate does not support this document (container: ${container || 'unknown'}).`,
+      'Annotations need a page position or a time range, so only PDF, image, video and audio are supported. '
+        + 'For a text or Office document, convert it to PDF first.',
+    );
+  }
+  throw new ToolError(
+    'UNSUPPORTED_MEDIA_TYPE',
+    `media_annotate does not support ${mediaType} media.`,
+    'Supported media: PDF, image, video and audio.',
+  );
+}
+
+/**
+ * 解析本次调用的作者：显式参数 → MCP initialize 的 clientInfo.name → "MultiMediaGrep"。
+ *
+ * 每次调用只解析一次（新批注都用它）；绝不使用模型名，也不读环境变量。
+ * 导入的批注保留原作者；update 不改作者。
+ *
+ * @param {string|undefined} explicitAuthor 调用参数 author
+ * @param {{name?: string}|null|undefined} clientInfo MCP initialize 里的 clientInfo
+ * @returns {string}
+ */
+function resolveAnnotationAuthor(explicitAuthor, clientInfo) {
+  if (explicitAuthor !== undefined && explicitAuthor !== null) {
+    const author = normalizeAuthor(explicitAuthor);
+    if (author === null) {
+      throw new ToolError(
+        'INVALID_ARGUMENT',
+        `author must be a non-empty string of at most ${MAX_AUTHOR_CHARS} characters `
+          + `(got ${JSON.stringify(explicitAuthor)}).`,
+        'Pass the human or agent name that should own these annotations, or omit "author" '
+          + 'to use the MCP client name.',
+      );
+    }
+    return author;
+  }
+  return normalizeAuthor(clientInfo?.name) ?? DEFAULT_ANNOTATION_AUTHOR;
+}
+
+function formatAnnotationList(media, entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return '(no annotations)';
+  return entries
+    .map((entry) => formatAnnotation(entry, { media, idPrefix: ANNOTATION_ID_PREFIX }))
+    .join('\n');
+}
+
+async function handleAnnotate(args, call) {
+  const base = await resolveMedia(args);
+  const probed = await internalProbe(base, {}, call);
+  const media = annotationMediaType(base, probed);
+  const author = resolveAnnotationAuthor(args.author, call.clientInfo);
+
+  // 注入点：测试 / 9z5.38.2 / 9z5.38.3 可以传自己的注册表；undefined = 默认注册表，null = 只写 sidecar
+  const embedder = call.annotationEmbedders === undefined
+    ? undefined
+    : annotationEmbedderFor(media, call.annotationEmbedders);
+
+  const result = await annotationEngine.execute({
+    filePath: base.path,
+    media,
+    probe: probed,
+    operations: { add: args.add, remove: args.remove, update: args.update },
+    embedder,
+    signal: call.signal,
+    context: { author },
+  });
+
+  const lines = [
+    `Annotations written for "${result.path}" (${result.media}): ${result.annotations.total} entries`
+      + `${result.created ? `; imported ${result.imported} from the file's own annotations` : ''}.`,
+    `author: ${author}`,
+    `applied: ${summarizeApplied(result.applied)}`,
+    `sidecar: ${result.sidecarPath}`,
+    `embed target: ${result.embed.target ?? '(none — sidecar only)'}`,
+    `checks: ${formatChecksSummary(result.checks)}`,
+    '',
+    `ANNOTATIONS (${result.annotations.total} entries${result.media === 'pdf' ? ', physical pages' : ''}):`,
+    formatAnnotationList(result.media, result.annotations.entries),
+  ];
+
+  return {
+    content: [{ type: 'text', text: lines.join('\n') }],
+    structuredContent: {
+      path: result.path,
+      media: result.media,
+      sidecarPath: result.sidecarPath,
+      created: result.created,
+      imported: result.imported,
+      applied: result.applied,
+      author,
+      embed: result.embed,
+      checks: result.checks,
+      annotations: result.annotations,
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * 注册
  * ------------------------------------------------------------------ */
 
-/** 4 个工具的定义表（顺序即注册顺序） */
+/** 只读工具（probe / overview / zoom / locate）：不写文件、不联网 */
+const READ_ONLY_ANNOTATIONS = Object.freeze({ readOnlyHint: true, openWorldHint: false });
+
+/** 写工具（bookmark / annotate）：改写源文件 / 在源文件旁写 sidecar，不可逆、非幂等 */
+const WRITE_ANNOTATIONS = Object.freeze({
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: false,
+});
+
+/** 6 个工具的定义表（顺序即注册顺序） */
 export const TOOL_DEFINITIONS = Object.freeze([
-  { name: 'media_probe', title: 'Probe media', description: PROBE_DESCRIPTION, shape: TOOL_SHAPES.media_probe, handler: handleProbe },
-  { name: 'media_overview', title: 'Overview', description: OVERVIEW_DESCRIPTION, shape: TOOL_SHAPES.media_overview, handler: handleOverview },
-  { name: 'media_zoom', title: 'Zoom', description: ZOOM_DESCRIPTION, shape: TOOL_SHAPES.media_zoom, handler: handleZoom },
-  { name: 'media_locate', title: 'Locate', description: LOCATE_DESCRIPTION, shape: TOOL_SHAPES.media_locate, handler: handleLocate },
+  {
+    name: 'media_probe',
+    title: 'Probe media',
+    description: PROBE_DESCRIPTION,
+    shape: TOOL_SHAPES.media_probe,
+    handler: handleProbe,
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'media_overview',
+    title: 'Overview',
+    description: OVERVIEW_DESCRIPTION,
+    shape: TOOL_SHAPES.media_overview,
+    handler: handleOverview,
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'media_zoom',
+    title: 'Zoom',
+    description: ZOOM_DESCRIPTION,
+    shape: TOOL_SHAPES.media_zoom,
+    handler: handleZoom,
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'media_locate',
+    title: 'Locate',
+    description: LOCATE_DESCRIPTION,
+    shape: TOOL_SHAPES.media_locate,
+    handler: handleLocate,
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'media_bookmark',
+    title: 'Bookmark',
+    description: BOOKMARK_DESCRIPTION,
+    shape: TOOL_SHAPES.media_bookmark,
+    handler: handleBookmark,
+    annotations: WRITE_ANNOTATIONS,
+  },
+  {
+    name: 'media_annotate',
+    title: 'Annotate',
+    description: ANNOTATE_DESCRIPTION,
+    shape: TOOL_SHAPES.media_annotate,
+    handler: handleAnnotate,
+    annotations: WRITE_ANNOTATIONS,
+  },
 ]);
 
 /**
@@ -3098,8 +3483,13 @@ export function createProgressReporter({ tool, extra, config, logger = null }) {
   };
 }
 
-/** 每次调用共享的上下文 */
-export function createCallContext(runtime, extra, toolName) {
+/**
+ * 每次调用共享的上下文。
+ *
+ * `options.clientInfo` 是 MCP initialize 里客户端报的 clientInfo（stdio 与 HTTP 共用同一个
+ * McpServer，所以两条传输都能拿到）；media_annotate 用它做 author 回退的第二级。
+ */
+export function createCallContext(runtime, extra, toolName, { clientInfo = null } = {}) {
   const onProgress = createProgressReporter({
     tool: toolName,
     extra,
@@ -3113,6 +3503,11 @@ export function createCallContext(runtime, extra, toolName) {
     logger: runtime.logger,
     cache: runtime.cache ?? null,
     dispatcher: runtime.dispatcher,
+    // 嵌入器注册表：undefined = 默认注册表，null = 明确只写 sidecar
+    bookmarkEmbedders: runtime.bookmarkEmbedders,
+    annotationEmbedders: runtime.annotationEmbedders,
+    // MCP initialize 的 clientInfo（未初始化 / 客户端没报时为 null）
+    clientInfo: clientInfo ?? null,
     signal: extra?.signal ?? null,
     onProgress,
     backendCtx: {
@@ -3129,12 +3524,21 @@ export function createCallContext(runtime, extra, toolName) {
 }
 
 /**
- * 把 4 个工具注册到 McpServer。
+ * 把 6 个工具注册到 McpServer。
  *
  * @param {import('@modelcontextprotocol/sdk/server/mcp.js').McpServer} server
- * @param {object} runtime { config, logger, cache, asrProvider, ocrProvider, typesetProvider, backends, dispatcher }
+ * @param {object} runtime { config, logger, cache, asrProvider, ocrProvider, typesetProvider, backends, dispatcher,
+ *   bookmarkEmbedders, annotationEmbedders }
  */
 export function registerTools(server, runtime) {
+  // clientInfo 要等 initialize 之后才有；每次调用时现读，未初始化时返回 null。
+  const getClientInfo = () => {
+    try {
+      return server.server.getClientVersion() ?? null;
+    } catch {
+      return null;
+    }
+  };
   for (const definition of TOOL_DEFINITIONS) {
     const inputSchema = z.object(definition.shape).strict();
     server.registerTool(
@@ -3143,11 +3547,14 @@ export function registerTools(server, runtime) {
         title: definition.title,
         description: definition.description,
         inputSchema,
-        annotations: { readOnlyHint: true, openWorldHint: false },
+        annotations: definition.annotations ?? { readOnlyHint: true, openWorldHint: false },
       },
       guardToolHandler(
         definition.name,
-        async (args, extra) => definition.handler(args ?? {}, createCallContext(runtime, extra, definition.name)),
+        async (args, extra) => definition.handler(
+          args ?? {},
+          createCallContext(runtime, extra, definition.name, { clientInfo: getClientInfo() }),
+        ),
         { logger: runtime.logger },
       ),
     );
