@@ -271,6 +271,31 @@ describe('createAsrProvider（OpenAI 兼容相关）', () => {
     });
   });
 
+  test('MMGREP_ASR_LANGUAGE=auto（含大小写变体）不发送语言字段', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'mmgrep-asr-oai-auto-'));
+    const audioPath = join(dir, 'sample.wav');
+    await writeFile(audioPath, Buffer.from('fake-wav-bytes'));
+    const stub = await startStub(jsonHandler({ text: 'ok' }));
+    try {
+      for (const language of ['auto', 'AUTO', ' auto ']) {
+        const provider = createAsrProvider({
+          MMGREP_ASR_PROVIDER: 'openai-compatible',
+          MMGREP_OPENAI_COMPATIBLE_API_KEY: FAKE_KEY,
+          MMGREP_OPENAI_COMPATIBLE_BASE_URL: stub.baseUrl,
+          MMGREP_ASR_LANGUAGE: language,
+        });
+        await provider.transcribe({ audioPath });
+      }
+      assert.equal(stub.requests.length, 3);
+      for (const request of stub.requests) {
+        assert.doesNotMatch(request.raw, /name="language"\r\n/, 'auto 不能作为语言码发出去');
+      }
+    } finally {
+      await stub.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test('provider = openai-compatible 但没给 key → 构造不报错，transcribe() 时说清缺哪个环境变量', async () => {
     const provider = createAsrProvider({ MMGREP_ASR_PROVIDER: 'openai-compatible' });
     assert.ok(provider, '缺 key 时也要返回 provider，不能是 null');
