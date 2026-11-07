@@ -111,7 +111,7 @@ export function createElevenLabsAsr({
         );
       }
 
-      const languageCode = languageOverride ?? language;
+      const languageCode = normalizeLanguageCode(languageOverride ?? language);
       const form = new FormData();
       form.append(
         'file',
@@ -247,6 +247,15 @@ export function groupWordsIntoSentences(words) {
   }
   if (current) sentences.push(current);
   return sentences;
+}
+
+/**
+ * 语言码归一化。配置层用 `auto` 表示「由 provider 自动判定」，但服务商那边
+ * 的语义是「不传该字段」——把字面量 `auto` 发出去会被判成非法语言码（ElevenLabs 直接 400）。
+ */
+function normalizeLanguageCode(language) {
+  const value = typeof language === 'string' ? language.trim() : '';
+  return value && value.toLowerCase() !== 'auto' ? value : undefined;
 }
 
 /** 秒 → 整数毫秒 */

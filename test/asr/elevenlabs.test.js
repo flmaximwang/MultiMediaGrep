@@ -282,6 +282,28 @@ describe('ElevenLabs ASR provider', () => {
     }
   });
 
+  test('MMGREP_ASR_LANGUAGE=auto（含大小写变体）不发送 language_code 字段', async () => {
+    const stub = await startStub(jsonHandler({ text: 'ok' }));
+    try {
+      for (const language of ['auto', 'AUTO', ' auto ']) {
+        const provider = createAsrProvider({
+          MMGREP_ASR_PROVIDER: 'elevenlabs',
+          MMGREP_ELEVENLABS_API_KEY: FAKE_KEY,
+          MMGREP_ELEVENLABS_BASE_URL: stub.baseUrl,
+          MMGREP_ASR_LANGUAGE: language,
+        });
+        const result = await provider.transcribe({ audioPath });
+        assert.equal(result.language, null, '自动判定时对外语言应回 null，而不是 auto');
+      }
+      assert.equal(stub.requests.length, 3);
+      for (const request of stub.requests) {
+        assert.doesNotMatch(request.raw, /name="language_code"/, 'auto 不能作为语言码发出去');
+      }
+    } finally {
+      await stub.close();
+    }
+  });
+
   test('音频超过体积上限：给出清晰错误并提示去切 ≤45 秒', async () => {
     const provider = createElevenLabsAsr({
       apiKey: FAKE_KEY,
