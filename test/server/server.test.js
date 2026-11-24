@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
+import { SERVER_VERSION } from '../../src/server/config.js';
 import { SERVER_INSTRUCTIONS } from '../../src/server/server-instructions.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -115,7 +116,7 @@ test('stdio：listTools / instructions / 路径错误 / 占位后端', { timeout
     }
 
     // 5) 日志只走 stderr：启动横幅应该在那里
-    assert.match(stderr(), /multimediagrep@0\.2\.0 ready on stdio/);
+    assert.match(stderr(), new RegExp(`multimediagrep@${SERVER_VERSION.replace(/\./g, '\\.')} ready on stdio`));
     assert.match(stderr(), /\[mmgrep\] info:/);
   });
 });
