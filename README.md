@@ -110,7 +110,7 @@ winget install Gyan.FFmpeg          # PDF 另装 poppler（无官方 winget 包�
 重新打开）。缺了 qpdf 只是读不到书签，正文与页图不受影响；写 PDF 的目录 / 批注与读 PDF 批注所需的
 `mutool` 见上表。
 
-**外部服务（可选）**：ASR（ElevenLabs 或任何 OpenAI `/audio/transcriptions` 兼容服务）与文档解析（MinerU）
+**外部服务（可选）**：ASR（ElevenLabs、DeepSeek，或任何 OpenAI `/audio/transcriptions` 兼容服务）与文档解析（MinerU）
 由你用环境变量配置。文档解析拆成 OCR / typeset 两个角色：OCR 默认 `none`，typeset 默认本地 `builtin`（不联网）——
 **不配也能用**，只是扫描页拿不到文字（详见下面「环境变量」）。
 
@@ -274,13 +274,16 @@ HTTP 端点常被多个调用方共用，provider 的 key 不必都写死在 ser
 
 | 请求头 | 作用 | 对应环境变量 |
 |---|---|---|
-| `x-mmgrep-asr-provider` | 本次请求用哪个 ASR provider：`elevenlabs` / `openai-compatible` | `MMGREP_ASR_PROVIDER` |
+| `x-mmgrep-asr-provider` | 本次请求用哪个 ASR provider：`elevenlabs` / `openai-compatible` / `deepseek` | `MMGREP_ASR_PROVIDER` |
 | `x-mmgrep-elevenlabs-api-key` | ElevenLabs key | `MMGREP_ELEVENLABS_API_KEY` |
 | `x-mmgrep-elevenlabs-base-url` | ElevenLabs 基址 | `MMGREP_ELEVENLABS_BASE_URL` |
 | `x-mmgrep-elevenlabs-model` | ElevenLabs 模型 | `MMGREP_ELEVENLABS_MODEL` |
 | `x-mmgrep-openai-compatible-api-key` | OpenAI 兼容服务的 key | `MMGREP_OPENAI_COMPATIBLE_API_KEY` |
 | `x-mmgrep-openai-compatible-base-url` | OpenAI 兼容服务的基址 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` |
 | `x-mmgrep-openai-compatible-model` | OpenAI 兼容服务的模型 | `MMGREP_OPENAI_COMPATIBLE_MODEL` |
+| `x-mmgrep-deepseek-api-key` | DeepSeek key | `MMGREP_DEEPSEEK_API_KEY` |
+| `x-mmgrep-deepseek-base-url` | DeepSeek 基址 | `MMGREP_DEEPSEEK_BASE_URL` |
+| `x-mmgrep-deepseek-model` | DeepSeek 模型（可空；`/tools/asr` 不接受 model 字段，只用于回填） | `MMGREP_DEEPSEEK_MODEL` |
 | `x-mmgrep-asr-api-key` | 通用兜底 key（旧共用变量语义） | `MMGREP_ASR_API_KEY` |
 | `x-mmgrep-ocr-provider` | 本次请求的 OCR 角色 provider：`mineru` / `none` | `MMGREP_OCR_PROVIDER` |
 | `x-mmgrep-typeset-provider` | 本次请求的 typeset 角色 provider：`builtin` / `mineru` / `none` | `MMGREP_TYPESET_PROVIDER` |
@@ -345,14 +348,17 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 | `MMGREP_HTTP_TOKEN` | 空 | Bearer 令牌。设置后每个请求必须带 `Authorization: Bearer <令牌>`；不接受 query string。令牌可以是任意 UTF-8 字符串 |
 | `MMGREP_CACHE_DIR` | `~/.cache/multimediagrep` | 缓存根目录（抽帧、页图、转写、全文落盘都在这）。`~` 会展开；相对路径按 cwd 解析 |
 | `MMGREP_CACHE_MAX_BYTES` | `10737418240`（10 GiB） | 缓存上限，支持 `512MB` / `10GB` / 纯字节数；超出按 LRU 淘汰 |
-| `MMGREP_ASR_PROVIDER` | `none` | ASR 后端：`none`（不转写）/ `elevenlabs` / `openai-compatible`。选定后只读该 provider 自己那组变量 |
+| `MMGREP_ASR_PROVIDER` | `none` | ASR 后端：`none`（不转写）/ `elevenlabs` / `openai-compatible` / `deepseek`。选定后只读该 provider 自己那组变量 |
 | `MMGREP_ELEVENLABS_API_KEY` | 空 | ElevenLabs 的 API key（`MMGREP_ASR_PROVIDER=elevenlabs` 时**必填**） |
 | `MMGREP_ELEVENLABS_BASE_URL` | `https://api.elevenlabs.io/v1` | ElevenLabs 的 API 基址 |
 | `MMGREP_ELEVENLABS_MODEL` | `scribe_v1` | ElevenLabs 转写模型名 |
 | `MMGREP_OPENAI_COMPATIBLE_API_KEY` | 空 | OpenAI 兼容服务的 API key（`MMGREP_ASR_PROVIDER=openai-compatible` 时**必填**；自建本地服务也要填非空占位值，如 `local`） |
 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容服务的 API 基址；自建服务填自己的地址 |
 | `MMGREP_OPENAI_COMPATIBLE_MODEL` | `whisper-1` | OpenAI 兼容服务的转写模型名 |
-| `MMGREP_ASR_LANGUAGE` | `auto` | 强制语言（BCP-47，如 `zh` / `en`）；`auto` = 让服务自己判断 |
+| `MMGREP_DEEPSEEK_API_KEY` | 空 | DeepSeek 的 API key（`MMGREP_ASR_PROVIDER=deepseek` 时**必填**） |
+| `MMGREP_DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | DeepSeek 的 API 基址；实际端点是 `POST {baseUrl}/tools/asr` |
+| `MMGREP_DEEPSEEK_MODEL` | 空 | DeepSeek 模型名。**默认留空是对的**：`/tools/asr` 没有 model 参数，填了只用于回填 `model`，不会发给服务 |
+| `MMGREP_ASR_LANGUAGE` | `auto` | 强制语言（BCP-47，如 `zh` / `en`）；`auto` = 让服务自己判断。DeepSeek 一律自动判定，这个值只回填不发送 |
 | `MMGREP_ASR_TIMEOUT_MS` | `120000` | ASR 单次请求超时 |
 | `MMGREP_OCR_PROVIDER` | `none` | OCR 角色：只处理没有文字层的页，以及工具参数 `ocr: "force"` 指定的页。`none` / `mineru` |
 | `MMGREP_TYPESET_PROVIDER` | `builtin` | typeset 角色：只处理有文字层的页，恢复结构、不重识别字符。`builtin` / `mineru` / `none` |
@@ -378,7 +384,14 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 另有 `MMGREP_FFMPEG_PATH` / `MMGREP_FFPROBE_PATH`（默认按 `PATH` 查找）、
 `MMGREP_AUDIO_MIN_DBFS` / `MMGREP_AUDIO_MIN_SPEECH_RATIO`（音频体检阈值）、
 `MMGREP_PROGRESS_NOTIFICATIONS`（默认 `true`）等，完整清单见
-[`docs/install.md` §3.5](docs/install.md) 与 [`docs/mcp-contract.md` §12](docs/mcp-contract.md)。
+[`docs/install.md` §3.6](docs/install.md) 与 [`docs/mcp-contract.md` §12](docs/mcp-contract.md)。
+
+> **DeepSeek 的两个「反直觉」点**：`MMGREP_DEEPSEEK_MODEL` 默认**空**是对的——`/tools/asr`
+> 不接受 model 字段，填了只用于回填 `model` / `describe()`；`MMGREP_ASR_MAX_BYTES` 在 `deepseek`
+> 下默认是 **8 MiB**（不是 100 MiB），因为服务端单请求就只收这么大，调大没用，该做的是让上层
+> 切成 ≤45 秒的片段。格式上它只收 **16-bit PCM WAV**（采样率 8000 / 16000 / 22050 / 24000 /
+> 32000 / 44100 / 48000 Hz，单/双声道，双声道只识别左声道）或 **Ogg Opus**，单段最长 **120 秒**，
+> 语言自动判定（`MMGREP_ASR_LANGUAGE` 只回填、不发送）。
 
 ---
 
@@ -452,7 +465,8 @@ server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
 - **运行时依赖**：`@modelcontextprotocol/sdk`（MIT）、`zod`（MIT）。没有构建步骤，纯 ESM。
 - **系统依赖**：ffmpeg / ffprobe（不打包、不链接，按独立子进程调用）、poppler 或 mutool 或 gs（只读 PDF 时用）；
   mutool（mupdf-tools）还用于原地写 PDF 的 outline / 批注、以及读取 PDF 批注；qpdf 可选，用于读 PDF 书签与写入后校验。
-- **可选外部服务**：ElevenLabs（ASR）、MinerU（文档解析）。都是用户自备 key，代码里不含它们的凭据。
+- **可选外部服务**：ElevenLabs / DeepSeek（ASR）、MinerU（文档解析）。都是用户自备 key，代码里不含它们的凭据
+  （DeepSeek 的 `MMGREP_DEEPSEEK_MODEL` 可以留空：`/tools/asr` 没有模型选择参数）。
 - **许可**：本项目 **Apache-2.0**（[`LICENSE`](LICENSE)）。
 - **派生源码**：`src/backend/video/` 下的 `geometry.js`、`frames.js`、`sheet.js`、`shots.js`
   以及 `storyboard.js` 的 `mapPool` 派生自 Apache-2.0 的

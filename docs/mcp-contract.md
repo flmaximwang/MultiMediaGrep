@@ -2004,15 +2004,18 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 
 | 变量 | 类型 | 默认值 | 作用 | 没配 / 配错时的行为 |
 |---|---|---|---|---|
-| `MMGREP_ASR_PROVIDER` | string | `none` | 生效的 ASR 后端。`none` = 完全不做转写；`elevenlabs` = ElevenLabs；`openai-compatible` = 按 OpenAI `/audio/transcriptions` 方言的兼容服务。选定后只读取该 provider 自己那组 key / baseUrl / model 变量 | `none` → `capabilities.asr.available = false`，`reason` 写「MMGREP_ASR_PROVIDER is \"none\"」。此时**只出画面**。另外：音频体检判定 `too-quiet` / `silent` 时**即使配了 provider 也不跑 ASR**（见 §4.3.1）。未知 provider id → 记 warning 并回落到 `none` |
+| `MMGREP_ASR_PROVIDER` | string | `none` | 生效的 ASR 后端。`none` = 完全不做转写；`elevenlabs` = ElevenLabs；`openai-compatible` = 按 OpenAI `/audio/transcriptions` 方言的兼容服务；`deepseek` = DeepSeek `POST {baseUrl}/tools/asr`（见 §12.2.1）。选定后只读取该 provider 自己那组 key / baseUrl / model 变量 | `none` → `capabilities.asr.available = false`，`reason` 写「MMGREP_ASR_PROVIDER is \"none\"」。此时**只出画面**。另外：音频体检判定 `too-quiet` / `silent` 时**即使配了 provider 也不跑 ASR**（见 §4.3.1）。未知 provider id → 记 warning 并回落到 `none` |
 | `MMGREP_ELEVENLABS_API_KEY` | string | 空 | `elevenlabs` 的 API key | 云端 provider 缺 key → `PROVIDER_NOT_CONFIGURED`（不猜、不匿名试）。若 `MMGREP_ELEVENLABS_BASE_URL` 指向回环地址（`127.0.0.1` / `localhost` / `[::1]`），则**不需要** key |
 | `MMGREP_ELEVENLABS_BASE_URL` | string | `https://api.elevenlabs.io/v1` | ElevenLabs 的 API 基址 | 用默认值。填回环地址即视为本地服务，免 key |
 | `MMGREP_ELEVENLABS_MODEL` | string | `scribe_v1` | ElevenLabs 转写模型名 | 用默认值。模型不被 provider 接受 → `PROVIDER_FAILED`，并把 provider 的原话带上 |
 | `MMGREP_OPENAI_COMPATIBLE_API_KEY` | string | 空 | `openai-compatible` 的 API key | 缺 key → `PROVIDER_NOT_CONFIGURED`；回环地址免 key |
 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` | string | `https://api.openai.com/v1` | OpenAI 兼容服务的 API 基址 | 用默认值；自建服务显式填自己的地址 |
 | `MMGREP_OPENAI_COMPATIBLE_MODEL` | string | `whisper-1` | OpenAI 兼容服务的转写模型名 | 用默认值。**不会**继承 ElevenLabs 的 `scribe_v1`；模型不被接受 → `PROVIDER_FAILED` |
+| `MMGREP_DEEPSEEK_API_KEY` | string | 空 | `deepseek` 的 API key（请求头 `Authorization: Bearer <key>`） | 缺 key → `capabilities.asr.available = false`，`reason` 点名该变量；真去转写时适配器抛 `ASR provider "deepseek" is not configured: environment variable MMGREP_DEEPSEEK_API_KEY is not set. …`（属 §2.4 的「provider 未配置」情形）。DeepSeek 是云端服务、没有自建本地形态，key **必须非空**（见 §12.2.1） |
+| `MMGREP_DEEPSEEK_BASE_URL` | string | `https://api.deepseek.com/v1` | DeepSeek 的 API 基址；实际端点是 `POST {baseUrl}/tools/asr` | 用默认值 |
+| `MMGREP_DEEPSEEK_MODEL` | string | 空 | `deepseek` 的模型名。**默认留空是契约行为**：`/tools/asr` 没有 `model` 字段，该值只回填 `transcript.model` / `describe().model`，**不进请求体** | 空 → `transcript.model = null`（不编造假模型名）。填了也不会让服务端换模型 |
 | `MMGREP_ASR_LANGUAGE` | string | `auto` | 强制语言（BCP-47，如 `zh` / `en`）。`auto` = 由 provider 自动判定 | 用默认值。填了不被支持的语言 → `PROVIDER_FAILED`（provider 原话） |
-| `MMGREP_ASR_MAX_BYTES` | integer | `104857600`（100 MiB） | 单次上传给 ASR 服务的音频上限 | 用默认值。超过时 provider 自己报错（不会切成无数片偷偷上传） |
+| `MMGREP_ASR_MAX_BYTES` | integer | `104857600`（100 MiB）；`deepseek` 为 `8388608`（8 MiB） | 单次上传给 ASR 服务的音频上限。**默认值按 provider 分组**：`deepseek` 的单请求硬上限就是 8 MiB | 用默认值。超过时 provider 自己报错（不会切成无数片偷偷上传）。`deepseek` 下把值调大没用——服务端仍会拒绝，该做的是切 ≤45 秒的片段 |
 | `MMGREP_ASR_DIARIZE` | boolean | `false` | 仅 `elevenlabs`：是否向服务请求说话人分离。**本版只透传请求，还没有把 speaker 回填到 segments**（字段恒为 `null`） | 用默认值；`openai-compatible` 忽略它 |
 | `MMGREP_ASR_RESPONSE_FORMAT` | string | `verbose_json` | 仅 `openai-compatible`：请求的响应格式（要时间戳就得是 `verbose_json`） | 用默认值；服务不支持该格式 → `PROVIDER_FAILED` |
 | `MMGREP_ASR_TIMESTAMP_GRANULARITIES` | string | 空 | 仅 `openai-compatible`：逗号分隔的时间戳粒度（`word` / `segment`） | 空 = 不传，由服务默认 |
@@ -2022,6 +2025,45 @@ TOOL DESCRIPTIONS CARRY CHINESE TRIGGER WORDS (探媒体 / 视频 / 录音 / 文
 > 不经 `config.js`，所以不会出现在 `describeConfig()` 的输出里。
 
 > 兼容兜底：`MMGREP_ASR_API_KEY` / `MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 在对应的 provider 专属变量未设置时仍然生效，但会在 `config.warnings` 里记一条弃用提示。**0.2.0 未删除它们**（本版删的是文档 provider 的 `MMGREP_DOC_*`）；按现有计划，删除会发生在后续大版本。旧 `MMGREP_ASR_MODEL` 与 `openai-compatible` 同用时还会额外警告该值可能不适配。
+
+#### 12.2.1 DeepSeek（`POST {baseUrl}/tools/asr`）
+
+`MMGREP_ASR_PROVIDER=deepseek` 时的适配器契约。端点 `POST {baseUrl}/tools/asr`，
+`baseUrl` 默认 `https://api.deepseek.com/v1`；认证头 `Authorization: Bearer <MMGREP_DEEPSEEK_API_KEY>`。
+
+请求体是 multipart，**只有 `file` 一个字段**。以下两条是硬约束，不是建议：
+
+- **不接受 `model` 字段**：`/tools/asr` 没有模型选择参数。`MMGREP_DEEPSEEK_MODEL`（及
+  `x-mmgrep-deepseek-model`）只回填结果里的 `transcript.model` 与 `describe().model`；留空时两者都是
+  `null`。**不要把 `MMGREP_DEEPSEEK_MODEL` 当成「必填但文档忘了写」**——空是正常状态。
+- **不接受 `language` 字段**：语言由服务自动判定。`MMGREP_ASR_LANGUAGE` 填了具体语言码会回填到
+  `transcript.language`，`auto` / 未填 → `null`；这个值**不会**进请求体。
+
+音频与体积：
+
+| 约束 | 值 | 配错时 |
+|---|---|---|
+| 接受的格式 | 16-bit PCM WAV（采样率 8000 / 16000 / 22050 / 24000 / 32000 / 44100 / 48000 Hz，单声道或双声道；双声道只识别左声道）或 Ogg Opus | 服务端拒绝 → `PROVIDER_FAILED`（provider 原话，见 §2.4） |
+| 单请求体积上限 | **8 MiB**（`MMGREP_ASR_MAX_BYTES` 在 `deepseek` 下的默认值 `8388608`） | 适配器先本地抛错，错误里让你切 ≤45 秒片段；调大 `MMGREP_ASR_MAX_BYTES` 无效（服务端仍会拒绝） |
+| 单段时长上限 | **120 秒**（服务端硬限制；本仓库上游按 ≤45 秒切片，所以正常走不到） | 服务端拒绝 → `PROVIDER_FAILED` |
+| 分块 | 上游 server 按 ≤45 秒切片后逐片调用（见 §4.3 与 `src/providers/asr/README.md`） | 超长音频会被切，不会整段硬传 |
+
+默认链路送进来的就是 `src/media/ffmpeg.js` 的 `normalizeToWav()` 产物：16 kHz、单声道、
+16-bit PCM WAV，落在允许范围内，不需要额外转码。
+
+响应与结果映射：服务返回 `{ request_id, text, duration_ms }`。
+
+- `text` 非空 → `segments` 里**只有一个**元素：`startMs = 0`，`endMs = duration_ms`
+  （`duration_ms` 不是合法非负数时 `endMs = null`）。
+- `text` 为空 / 纯空白 → `segments = []`（不造一条空 segment）。
+- **没有逐句 / 逐词时间戳**：`/tools/asr` 响应里不存在这个信息。`media_locate` 的命中时间来自
+  这个单 segment 的整段区间，不要据此宣称「第 3 句在第 12 秒」。
+- 缺 key 的可观测行为：`probe` 的 `capabilities.asr.available = false`、`reason` 里点名
+  `MMGREP_DEEPSEEK_API_KEY is not set for provider "deepseek".`；真去转写时抛的文案是
+  `ASR provider "deepseek" is not configured: environment variable MMGREP_DEEPSEEK_API_KEY is not set. …`
+- 错误映射：HTTP 非 2xx、超时、超限、响应不可解析 → 契约上归 `PROVIDER_FAILED`（见 §2.4），
+  provider 原话里带脱敏后的响应体与端点，**不含 key**；音频体检判定无声时则根本不会调到它（见 §4.3.1）。
+- `describe()` → `{ id: 'deepseek', model: model || null, baseUrl }`，**不含 apiKey**（见 §12.7 的安全条款）。
 
 ### 12.3 文档 provider：OCR 角色
 
@@ -2098,13 +2140,16 @@ provider 无法保证原字符时必须返回 `textOrigin = "ocr"` / `"unknown"`
 
 | 请求头 | 作用 | 对应环境变量 |
 |---|---|---|
-| `x-mmgrep-asr-provider` | 本次请求的 ASR provider：`elevenlabs` / `openai-compatible` | `MMGREP_ASR_PROVIDER` |
+| `x-mmgrep-asr-provider` | 本次请求的 ASR provider：`elevenlabs` / `openai-compatible` / `deepseek` | `MMGREP_ASR_PROVIDER` |
 | `x-mmgrep-elevenlabs-api-key` | ElevenLabs key | `MMGREP_ELEVENLABS_API_KEY` |
 | `x-mmgrep-elevenlabs-base-url` | ElevenLabs 基址 | `MMGREP_ELEVENLABS_BASE_URL` |
 | `x-mmgrep-elevenlabs-model` | ElevenLabs 模型 | `MMGREP_ELEVENLABS_MODEL` |
 | `x-mmgrep-openai-compatible-api-key` | OpenAI 兼容服务 key | `MMGREP_OPENAI_COMPATIBLE_API_KEY` |
 | `x-mmgrep-openai-compatible-base-url` | OpenAI 兼容服务基址 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` |
 | `x-mmgrep-openai-compatible-model` | OpenAI 兼容服务模型 | `MMGREP_OPENAI_COMPATIBLE_MODEL` |
+| `x-mmgrep-deepseek-api-key` | DeepSeek key | `MMGREP_DEEPSEEK_API_KEY` |
+| `x-mmgrep-deepseek-base-url` | DeepSeek 基址（端点为 `{baseUrl}/tools/asr`） | `MMGREP_DEEPSEEK_BASE_URL` |
+| `x-mmgrep-deepseek-model` | DeepSeek 模型。**可空**：`/tools/asr` 没有 `model` 字段，该值只回填 `transcript.model`，不进请求体 | `MMGREP_DEEPSEEK_MODEL` |
 | `x-mmgrep-asr-api-key` | 通用兜底 key（旧共用变量语义） | `MMGREP_ASR_API_KEY` |
 | `x-mmgrep-ocr-provider` | 本次请求的 OCR 角色 provider：`mineru` / `none` | `MMGREP_OCR_PROVIDER` |
 | `x-mmgrep-typeset-provider` | 本次请求的 typeset 角色 provider：`builtin` / `mineru` / `none` | `MMGREP_TYPESET_PROVIDER` |

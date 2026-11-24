@@ -339,7 +339,46 @@ MMGREP_OPENAI_COMPATIBLE_MODEL=whisper-1
 > （例如 `MMGREP_OPENAI_COMPATIBLE_API_KEY=local`）。
 > 另外：只有本地地址时 `MMGREP_ASR_PROVIDER` 要写 `openai-compatible`，别写 `elevenlabs`。
 
-### 3.3 文档解析：OCR 与 typeset 两个角色（MinerU）
+### 3.3 ASR：DeepSeek（`/tools/asr`）
+
+```bash
+MMGREP_ASR_PROVIDER=deepseek
+MMGREP_DEEPSEEK_API_KEY=sk-你的key
+# 下面两个一般不用动
+MMGREP_DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+MMGREP_DEEPSEEK_MODEL=          # 留空是对的，见下面第一条 ⚠️
+```
+
+server 打的是 `POST {baseUrl}/tools/asr`，认证头是 `Authorization: Bearer <key>`；
+multipart 请求体里**只有 `file` 一个字段**。
+
+> ⚠️ **`MMGREP_DEEPSEEK_MODEL` 默认留空，这不是漏配。** `/tools/asr` 没有模型选择参数，
+> 填了这个值只会回填到 `transcript.model` / `describe()`，**不会**发进请求体；填一个服务没接受过的
+> 模型名也不会让它生效。
+
+> ⚠️ **单请求上限 8 MiB**（不是 100 MiB）。`MMGREP_ASR_MAX_BYTES` 在 `deepseek` 下的默认值就是
+> `8388608`；服务端也会直接拒绝更大的上传，**把自己的值调大没有用**——该做的是让上层按 ≤45 秒
+> 切片（server 默认就这么切）。超限时报的是
+> `DeepSeek ASR: audio file is N bytes, over the M byte limit for a single request.`
+
+> ⚠️ **只收两种音频**：16-bit PCM WAV（采样率 8000 / 16000 / 22050 / 24000 / 32000 / 44100 /
+> 48000 Hz，单声道或双声道——双声道只识别左声道）或 Ogg Opus；单段最长 **120 秒**，上传要在
+> 10 分钟内完成。默认链路是 ffmpeg → 16 kHz 单声道 WAV，正好在允许范围内；直接把 mp3 / m4a
+> 之类丢给它会被服务端拒绝。另外每个账号最多 **50 个并发请求**，超了返回 `429`。
+
+其它已知限制：
+
+- **语言自动判定**：`MMGREP_ASR_LANGUAGE` 对 DeepSeek 只用于回填 `transcript.language`，**不发送**；
+  服务返回体里没有语言字段，所以 `auto` 时就是 `null`（不猜）。
+- **没有分段 / 逐词时间戳**：响应是 `{ request_id, text, duration_ms }`，`duration_ms` 是整段音频的
+  毫秒时长。转写结果因此退化成一个 segment（`startMs: 0`）；想要逐句时间轴请换 provider，
+  别假装有时间码。
+- HTTP 模式下，这三项都可以按请求覆盖：`x-mmgrep-deepseek-api-key` /
+  `x-mmgrep-deepseek-base-url` / `x-mmgrep-deepseek-model`（见 README「每请求凭据」与契约 §12.7）。
+
+到 <https://platform.deepseek.com/api_keys> 取 key。
+
+### 3.4 文档解析：OCR 与 typeset 两个角色（MinerU）
 
 0.2.0 起，文档 provider 拆成两个角色，分别配置：
 
@@ -394,7 +433,7 @@ provider 的解析结果**按页缓存**（键含源文件内容 sha256 + provid
 - **旧变量已删除**：`MMGREP_DOC_PROVIDER` / `MMGREP_DOC_API_KEY` /
   `MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL` 不再生效；启动时会 warn 并指出替代变量。
 
-### 3.4 key 的处理
+### 3.5 key 的处理
 
 - key 只写在**你自己的**宿主配置或环境变量里，**不要提交进仓库**。
 - server 从不打印 key：日志和错误里只会出现 `set` / `unset`，返回值里的 `describe()` 也不含 key。
@@ -406,7 +445,7 @@ provider 的解析结果**按页缓存**（键含源文件内容 sha256 + provid
 
 ---
 
-### 3.5 环境变量总表
+### 3.6 环境变量总表
 
 全部前缀 `MMGREP_`。**key 只回答「配没配」，永不打印值**；写错的值按「用默认值 + 记 warning」处理，不会让 server 崩。
 
@@ -418,16 +457,19 @@ provider 的解析结果**按页缓存**（键含源文件内容 sha256 + provid
 | `MMGREP_HTTP_TOKEN` | 空 | Bearer 令牌；空 = 不鉴权 |
 | `MMGREP_CACHE_DIR` | `~/.cache/multimediagrep` | 缓存根目录（`~` 展开，相对路径按 cwd） |
 | `MMGREP_CACHE_MAX_BYTES` | `10737418240`（10 GiB） | 缓存上限，支持 `512MB` / `10GB` / 字节数；LRU 淘汰 |
-| `MMGREP_ASR_PROVIDER` | `none` | `none` / `elevenlabs` / `openai-compatible` |
+| `MMGREP_ASR_PROVIDER` | `none` | `none` / `elevenlabs` / `openai-compatible` / `deepseek` |
 | `MMGREP_ELEVENLABS_API_KEY` | 空 | ElevenLabs key（回环 baseUrl 可免） |
 | `MMGREP_ELEVENLABS_BASE_URL` | `https://api.elevenlabs.io/v1` | ElevenLabs 基址 |
 | `MMGREP_ELEVENLABS_MODEL` | `scribe_v1` | ElevenLabs 转写模型 |
 | `MMGREP_OPENAI_COMPATIBLE_API_KEY` | 空 | OpenAI 兼容服务 key（自建服务也要非空占位值） |
 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容服务基址 |
 | `MMGREP_OPENAI_COMPATIBLE_MODEL` | `whisper-1` | OpenAI 兼容服务模型 |
-| `MMGREP_ASR_LANGUAGE` | `auto` | 强制语言（BCP-47）；`auto` = 服务自己判断 |
+| `MMGREP_DEEPSEEK_API_KEY` | 空 | DeepSeek key（`deepseek` 时**必填**） |
+| `MMGREP_DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | DeepSeek 基址；端点是 `POST {baseUrl}/tools/asr` |
+| `MMGREP_DEEPSEEK_MODEL` | 空 | DeepSeek 模型；**留空是对的**，`/tools/asr` 没有 model 参数，填了只回填不发 |
+| `MMGREP_ASR_LANGUAGE` | `auto` | 强制语言（BCP-47）；`auto` = 服务自己判断（DeepSeek 只回填、不发送） |
 | `MMGREP_ASR_TIMEOUT_MS` | `120000` | ASR 单次请求超时 |
-| `MMGREP_ASR_MAX_BYTES` | `104857600`（100 MiB） | 单次上传音频上限（provider 层读取） |
+| `MMGREP_ASR_MAX_BYTES` | `104857600`（100 MiB）；`deepseek` 为 `8388608`（8 MiB） | 单次上传音频上限（provider 层读取；默认值按 provider 分组） |
 | `MMGREP_ASR_DIARIZE` | `false` | 仅 ElevenLabs：请求说话人分离（本版只透传，`speaker` 未回填） |
 | `MMGREP_ASR_RESPONSE_FORMAT` | `verbose_json` | 仅 OpenAI 兼容：响应格式（要时间戳就用它） |
 | `MMGREP_ASR_TIMESTAMP_GRANULARITIES` | 空 | 仅 OpenAI 兼容：`word` / `segment` 时间戳粒度 |
@@ -480,7 +522,7 @@ provider 的解析结果**按页缓存**（键含源文件内容 sha256 + provid
 │   ├── manifest.json             这次产出了什么
 │   ├── document.json             可选件（cangjie SourceDocument Contract v1）
 │   ├── images/                   宫格图 / 特写图
-│   └── doc-provider/...          文档 provider 的逐页结果（page-0001.json …，见 §3.3）
+│   └── doc-provider/...          文档 provider 的逐页结果（page-0001.json …，见 §3.4）
 └── <2 位分片>/.meta-<摘要>.json  条目记录（大小、创建与最后使用时间）
 ```
 
@@ -556,8 +598,8 @@ sampled（完整单元等距抽样，并写明未覆盖页）；`view:"outline"`
 | `TOOL_NOT_FOUND: ffmpeg is not installed or not on PATH.` | 同上 | 同上 |
 | `TOOL_NOT_FOUND: no PDF page rasterizer is available on this machine (pdftoppm, mutool, and gs were all missing).` | 没装 PDF 栅格化工具 | 装 `poppler-utils` / `mupdf-tools` / `ghostscript` 任意一个 |
 | `TOOL_NOT_FOUND: cannot read PDF metadata: no PDF tool is installed (pdfinfo, mutool, or qpdf).` | 同上（缺的是元信息工具） | 同上 |
-| probe 说 `asr: unavailable — …` | 没配 ASR / 缺 key / 体检判定无声（`too-quiet` / `silent`） | 配 `MMGREP_ASR_PROVIDER` + 对应 provider 的 key（§3.1 / §3.2），或传一个本地字幕文件；体检无声时换一份清楚的录音 |
-| probe 说 `ocr provider: none — No OCR provider is configured (MMGREP_OCR_PROVIDER is "none"). Pages without a text layer are returned as page images only.` | 没配 OCR | 配 `MMGREP_OCR_PROVIDER=mineru` + `MMGREP_MINERU_API_KEY`（§3.3）；扫描件没 OCR 就只能看页图 |
+| probe 说 `asr: unavailable — …` | 没配 ASR / 缺 key / 体检判定无声（`too-quiet` / `silent`） | 配 `MMGREP_ASR_PROVIDER` + 对应 provider 的 key（§3.1 / §3.2 / §3.3），或传一个本地字幕文件；体检无声时换一份清楚的录音 |
+| probe 说 `ocr provider: none — No OCR provider is configured (MMGREP_OCR_PROVIDER is "none"). Pages without a text layer are returned as page images only.` | 没配 OCR | 配 `MMGREP_OCR_PROVIDER=mineru` + `MMGREP_MINERU_API_KEY`（§3.4）；扫描件没 OCR 就只能看页图 |
 | `PROVIDER_NOT_CONFIGURED`（文档，含 `ocr: "force"`） | 选了 provider 但缺 key；或 force 时根本没配 OCR provider | `MMGREP_MINERU_API_KEY` 填上，或把对应角色设成 `none`（`MMGREP_OCR_PROVIDER=none` / `MMGREP_TYPESET_PROVIDER=none`）退回「只有页图」/「原生文字层」 |
 | `PROVIDER_FAILED: … HTTP 401/403 …` | key 不对 / token 过期 | 换 key；MinerU 常见业务码 `A0202`（token 错）、`A0211`（token 过期） |
 | `PROVIDER_FAILED`，但我明明用的是自己的服务 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` / `MMGREP_OPENAI_COMPATIBLE_MODEL` 没改 | 这两个的默认值是 OpenAI 官方的 `https://api.openai.com/v1` + `whisper-1`；用自己的服务时显式写上（见 §3.2） |

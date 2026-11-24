@@ -9,15 +9,15 @@
  * 降级规则（重要，server 集成要照着写）：
  *   - `MMGREP_ASR_PROVIDER` 没设或设为 `none` → 返回 **null**，表示「本次没有 ASR」，
  *     server 应当只返回画面内容，不要报错。
- *   - provider 明确选了（elevenlabs / openai-compatible）但没给 key → 返回一个
- *     **会在 transcribe() 时抛出清晰错误**的 provider（而不是在构造时炸），
+ *   - provider 明确选了（elevenlabs / openai-compatible / deepseek）但没给 key →
+ *     返回一个**会在 transcribe() 时抛出清晰错误**的 provider（而不是在构造时炸），
  *     这样 server 可以在真正需要转写时才告诉用户「你少了 MMGREP_ELEVENLABS_API_KEY /
- *     MMGREP_OPENAI_COMPATIBLE_API_KEY」。
+ *     MMGREP_OPENAI_COMPATIBLE_API_KEY / MMGREP_DEEPSEEK_API_KEY」。
  *   - `MMGREP_ASR_PROVIDER` 是个不认识的值 → 构造时直接抛错（这是拼写错误，必须吵醒用户）。
  *
  * provider 对象契约：
  *   {
- *     id: 'elevenlabs' | 'openai-compatible' | 'none',
+ *     id: 'elevenlabs' | 'openai-compatible' | 'deepseek' | 'none',
  *     transcribe({ audioPath, language?, mimeType?, signal? }) =>
  *       Promise<{ provider, model, language, segments: Array<{startMs, endMs, text}>, raw? }>,
  *     describe() => { id, model, baseUrl },   // 永远不含 apiKey
@@ -32,9 +32,15 @@ import {
   OPENAI_DEFAULT_BASE_URL,
   OPENAI_DEFAULT_MODEL,
 } from './openai-compatible.js';
+import {
+  createDeepSeekAsr,
+  DEEPSEEK_DEFAULT_BASE_URL,
+  DEEPSEEK_DEFAULT_MAX_BYTES,
+  DEEPSEEK_DEFAULT_MODEL,
+} from './deepseek.js';
 
 /** 所有可用的 ASR provider id。'none' = 明确不启用 ASR。 */
-export const ASR_PROVIDERS = ['elevenlabs', 'openai-compatible', 'none'];
+export const ASR_PROVIDERS = ['elevenlabs', 'openai-compatible', 'deepseek', 'none'];
 
 /** 默认超时（毫秒） */
 export const DEFAULT_TIMEOUT_MS = 120_000;
@@ -56,6 +62,11 @@ const PROVIDER_ENV = Object.freeze({
     apiKey: 'MMGREP_OPENAI_COMPATIBLE_API_KEY',
     baseUrl: 'MMGREP_OPENAI_COMPATIBLE_BASE_URL',
     model: 'MMGREP_OPENAI_COMPATIBLE_MODEL',
+  }),
+  deepseek: Object.freeze({
+    apiKey: 'MMGREP_DEEPSEEK_API_KEY',
+    baseUrl: 'MMGREP_DEEPSEEK_BASE_URL',
+    model: 'MMGREP_DEEPSEEK_MODEL',
   }),
 });
 
@@ -105,7 +116,9 @@ export function createAsrProvider(env = process.env, opts = {}) {
   const apiKey = cleanEnvValue(opts.apiKey ?? readProviderEnv(env, requested, 'apiKey')) || '';
   const language = cleanEnvValue(opts.language ?? env.MMGREP_ASR_LANGUAGE) || undefined;
   const timeoutMs = positiveInt(opts.timeoutMs ?? env.MMGREP_ASR_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
-  const maxBytes = positiveInt(opts.maxBytes ?? env.MMGREP_ASR_MAX_BYTES, DEFAULT_MAX_BYTES);
+  // DeepSeek 单请求只收 8 MiB，默认值必须按 provider 分组，不能被别的 provider 撑大。
+  const defaultMaxBytes = requested === 'deepseek' ? DEEPSEEK_DEFAULT_MAX_BYTES : DEFAULT_MAX_BYTES;
+  const maxBytes = positiveInt(opts.maxBytes ?? env.MMGREP_ASR_MAX_BYTES, defaultMaxBytes);
   const baseUrl = stripTrailingSlash(
     cleanEnvValue(opts.baseUrl ?? readProviderEnv(env, requested, 'baseUrl')) || defaultBaseUrl(requested),
   );
@@ -126,6 +139,18 @@ export function createAsrProvider(env = process.env, opts = {}) {
       timeoutMs,
       maxBytes,
       diarize: parseBoolean(opts.diarize ?? env.MMGREP_ASR_DIARIZE),
+      fetchImpl: opts.fetchImpl,
+    });
+  }
+
+  if (requested === 'deepseek') {
+    return createDeepSeekAsr({
+      apiKey,
+      baseUrl,
+      model,
+      language,
+      timeoutMs,
+      maxBytes,
       fetchImpl: opts.fetchImpl,
     });
   }
@@ -158,8 +183,8 @@ export function createNoneAsrProvider() {
     async transcribe() {
       throw new Error(
         'No ASR provider is configured; only visual content is available. ' +
-          'Set MMGREP_ASR_PROVIDER to "elevenlabs" or "openai-compatible" and provide the matching API key ' +
-          '(MMGREP_ELEVENLABS_API_KEY or MMGREP_OPENAI_COMPATIBLE_API_KEY) to enable transcription.',
+          'Set MMGREP_ASR_PROVIDER to "elevenlabs", "openai-compatible" or "deepseek" and provide the matching API key ' +
+          '(MMGREP_ELEVENLABS_API_KEY, MMGREP_OPENAI_COMPATIBLE_API_KEY or MMGREP_DEEPSEEK_API_KEY) to enable transcription.',
       );
     },
     describe() {
@@ -187,11 +212,15 @@ function createUnconfiguredProvider({ id, model, baseUrl }) {
 }
 
 function defaultBaseUrl(providerId) {
-  return providerId === 'elevenlabs' ? ELEVENLABS_DEFAULT_BASE_URL : OPENAI_DEFAULT_BASE_URL;
+  if (providerId === 'elevenlabs') return ELEVENLABS_DEFAULT_BASE_URL;
+  if (providerId === 'deepseek') return DEEPSEEK_DEFAULT_BASE_URL;
+  return OPENAI_DEFAULT_BASE_URL;
 }
 
 function defaultModel(providerId) {
-  return providerId === 'elevenlabs' ? ELEVENLABS_DEFAULT_MODEL : OPENAI_DEFAULT_MODEL;
+  if (providerId === 'elevenlabs') return ELEVENLABS_DEFAULT_MODEL;
+  if (providerId === 'deepseek') return DEEPSEEK_DEFAULT_MODEL;
+  return OPENAI_DEFAULT_MODEL;
 }
 
 /** provider id 归一化：去空白、转小写 */

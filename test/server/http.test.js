@@ -616,6 +616,50 @@ test('http：逐请求凭据 —— 同一端点两个请求各用各的 provide
   }
 });
 
+test('http：x-mmgrep-deepseek-* 逐请求凭据生效（config 级），共享 runtime 不被改动', async () => {
+  const seen = [];
+  const serverFactory = (runtimeForRequest) => {
+    seen.push(runtimeForRequest);
+    return createServer(runtimeForRequest);
+  };
+
+  await withHttpServer({}, async ({ endpoint, runtime, logs }) => {
+    const list = { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} };
+    const res = await rpc(endpoint, list, {
+      'x-mmgrep-asr-provider': 'deepseek',
+      'x-mmgrep-deepseek-api-key': 'sentinel-deepseek-request-key',
+      'x-mmgrep-deepseek-base-url': 'https://sentinel.deepseek.example/v1',
+      'x-mmgrep-deepseek-model': 'sentinel-deepseek-model',
+    });
+    assert.equal(res.status, 200);
+    assert.equal(seen.length, 1);
+    assert.notEqual(seen[0], runtime);
+    assert.equal(seen[0].config.asr.provider, 'deepseek');
+    assert.equal(seen[0].config.asr.apiKey, 'sentinel-deepseek-request-key');
+    assert.equal(seen[0].config.asr.apiKeySource, 'x-mmgrep-deepseek-api-key');
+    assert.equal(seen[0].config.asr.baseUrl, 'https://sentinel.deepseek.example/v1');
+    assert.equal(seen[0].config.asr.model, 'sentinel-deepseek-model');
+    assert.deepEqual(seen[0].config.requestOverrides.asr, {
+      provider: 'x-mmgrep-asr-provider',
+      apiKey: 'x-mmgrep-deepseek-api-key',
+      baseUrl: 'x-mmgrep-deepseek-base-url',
+      model: 'x-mmgrep-deepseek-model',
+    });
+    assert.equal(runtime.config.asr.provider, 'none', '共享 runtime 的配置被改动了');
+
+    // 日志只出现头名，不出现任何头的值。
+    const text = logs.join('\n');
+    assert.match(text, /x-mmgrep-deepseek-api-key/);
+    for (const secret of [
+      'sentinel-deepseek-request-key',
+      'sentinel-deepseek-model',
+      'https://sentinel.deepseek.example/v1',
+    ]) {
+      assert.ok(!text.includes(secret), `日志泄漏了请求头的值 ${secret}：${text}`);
+    }
+  }, { serverFactory });
+});
+
 test('http：x-mmgrep-ocr-provider / x-mmgrep-typeset-provider 覆盖 env（仅本次请求）', async () => {
   const seen = [];
   const serverFactory = (runtimeForRequest) => {
@@ -754,6 +798,7 @@ test('http：未知 provider 头 → 400 / -32602，不构造 provider，也不�
     assert.match(res.json.error.message, /x-mmgrep-asr-provider/);
     assert.match(res.json.error.message, /elevenlabs/);
     assert.match(res.json.error.message, /openai-compatible/);
+    assert.match(res.json.error.message, /deepseek/);
     assert.ok(!res.text.includes(sentinel), '错误响应回显了 key');
     assert.equal(seen.length, 0, 'provider id 不合法时不该构造任何 server / provider');
 

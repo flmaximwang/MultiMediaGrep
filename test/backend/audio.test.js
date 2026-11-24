@@ -195,6 +195,9 @@ test('后端 probe/overview/zoom/locate：字幕文件路径', { skip }, async (
     assert.equal(probe.capabilities.transcriptOrigin, 'file');
     assert.equal(probe.capabilities.transcriptPath, srt);
     assert.equal(probe.capabilities.asr.available, false); // 没配 ASR
+    // 没配 ASR 时要把三家 provider 的 key 变量都点名（含 DeepSeek）
+    assert.match(probe.capabilities.asr.reason, /MMGREP_ELEVENLABS_API_KEY/);
+    assert.match(probe.capabilities.asr.reason, /MMGREP_DEEPSEEK_API_KEY/);
     assert.equal(probe.audioHealth.verdict, 'has-speech');
 
     const overview = await backend.overview({ path: audio, subtitle: srt, envelope: true });

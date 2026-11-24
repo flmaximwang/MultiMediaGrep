@@ -42,6 +42,12 @@ export const DEFAULT_ASR_BASE_URL = 'https://api.elevenlabs.io/v1';
 export const DEFAULT_ASR_MODEL = 'scribe_v1';
 export const DEFAULT_OPENAI_COMPATIBLE_BASE_URL = 'https://api.openai.com/v1';
 export const DEFAULT_OPENAI_COMPATIBLE_MODEL = 'whisper-1';
+/**
+ * DeepSeek ASR：`/v1/tools/asr` **没有模型选择参数**（语言也自动判定），
+ * 所以默认模型留空串——对外表现为 null，describe() 里不会编出一个假模型名。
+ */
+export const DEFAULT_DEEPSEEK_BASE_URL = 'https://api.deepseek.com/v1';
+export const DEFAULT_DEEPSEEK_MODEL = '';
 export const DEFAULT_DOC_BASE_URL = 'https://mineru.net/api/v4';
 export const DEFAULT_DOC_MODEL = '';
 
@@ -103,6 +109,13 @@ export const PROVIDER_ENV = Object.freeze({
       model: 'MMGREP_OPENAI_COMPATIBLE_MODEL',
       defaultBaseUrl: DEFAULT_OPENAI_COMPATIBLE_BASE_URL,
       defaultModel: DEFAULT_OPENAI_COMPATIBLE_MODEL,
+    }),
+    deepseek: Object.freeze({
+      apiKey: 'MMGREP_DEEPSEEK_API_KEY',
+      baseUrl: 'MMGREP_DEEPSEEK_BASE_URL',
+      model: 'MMGREP_DEEPSEEK_MODEL',
+      defaultBaseUrl: DEFAULT_DEEPSEEK_BASE_URL,
+      defaultModel: DEFAULT_DEEPSEEK_MODEL,
     }),
   }),
   doc: Object.freeze({

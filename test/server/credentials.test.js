@@ -7,6 +7,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  DEFAULT_DEEPSEEK_BASE_URL,
+  DEFAULT_DEEPSEEK_MODEL,
   DEFAULT_MAX_TEXT_INLINE_CHARS,
   DEFAULT_OPENAI_COMPATIBLE_BASE_URL,
   DEFAULT_OPENAI_COMPATIBLE_MODEL,
@@ -54,6 +56,11 @@ test('REQUEST_HEADERS：头名就是环境变量名的小写连字符形式', ()
           apiKey: 'x-mmgrep-openai-compatible-api-key',
           baseUrl: 'x-mmgrep-openai-compatible-base-url',
           model: 'x-mmgrep-openai-compatible-model',
+        },
+        deepseek: {
+          apiKey: 'x-mmgrep-deepseek-api-key',
+          baseUrl: 'x-mmgrep-deepseek-base-url',
+          model: 'x-mmgrep-deepseek-model',
         },
       },
     },
@@ -175,6 +182,61 @@ test('请求头切换 provider：只用新 provider 的变量组，绝不借用�
   assert.equal(noBorrow.asr.model, DEFAULT_OPENAI_COMPATIBLE_MODEL);
 });
 
+test('deepseek：请求头 x-mmgrep-deepseek-* 覆盖，缺头时回落到专属 env / 内置默认值', () => {
+  const fromHeaders = resolveConfigForRequest(
+    baseConfig(),
+    {
+      'x-mmgrep-asr-provider': 'deepseek',
+      'x-mmgrep-deepseek-api-key': 'header-deepseek-key',
+      'x-mmgrep-deepseek-base-url': 'https://header.deepseek.example/v1',
+      'x-mmgrep-deepseek-model': 'header-deepseek-model',
+    },
+    {},
+  );
+  assert.equal(fromHeaders.asr.provider, 'deepseek');
+  assert.equal(fromHeaders.asr.apiKey, 'header-deepseek-key');
+  assert.equal(fromHeaders.asr.apiKeySource, 'x-mmgrep-deepseek-api-key');
+  assert.equal(fromHeaders.asr.baseUrl, 'https://header.deepseek.example/v1');
+  assert.equal(fromHeaders.asr.model, 'header-deepseek-model');
+  assert.deepEqual(fromHeaders.requestOverrides.asr, {
+    provider: 'x-mmgrep-asr-provider',
+    apiKey: 'x-mmgrep-deepseek-api-key',
+    baseUrl: 'x-mmgrep-deepseek-base-url',
+    model: 'x-mmgrep-deepseek-model',
+  });
+
+  const fromEnv = resolveConfigForRequest(
+    baseConfig({
+      MMGREP_ASR_PROVIDER: 'elevenlabs',
+      MMGREP_ELEVENLABS_API_KEY: 'env-elevenlabs-key',
+      MMGREP_DEEPSEEK_API_KEY: 'env-deepseek-key',
+    }),
+    { 'x-mmgrep-asr-provider': 'deepseek' },
+    {
+      MMGREP_ASR_PROVIDER: 'elevenlabs',
+      MMGREP_ELEVENLABS_API_KEY: 'env-elevenlabs-key',
+      MMGREP_DEEPSEEK_API_KEY: 'env-deepseek-key',
+    },
+  );
+  assert.equal(fromEnv.asr.provider, 'deepseek');
+  assert.equal(fromEnv.asr.apiKey, 'env-deepseek-key', '只能拿到 deepseek 自己的 key');
+  assert.equal(fromEnv.asr.apiKeySource, 'MMGREP_DEEPSEEK_API_KEY');
+  assert.equal(fromEnv.asr.baseUrl, DEFAULT_DEEPSEEK_BASE_URL);
+  assert.equal(fromEnv.asr.model, DEFAULT_DEEPSEEK_MODEL);
+
+  // 环境里没有 deepseek 的 key：切过去后必须为空，不能借用 elevenlabs 的。
+  const noBorrow = resolveConfigForRequest(
+    baseConfig({ MMGREP_ASR_PROVIDER: 'elevenlabs', MMGREP_ELEVENLABS_API_KEY: 'elevenlabs-only-key' }),
+    { 'x-mmgrep-asr-provider': 'deepseek' },
+    { MMGREP_ASR_PROVIDER: 'elevenlabs', MMGREP_ELEVENLABS_API_KEY: 'elevenlabs-only-key' },
+  );
+  assert.equal(noBorrow.asr.provider, 'deepseek');
+  assert.equal(noBorrow.asr.apiKey, '');
+  assert.equal(noBorrow.asr.apiKeySource, null);
+  assert.equal(noBorrow.asr.baseUrl, DEFAULT_DEEPSEEK_BASE_URL);
+  assert.equal(noBorrow.asr.model, DEFAULT_DEEPSEEK_MODEL);
+});
+
 test('空头 / 纯空白头等于没带', () => {
   for (const empty of ['', '   ', '\t\n']) {
     const config = resolveConfigForRequest(
@@ -200,6 +262,7 @@ test('未知 provider → INVALID_ARGUMENT，消息列出允许值', () => {
       assert.match(error.message, /x-mmgrep-asr-provider/);
       assert.match(error.message, /elevenlabs/);
       assert.match(error.message, /openai-compatible/);
+      assert.match(error.message, /deepseek/);
       return true;
     },
   );

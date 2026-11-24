@@ -108,6 +108,73 @@ test('createRuntime：ASR provider 接上 stub 端点，transcribe 走 multipart
   }
 });
 
+test('createRuntime：deepseek 接上 stub 的 /tools/asr，Bearer 鉴权、只发 file 字段', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-runtime-ds-'));
+  const audioPath = path.join(dir, 'clip.wav');
+  await writeFile(audioPath, Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(64)]));
+
+  const stub = await startStub({ request_id: 'req-1', text: '你好世界', duration_ms: 1750 });
+
+  try {
+    const runtime = await createRuntime(runtimeOptions({
+      MMGREP_CACHE_DIR: path.join(dir, 'cache'),
+      MMGREP_ASR_PROVIDER: 'deepseek',
+      MMGREP_DEEPSEEK_API_KEY: SECRET,
+      // stub 的 baseUrl 带 /v1，provider 会再拼 /tools/asr
+      MMGREP_DEEPSEEK_BASE_URL: stub.baseUrl,
+    }));
+
+    assert.deepEqual(runtime.providerErrors, {});
+    assert.ok(runtime.asrProvider, 'deepseek ASR provider should be wired into the runtime');
+    const described = runtime.asrProvider.describe();
+    assert.equal(described.id, 'deepseek');
+    assert.equal(described.baseUrl, stub.baseUrl);
+    assert.equal(described.model, null, 'DeepSeek 没有模型选择参数：默认模型是对外的 null');
+    assert.equal(JSON.stringify(described).includes(SECRET), false, 'describe() must not leak the key');
+
+    const result = await runtime.asrProvider.transcribe({ audioPath });
+    assert.equal(result.provider, 'deepseek');
+    // DeepSeek 不分段：只有单段全文，endMs 取 duration_ms。
+    assert.deepEqual(result.segments, [{ startMs: 0, endMs: 1750, text: '你好世界' }]);
+
+    assert.equal(stub.requests.length, 1);
+    const [request] = stub.requests;
+    assert.equal(request.method, 'POST');
+    assert.equal(request.url, '/v1/tools/asr');
+    assert.equal(request.headers.authorization, `Bearer ${SECRET}`);
+    assert.match(request.headers['content-type'], /^multipart\/form-data; boundary=/);
+    assert.match(request.body, /name="file"/);
+    assert.doesNotMatch(request.body, /name="model"/, 'DeepSeek 不接受 model 字段');
+    assert.doesNotMatch(request.body, /name="language"/, 'DeepSeek 不接受 language 字段');
+  } finally {
+    await stub.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('createRuntime：deepseek 配了但缺 key → provider 仍在，转写时报缺 MMGREP_DEEPSEEK_API_KEY', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-runtime-ds-nokey-'));
+  try {
+    const runtime = await createRuntime(runtimeOptions({
+      MMGREP_CACHE_DIR: path.join(dir, 'cache'),
+      MMGREP_ASR_PROVIDER: 'deepseek',
+      MMGREP_OPENAI_COMPATIBLE_API_KEY: 'other-provider-key-must-not-be-borrowed',
+    }));
+    assert.ok(runtime.asrProvider, '缺 key 也要有 provider 对象（三态降级的第二态）');
+    assert.equal(runtime.asrProvider.describe().baseUrl, 'https://api.deepseek.com/v1');
+    await assert.rejects(
+      () => runtime.asrProvider.transcribe({ audioPath: path.join(dir, 'missing.mp3') }),
+      (error) => {
+        assert.match(error.message, /MMGREP_DEEPSEEK_API_KEY/);
+        assert.equal(error.message.includes('other-provider-key-must-not-be-borrowed'), false, '报错不能带别的 provider 的 key');
+        return true;
+      },
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('createRuntime：provider=none → null；provider 拼错 → 不崩，warning 后回落到 none', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'mmgrep-runtime-'));
   try {

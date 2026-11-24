@@ -5,6 +5,8 @@ import { test } from 'node:test';
 import {
   DEFAULT_ASR_MODEL,
   DEFAULT_CACHE_MAX_BYTES,
+  DEFAULT_DEEPSEEK_BASE_URL,
+  DEFAULT_DEEPSEEK_MODEL,
   DEFAULT_MAX_IMAGE_TOKENS,
   DEFAULT_MAX_TEXT_INLINE_CHARS,
   createLogger,
@@ -158,6 +160,51 @@ test('loadConfig：旧 MMGREP_ASR_MODEL 配 openai-compatible 时额外警告可
   assert.match(warnings, /may not be valid for "openai-compatible"/);
   assert.match(warnings, /MMGREP_OPENAI_COMPATIBLE_MODEL/);
   assert.equal(warnings.includes('scribe_v1'), false, 'warning 不该重复输出配置值');
+});
+
+test('loadConfig：deepseek 只读 MMGREP_DEEPSEEK_*，默认 baseUrl / 空模型，不借用其他 provider', () => {
+  const onlyKey = loadConfig({
+    MMGREP_ASR_PROVIDER: 'DeepSeek',
+    MMGREP_DEEPSEEK_API_KEY: 'deepseek-key-value',
+    // 另外两家也配了：deepseek 不能捡它们的值。
+    MMGREP_ELEVENLABS_API_KEY: 'eleven-key-value',
+    MMGREP_ELEVENLABS_BASE_URL: 'https://eleven.example/v1',
+    MMGREP_ELEVENLABS_MODEL: 'scribe_v9',
+    MMGREP_OPENAI_COMPATIBLE_API_KEY: 'openai-key-value',
+    MMGREP_OPENAI_COMPATIBLE_BASE_URL: 'https://openai.example/v1',
+    MMGREP_OPENAI_COMPATIBLE_MODEL: 'whisper-large-v3',
+  });
+
+  assert.equal(onlyKey.asr.provider, 'deepseek');
+  assert.equal(onlyKey.asr.apiKey, 'deepseek-key-value');
+  assert.equal(onlyKey.asr.apiKeySource, 'MMGREP_DEEPSEEK_API_KEY');
+  assert.equal(onlyKey.asr.baseUrl, DEFAULT_DEEPSEEK_BASE_URL);
+  assert.equal(onlyKey.asr.baseUrl, 'https://api.deepseek.com/v1');
+  assert.equal(onlyKey.asr.model, DEFAULT_DEEPSEEK_MODEL);
+  assert.equal(onlyKey.asr.model, '', 'DeepSeek 没有模型选择参数，默认必须是空串');
+  assert.notEqual(onlyKey.asr.model, 'scribe_v9');
+  assert.notEqual(onlyKey.asr.baseUrl, 'https://openai.example/v1');
+  assert.deepEqual(onlyKey.warnings, []);
+
+  const custom = loadConfig({
+    MMGREP_ASR_PROVIDER: 'deepseek',
+    MMGREP_DEEPSEEK_API_KEY: 'deepseek-key-value',
+    MMGREP_DEEPSEEK_BASE_URL: 'https://deepseek.example/v1',
+    MMGREP_DEEPSEEK_MODEL: 'asr-custom',
+  });
+  assert.equal(custom.asr.baseUrl, 'https://deepseek.example/v1');
+  assert.equal(custom.asr.model, 'asr-custom');
+  assert.equal(custom.asr.apiKeySource, 'MMGREP_DEEPSEEK_API_KEY');
+  assert.deepEqual(custom.warnings, []);
+
+  // deepseek 也支持旧 MMGREP_ASR_* 兜底，并给出指向专属变量的弃用 warning。
+  const legacy = loadConfig({
+    MMGREP_ASR_PROVIDER: 'deepseek',
+    MMGREP_ASR_API_KEY: 'legacy-asr-key',
+  });
+  assert.equal(legacy.asr.apiKey, 'legacy-asr-key');
+  assert.equal(legacy.asr.apiKeySource, 'MMGREP_ASR_API_KEY');
+  assert.match(legacy.warnings.join('\n'), /MMGREP_ASR_API_KEY is deprecated.*MMGREP_DEEPSEEK_API_KEY/);
 });
 
 test('loadConfig：未知 provider 记 warning 并回落到各角色默认值（不崩）', () => {
