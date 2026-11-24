@@ -26,7 +26,7 @@ if (asr) {
 
 ```js
 {
-  id: 'elevenlabs' | 'openai-compatible' | 'none',
+  id: 'elevenlabs' | 'openai-compatible' | 'deepseek' | 'none',
   transcribe({ audioPath, language?, mimeType?, signal? }) =>
     Promise<{
       provider: string,          // = id
@@ -50,16 +50,19 @@ if (asr) {
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `MMGREP_ASR_PROVIDER` | `none` | `elevenlabs` / `openai-compatible` / `none` |
+| `MMGREP_ASR_PROVIDER` | `none` | `elevenlabs` / `openai-compatible` / `deepseek` / `none` |
 | `MMGREP_ELEVENLABS_API_KEY` | — | ElevenLabs 的 key。`none` 时不需要 |
 | `MMGREP_ELEVENLABS_BASE_URL` | `https://api.elevenlabs.io/v1` | ElevenLabs 接口地址 |
 | `MMGREP_ELEVENLABS_MODEL` | `scribe_v1` | ElevenLabs 模型名 |
 | `MMGREP_OPENAI_COMPATIBLE_API_KEY` | — | OpenAI 兼容服务的 key |
 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容服务接口地址；自建服务填自己的地址 |
 | `MMGREP_OPENAI_COMPATIBLE_MODEL` | `whisper-1` | OpenAI 兼容服务模型名 |
+| `MMGREP_DEEPSEEK_API_KEY` | — | DeepSeek 的 key（`MMGREP_ASR_PROVIDER=deepseek` 时**必填**） |
+| `MMGREP_DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | DeepSeek 接口地址；实际端点 `POST {baseUrl}/tools/asr` |
+| `MMGREP_DEEPSEEK_MODEL` | 空 | DeepSeek 模型名。默认留空：`/tools/asr` **不接受 model 字段**，填了只用于回填 `model` / `describe()`，不会发给服务 |
 | `MMGREP_ASR_LANGUAGE` | — | 语言代码，如 `zh` / `en`。不填就交给服务自己判断 |
 | `MMGREP_ASR_TIMEOUT_MS` | `120000` | 单次请求超时 |
-| `MMGREP_ASR_MAX_BYTES` | `104857600`（100MB） | 单次请求的音频体积上限 |
+| `MMGREP_ASR_MAX_BYTES` | `104857600`（100MB）；`deepseek` 为 `8388608`（8 MiB） | 单次请求的音频体积上限。默认值**按 provider 分组**：DeepSeek 单请求只收 8 MiB，不能被别的 provider 撑大 |
 | `MMGREP_ASR_DIARIZE` | `false` | 仅 ElevenLabs：请求说话人分离 |
 | `MMGREP_ASR_RESPONSE_FORMAT` | `verbose_json` | 仅 OpenAI 兼容 |
 | `MMGREP_ASR_TIMESTAMP_GRANULARITIES` | 模型名含 `whisper` 时为 `segment` | 仅 OpenAI 兼容，逗号分隔 |
@@ -77,7 +80,7 @@ provider 专属变量未设置时兜底（0.2.0 删除）。
 | 情况 | 返回 | server 应该怎么办 |
 |---|---|---|
 | 没设 `MMGREP_ASR_PROVIDER`，或设成 `none` | `null` | **不报错**，只返回画面内容 |
-| provider 选了，但没给当前 provider 的专属 key（`MMGREP_ELEVENLABS_API_KEY` / `MMGREP_OPENAI_COMPATIBLE_API_KEY`） | 一个 provider（构造**不抛错**） | 真正要转写时，`transcribe()` 会抛一条说清「缺哪个环境变量」的错误；server 应当把这条错误原样告诉用户，而不是让整个请求崩掉 |
+| provider 选了，但没给当前 provider 的专属 key（`MMGREP_ELEVENLABS_API_KEY` / `MMGREP_OPENAI_COMPATIBLE_API_KEY` / `MMGREP_DEEPSEEK_API_KEY`） | 一个 provider（构造**不抛错**） | 真正要转写时，`transcribe()` 会抛一条说清「缺哪个环境变量」的错误；server 应当把这条错误原样告诉用户，而不是让整个请求崩掉 |
 | `MMGREP_ASR_PROVIDER` 是个不认识的值 | **抛错** | 拼写错误要在启动时吵醒用户。server 构造 provider 时建议 `try/catch` 包一下，退化成「只有画面」 |
 
 想显式拿到那个「明确不启用 ASR」的 provider（`id: 'none'`），用：
@@ -98,8 +101,11 @@ await none.transcribe({ audioPath });   // 抛错："only visual content is avai
   然后按 `startMs` 合并排序；
 - 跨片重复的词要去重（同一句可能在上一片尾和这一片头各出现一次）。
 
-单次请求的体积上限是 `MMGREP_ASR_MAX_BYTES`（默认 100MB）；超了 `transcribe()` 会直接抛错，
-并在错误里告诉你去切 ≤45 秒的片段。
+单次请求的体积上限是 `MMGREP_ASR_MAX_BYTES`；超了 `transcribe()` 会直接抛错，
+并在错误里告诉你去切 ≤45 秒的片段。默认值**按 provider 分组**：ElevenLabs /
+`openai-compatible` 是 100MB，`deepseek` 是 **8 MiB**（这是它服务端单请求的硬上限，
+服务端会直接拒绝更大的上传，调大 `MMGREP_ASR_MAX_BYTES` 也没用——该切的是音频）。
+`deepseek` 下这个 8 MiB 不是「建议值」：按 45 秒一片切，绝大多数 16-bit PCM WAV 都能落在里面。
 
 ## 新增一个 provider
 
@@ -128,7 +134,9 @@ await none.transcribe({ audioPath });   // 抛错："only visual content is avai
 
 2. 在 `src/providers/asr/index.js` 里：
    - 把 id 加进 `ASR_PROVIDERS`；
-   - 在 `createAsrProvider()` 里加分支，配上默认 baseUrl / model；
+   - 在 `PROVIDER_ENV` 里登记该 provider 专属的三个变量名（`apiKey` / `baseUrl` / `model`）；
+   - 在 `createAsrProvider()` 里加分支，配上默认 baseUrl / model
+     （服务有自己的单请求体积上限时，连 `defaultMaxBytes` 一起配上——见 `deepseek`：8 MiB）；
    - 缺 key 的分支是通用的，不用改。
 
 3. 在 `test/asr/` 加一个 `*.test.js`：用 `node:http` 起本地 stub server，
@@ -158,6 +166,15 @@ node --test                            # 全仓库（= npm test）
   - 端点 `POST {baseUrl}/audio/transcriptions`，认证头 `Authorization: Bearer <key>`；
   - multipart 字段 `file` / `model` / `response_format` / `language` / `timestamp_granularities[]`；
   - `verbose_json` 响应含 `segments: [{ start, end, text }]`，`start` / `end` 单位**秒**。
+- DeepSeek ASR（`/v1/tools/asr`）：
+  <https://api-docs.deepseek.com/>
+  - 端点 `POST {baseUrl}/tools/asr`（`baseUrl` 默认 `https://api.deepseek.com/v1`），
+    认证头 `Authorization: Bearer <key>`；
+  - multipart **只有 `file` 一个字段**：`/tools/asr` 不接受 `model`，也不接受 `language`（语言自动判定）；
+  - 只收 **16-bit PCM WAV**（采样率 8000 / 16000 / 22050 / 24000 / 32000 / 44100 / 48000 Hz，
+    单声道或双声道）或 **Ogg Opus**，单请求上限 **8 MiB**、单段时长上限 **120 秒**；
+  - 响应 `{ request_id, text, duration_ms }`：`duration_ms` 是整段音频的毫秒时长，
+    **没有分段 / 逐词时间戳**。
 
 ## 实现说明
 
@@ -168,3 +185,14 @@ node --test                            # 全仓库（= npm test）
   两边都会优先用服务自己给的 `segments[]`。
 - `words[]` 里的 `type` 有 `word` / `spacing` / `audio_event` 三种；空文本的条目（spacing）会被丢掉，
   `audio_event`（比如音乐提示）当作普通文本保留 —— 需要更精细的处理时在上层过滤。
+- **DeepSeek 只有整段文本**：`text` 非空时退化成**一个 segment**（`startMs: 0`，
+  `endMs: duration_ms`；响应里没有合法 `duration_ms` 时 `endMs: null`）。`text` 为空 / 纯空白 → `segments: []`。
+  想要逐句时间轴就只能换 provider，或者在上层按别的信号再切——**不要**假装有逐句时间码。
+- DeepSeek 的 `model` 默认是 `null`（`MMGREP_DEEPSEEK_MODEL` 留空即默认）：服务端没有模型选择参数，
+  填了也只回填到 `model` / `describe()`，**不会**发进请求体；`describe()` 里绝不编一个服务没接受过的模型名。
+- DeepSeek 的 `language` 只可能来自配置：`MMGREP_ASR_LANGUAGE`
+  填了具体语言码就原样回填，`auto` / 未填 → `null`。服务自己判定的语言**不会**回填
+  （响应里没有这个字段，不能凭空造一个）。
+- **上传格式**：服务端（上层）在切片前会先把音频规范化成 **16 kHz 单声道 16-bit PCM WAV**
+  （`src/media/ffmpeg.js` 的 `normalizeToWav`），正好是 DeepSeek 接受的格式之一，
+  所以默认链路不用额外转码；把 mp3 / m4a 之类直接喂给这个适配器才会被服务端拒绝。

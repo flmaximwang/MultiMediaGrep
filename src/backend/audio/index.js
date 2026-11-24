@@ -50,7 +50,7 @@ async function shapeProbe({ info, audioHealth, input, ctx, stats, durationSec, s
     asrReason = 'transcript is "subtitle": only subtitle sources are read and ASR is never called.';
   } else if (!asrProvider) {
     asrReason = 'No ASR provider is configured (set MMGREP_ASR_PROVIDER and the matching provider key: '
-      + 'MMGREP_ELEVENLABS_API_KEY or MMGREP_OPENAI_COMPATIBLE_API_KEY).';
+      + 'MMGREP_ELEVENLABS_API_KEY, MMGREP_OPENAI_COMPATIBLE_API_KEY or MMGREP_DEEPSEEK_API_KEY).';
   } else if (!audioHealth.effective) {
     asrReason = audioHealth.note;
   }

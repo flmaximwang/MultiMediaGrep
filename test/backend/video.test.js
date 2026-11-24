@@ -260,6 +260,10 @@ test('probe：契约 §4.3 字段、音频体检、字幕与 ASR 能力', { skip
     assert.equal(probe.audioTracks.length, 1);
     assert.equal(probe.capabilities.asr.available, false);
     assert.equal(probe.capabilities.asr.provider, null);
+    // 没配 ASR 时要把三家 provider 的 key 变量都点名（含 DeepSeek）
+    assert.match(probe.capabilities.asr.reason, /MMGREP_ELEVENLABS_API_KEY/);
+    assert.match(probe.capabilities.asr.reason, /MMGREP_OPENAI_COMPATIBLE_API_KEY/);
+    assert.match(probe.capabilities.asr.reason, /MMGREP_DEEPSEEK_API_KEY/);
     assert.equal(probe.capabilities.ocr.available, false);
     assert.equal(probe.capabilities.transcriptSource, 'none');
     assert.equal(probe.capabilities.transcriptOrigin, 'none');

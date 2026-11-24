@@ -245,7 +245,7 @@ export async function shapeProbe({ media, audioHealth, input, ctx }) {
     asrReason = 'This file has no audio track.';
   } else if (!provider) {
     asrReason = 'No ASR provider is configured (set MMGREP_ASR_PROVIDER and the matching provider key: '
-      + 'MMGREP_ELEVENLABS_API_KEY or MMGREP_OPENAI_COMPATIBLE_API_KEY).';
+      + 'MMGREP_ELEVENLABS_API_KEY, MMGREP_OPENAI_COMPATIBLE_API_KEY or MMGREP_DEEPSEEK_API_KEY).';
   } else if (!audioHealth.effective) {
     asrReason = audioHealth.note;
   }
