@@ -12,3 +12,11 @@ node_modules/
 npm-debug.log*
 *.tgz
 .DS_Store
+
+# AI agent configs & instructions
+.agents/
+.claude/
+.codex/
+.cursor/
+AGENTS.md
+CLAUDE.md
