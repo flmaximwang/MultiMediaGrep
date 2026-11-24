@@ -1,491 +1,77 @@
 # MultiMediaGrep
 
-**给 agent 的本地媒体感知工具（MCP server）。**
+MultiMediaGrep 是一个面向多模态 agent 的本地媒体感知 MCP server。它读取本地的视频、音频和文档，将其转化为模型可直接消费的图像（分镜宫格、单帧特写、页面缩略图）以及按时间码或页码对齐的文本索引。服务端本身不调用 LLM，理解与推理完全交由宿主 agent 完成。
 
-把**本地已有**的视频 / 录音 / 文档，变成 agent 能直接消化的材料：可直接看的图（分镜宫格、特写裁切）
-＋ 按时间/页码对齐的文本清单。server 自己不调 LLM——理解由 agent 的多模态模型完成。
+在设计上，它只处理本地绝对路径，不负责网络下载或内容检索；语音转写（ASR）与扫描件识别（OCR）通过外部服务配置接入，未配置时只返回可见画面并如实说明文本缺失。除自身的缓存目录外，只有调用写工具时才会在源文件旁生成 `.mmgrep.*` sidecar / VTT 文件或原地更新 PDF 的目录与批注。
 
----
+相关文档：[安装与运维指南](docs/install.md) · [MCP 工具契约](docs/mcp-contract.md) · [版本变更记录](CHANGELOG.md)
 
-## 这是什么 / 不是什么
+## 工具集
 
-| 是 | 不是 |
+MultiMediaGrep 提供六个跨媒体复用的工具：
+
+| 工具 | 用途 |
 |---|---|
-| 一个 **MCP server**（默认 stdio，可选 Streamable HTTP），只吃**本地绝对路径** | 不下载、不检索、不登录、不替你取数（取数属于 IntelligenceAtlas） |
-| 只做「材料化」：出图 + 出带时间码/页码的文本清单 | 不调 LLM：不做总结、不做问答、不做转述 |
-| ASR 与文档解析/OCR 走**你自己配**的外部服务与 key | 不内置本地 ASR / OCR 模型（mlx-whisper、rapidocr 都不再维护） |
-| 缓存只写自己的缓存目录；写工具只在源文件旁写 `*.mmgrep.*` sidecar / VTT（外加 PDF 原地改写） | 不写别的状态：没有服务器数据库、没有版本历史；唯一例外是写工具的 `*.mmgrep.*` 与 PDF 原地改写（见「会写你的文件」） |
+| `media_probe` | 读取媒体元信息（时长、分辨率、页数、编码、轨道、文字层状态、ASR/OCR 可用性及目录批注数量），不消耗图片 token。 |
+| `media_overview` | 生成视频分镜宫格、音频时间轴转写或文档页图与文本预览；完整文本会落盘至 `content.md` 供按需读取。 |
+| `media_zoom` | 提取指定时间点或区间的视频单帧，或渲染文档单页（支持局部裁切），用于辨认画面细节与文字。 |
+| `media_locate` | 按关键词检索字幕、文档文本、转写或批注内容，返回匹配的时间戳、页码及上下文片段（纯文本，无图片）。 |
+| `media_bookmark` | 写入或更新目录与章节信息；维护 `<file>.mmgrep.bookmark.json`，并同步嵌入 PDF outline 或生成 `.mmgrep.bookmark.vtt`。 |
+| `media_annotate` | 写入或更新批注；维护 `<file>.mmgrep.annotation.json`，并同步写入 PDF 批注或生成 `.mmgrep.annotation.vtt`。 |
 
-失败也是明说的：没配 ASR 就只给画面，扫描件没配 OCR 就只给页图，并在结果里写清楚原因——
-**宁可说「没有文字」，也不编一段台词。**
+> 调用 `media_bookmark` 或 `media_annotate` 会直接修改目标 PDF（不保留原件副本）并在源文件旁创建 sidecar 文件，修改重要文件前建议先做版本控制或备份。详细行为见 [MCP 工具契约](docs/mcp-contract.md) §15 与 §16。
 
-## 工具（6 个，按动作命名，跨媒体复用）
+## 部署与接入
 
-| 工具 | 干什么 |
-|---|---|
-| `media_probe` | 探媒体：时长/分辨率/页数/编码、可用轨道、文字层可靠不可靠、能否做 ASR/OCR、一份目录（sidecar / PDF 书签 / 章节）与批注条数。不花图片 token |
-| `media_overview` | 总览：视频出分镜宫格图，录音出带时间轴转写，文档出页面图 + 每页文本；**额外返回全文落盘路径**。内联文字是预览（whole / skim / sampled 三档，另有 outline 目录视图），`view` 可控目录，`ocr: "force"` 可对坏文字层重新识别；`images: 0` + `transcript: "subtitle"` 可只读字幕；批注挂在页 / 时间段旁 |
-| `media_zoom` | 特写：取指定时间点/区间的单帧或文档某页，可裁切放大，用于读字（约 1900 token/张，最贵） |
-| `media_locate` | 定位：给一句文本/关键词，返回它在视频/录音里的时间戳；文档返回页码 + 命中次数 + 命中附近的片段（不倾倒整页）；也会搜批注 note |
-| `media_bookmark` | **写**书签 / 目录 / 章节：PDF 原地改写 outline；视频、录音写 `<file>.mmgrep.bookmark.vtt`；所有类型写 `<file>.mmgrep.bookmark.json` sidecar（唯一真相源）。一次可 add / remove / update，全有或全无 |
-| `media_annotate` | **写**批注 / 注释 / 评论：PDF 原地写真正的批注对象（可新建 `text` / `square`，其它注释类批注导入后可改可删）；视频、录音写 `<file>.mmgrep.annotation.vtt`；所有类型写 `<file>.mmgrep.annotation.json` sidecar。author 默认取 MCP client 名 |
+最省事的方式是直接使用 **Magpie** 部署并接入，无需手动维护宿主配置与环境变量。
 
-前四个只读；后两个会**真的改文件**，调用前先看下一节。
-用法指引（先 probe → 再 overview → 只 zoom 重要部分 → 长素材先收窄范围；写之前先定位）写在工具描述与 server instructions 里。
-
-## 会写你的文件（0.3.0 起）
-
-`media_bookmark` / `media_annotate` 是对「不写用户文件」的明确例外：只写 `*.mmgrep.*` sidecar / VTT，外加 PDF 文件本身的原地修改——
-
-- **PDF 原地修改**：outline / 批注对象直接写进源 PDF，不生成副本（页面正文不重写）。
-- **视频、录音文件从不修改**：只写同名 `.mmgrep.bookmark.vtt` / `.mmgrep.annotation.vtt`。
-- **源文件旁会多出 sidecar**：`<file>.mmgrep.bookmark.json` / `<file>.mmgrep.annotation.json`。
-  它们是唯一真相源；sidecar 一旦存在，文件自带的目录 / 批注在下次写入时会被 sidecar 覆盖。
-- **先保护原件**：动文件前先 `git commit`（或另做备份）。写入失败时源文件保持原样：
-  临时文件 → 校验 → rename，任何一项检查失败都不会留下半成品。
-
-## 0.3.0 有什么新东西（API 无破坏性变更）
-
-- **新增两个写工具**：`media_bookmark`（目录 / 章节 / 书签）与 `media_annotate`（批注 / 注释 / 评论）。
-  四个原有工具的参数与调用方式不变；没有新增环境变量，也没有服务器状态。唯一需要跟着改的是目录**文本
-  格式**：0.2.0 的 `- 标题 — page N` 统一成 `b1  p.1  标题` / `b1  00:12:34  标题`（见下）。
-- **sidecar 是唯一真相源**：每次写入在源文件旁写 `<file>.mmgrep.bookmark.json` /
-  `<file>.mmgrep.annotation.json`；条目带稳定 id（`b1…` / `n1…`），首次写入自动导入文件自带的目录 / 批注。
-- **同时嵌入文件本身**：PDF 原地改写 outline / 写入真正的批注对象（不出副本，正文不动）；
-  视频、录音文件从不修改，只写同名 `.mmgrep.bookmark.vtt` / `.mmgrep.annotation.vtt`；图片只有 sidecar。
-- **读侧统一**：`media_probe` / `media_overview` / `media_locate` 只展示一份目录，来源优先级为
-  sidecar → 文件自带（PDF 书签 / 章节）→ heading 生成（仅 overview）；行格式统一为
-  `b3  p.12  标题` / `b3  00:12:34  标题`，有 sidecar 时目录末行是 `full detail: <sidecar 路径>`。
-  probe 报批注条数，overview 把批注挂在页 / 时间段旁，locate 也会搜批注 note。
-- **外部依赖**：写 PDF（outline / 批注）与读 PDF 批注需要 `mutool`（mupdf-tools）；读 PDF 书签仍用 `qpdf`（可选）。
-- 完整的写入语义、检查项与升级说明见 [`docs/RELEASE-NOTES-v0.3.0.md`](docs/RELEASE-NOTES-v0.3.0.md)。
-
-## 0.2.0 有什么新东西（有破坏性变更）
-
-- **文档 provider 拆成两个角色**：`MMGREP_OCR_PROVIDER`（只处理无文字层页，默认 `none`）与
-  `MMGREP_TYPESET_PROVIDER`（只处理有文字层页、恢复结构不重识别字符，默认 `builtin`）。
-  `MMGREP_DOC_PROVIDER` / `MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` / `MMGREP_DOC_MODEL`
-  **已删除**，启动时会 warn 并指出替代变量。
-- **来源新增 `text`（原生文字层 / 纯文本，字符精确、可原样引用）与 `mixed`（逐页来源不一致）**；
-  文档逐页按 `textOrigin` 映射来源，`segments[]` / `matches[]` 里能看到 `textOrigin`。
-- **内置目录**：`media_probe` 展示 PDF 书签（物理页 + 打印标签）与视频/录音章节；
-  `media_overview` 的 `view` 参数支持 `auto` / `outline` / `text`（视频没有章节时不生成目录）。
-- **内联预览分层**：文本三档 whole → skim（文档：全部 heading + 段首句）→ sampled（等距抽样 + 写明未覆盖页），另有 outline 目录视图；
-  全文路径固定出现在 text content 末尾，读全文去读 `content.md`。
-- **坏文字层可强制重识别**：probe 报 `text layer: looks unreliable (...)` 时用 `ocr: "force"`；
-  provider 结果按页缓存，force 单独成键、不覆盖 auto。
-- **文档定位不再倾倒整页**：返回页码 + 命中次数 + 命中附近的片段（`hits` / `snippet` / `fuzzy`），
-  视频 / 录音仍是 `score`。
-- **HTTP 客户端可覆盖内联上限**：请求头 `x-mmgrep-max-text-inline-chars`（硬上限 `200000`）。
-
-完整的破坏性变更与迁移方法见 [`docs/RELEASE-NOTES-v0.2.0.md`](docs/RELEASE-NOTES-v0.2.0.md)。
-
----
-
-## 环境要求
-
-| 依赖 | 必需性 | 缺了会怎样 |
-|---|---|---|
-| **Node.js ≥ 20**（ESM，零构建步骤） | 必需 | 起不来 |
-| **ffmpeg + ffprobe**（同一个发行版里通常一起装） | 视频 / 录音 / 文档**都需要** | 返回 `TOOL_NOT_FOUND: ffprobe is required but was not found on PATH…`；视频/录音连 `media_probe` 都跑不了，文档的 `media_probe` 还能用但出不了页图 |
-| **poppler**（`pdftoppm` / `pdftotext` / `pdfinfo`）**或** `mutool`（mupdf-tools）**或** `gs`（ghostscript） | 只有读 **PDF** 时需要 | PDF 相关调用返回 `TOOL_NOT_FOUND`，提示装 `poppler-utils` / `mupdf-tools` / `ghostscript`；纯视频 / 录音不受影响 |
-| **mupdf-tools**（`mutool`，mupdf ≥ 1.28） | 写 **PDF** 的目录 / 批注时需要；读 PDF 自带的批注也用它 | 写 PDF 时返回 `TOOL_NOT_FOUND: ... mutool ...`，提示 `brew install mupdf-tools` / `apt-get install mupdf-tools`；读批注缺它不报错，只在 probe 的批注行说明读不到；只读书签、只看页图不受影响 |
-
-安装示例：
+如需手动安装或自托管，请先确保系统已安装 Node.js >= 20 与 `ffmpeg` / `ffprobe`。处理 PDF 时，读取需要 `poppler`、`mutool` 或 `gs` 之一，写入目录/批注及读取自带批注需要 `mutool`，读取 PDF 书签则建议安装 `qpdf`。
 
 ```bash
-# macOS
-brew install ffmpeg poppler qpdf mupdf-tools   # 文档需要 poppler；写 PDF / 读批注需要 mupdf-tools
+# 通过 npx 直接运行（默认 stdio）
+npx -y github:flmaximwang/MultiMediaGrep
 
-# Debian / Ubuntu
-sudo apt install ffmpeg poppler-utils qpdf mupdf-tools
-
-# Windows（winget）
-winget install Gyan.FFmpeg          # PDF 另装 poppler（无官方 winget 包时用 scoop install poppler）
+# 或安装 release 运行时包（不含测试与示例素材）
+npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.3.1/multimediagrep-mcp-0.3.1.tgz
 ```
 
-可选：把可执行文件放在 `PATH` 之外时，用 `MMGREP_FFMPEG_PATH` / `MMGREP_FFPROBE_PATH` 指定绝对路径。
-
-读 **PDF 书签**（probe 的目录）另需 `qpdf`；写 PDF 时它只用于写入后校验（没有 qpdf 会改用 `mutool`
-重新打开）。缺了 qpdf 只是读不到书签，正文与页图不受影响；写 PDF 的目录 / 批注与读 PDF 批注所需的
-`mutool` 见上表。
-
-**外部服务（可选）**：ASR（ElevenLabs、DeepSeek，或任何 OpenAI `/audio/transcriptions` 兼容服务）与文档解析（MinerU）
-由你用环境变量配置。文档解析拆成 OCR / typeset 两个角色：OCR 默认 `none`，typeset 默认本地 `builtin`（不联网）——
-**不配也能用**，只是扫描页拿不到文字（详见下面「环境变量」）。
-
----
-
-## 安装与运行
-
-```bash
-# 1) 免安装（发布到 npm 之后）
-npx -y multimediagrep-mcp
-```
-
-> `npx -y multimediagrep-mcp` 会拉起 server 并**阻塞等待 stdio 上的 MCP 消息**——它没有交互界面，
-> 通常由 MCP client 自动拉起。想确认它起没起得来，就手动跑一次，看 stderr 有没有启动横幅：
->
-> ```
-> [mmgrep] info: multimediagrep@0.3.0 ready on stdio
-> [mmgrep] info: cache: /Users/you/.cache/multimediagrep (max 10737418240 bytes)
-> [mmgrep] info: asr: none (no API key) · ocr: none · typeset: builtin
-> [mmgrep] info: backends: video=ready audio=ready document=ready
-> [mmgrep] info: image budget: 4000 tokens/call, maxEdge 1600px
-> ```
-
-```bash
-# 2) 从 checkout 直接跑
-git clone https://github.com/flmaximwang/MultiMediaGrep.git && cd MultiMediaGrep
-npm install
-node src/index.js
-```
-
-```bash
-# 3) 从 GitHub 装（npm 还没发布时）
-npx -y github:flmaximwang/MultiMediaGrep            # 临时拉取并启动
-npm i -g github:flmaximwang/MultiMediaGrep           # 装成本地命令 multimediagrep-mcp
-npm i -y https://github.com/flmaximwang/MultiMediaGrep/releases/download/v0.3.0/multimediagrep-mcp-0.3.0.tgz   # 只装 release 里的运行时包
-```
-
-> 从 GitHub 源码装会把整个仓库拉下来（源码与文档），首次安装比 npm 慢；
-> release 里的 `.tgz` 只含运行时（src + 署名材料）。
-
-**stdio 是默认传输方式；HTTP 是显式开启的选项。** 不传 `--http`、也不设 `MMGREP_TRANSPORT=http`
-时，server 不会监听任何端口，仍由 MCP client 用 stdio 拉起——现有配置不需要任何改动。
-HTTP 模式见下一节。
-
----
-
-## HTTP 模式
-
-不想让宿主用 stdio 拉起、或要让同一台机器上的多个进程共用一个 server 时，用 Streamable HTTP：
-
-```bash
-# 默认只监听 127.0.0.1:3927；stdio 仍是默认，必须显式 --http
-npx -y multimediagrep-mcp --http
-
-# 换个端口，并设置 Bearer 令牌（设置后每个请求都要带 Authorization）
-npx -y multimediagrep-mcp --http --port 4000 --token '<你的令牌>'
-
-# 也可以用环境变量（命令行优先于环境变量）
-MMGREP_TRANSPORT=http MMGREP_HTTP_PORT=4000 MMGREP_HTTP_TOKEN='<你的令牌>' \
-  npx -y multimediagrep-mcp
-```
-
-- 端点固定为 `POST /mcp`，默认地址 `http://127.0.0.1:3927/mcp`；`GET /mcp` → 405，
-  其它路径 → 404。配了令牌时，未授权的请求在判断方法之前就先回 401。
-- 启动横幅会写实际地址和 `auth: bearer set|unset`（只报有没有配，不打印令牌值）。
-- 请求必须同时接受 JSON 和 SSE：`Accept: application/json, text/event-stream`；
-  `Content-Type: application/json`。缺了分别回 406 / 415。
-- 令牌只从 `Authorization: Bearer <令牌>` 读，不接受 query string（`?token=` 会被忽略并回 401）。
-- HTTP 模式是**无状态**的：每个请求独立处理，不在内存里保留会话。
-
-最小宿主配置（Claude Code 的 `claude mcp add`）：
-
-```bash
-claude mcp add --scope user --transport http multimediagrep \
-  http://127.0.0.1:3927/mcp \
-  --header "Authorization: Bearer <你的令牌>"
-```
-
-通用 JSON 形状（多数宿主叫 `mcpServers`；可复制的一份见
-[`examples/mcp-config-http.json`](examples/mcp-config-http.json)）：
-
-```json
-{
-  "mcpServers": {
-    "multimediagrep": {
-      "type": "http",
-      "url": "http://127.0.0.1:3927/mcp",
-      "headers": { "Authorization": "Bearer <你的令牌>" }
-    }
-  }
-}
-```
-
-> 监听非回环地址（如 `--host 0.0.0.0`）时必须配令牌。没配时 server **仍会启动**，只在启动横幅里
-> 记一条 warning，端点对所有能连到该地址的人开放。不要在没有 TLS 的网络上裸跑；
-> 反向代理与 curl 自测见 [`docs/install.md` §2.6](docs/install.md)。
-
----
-
-## 接入宿主
-
-### Claude Code
-
-```bash
-# 用户级（所有项目可用）
-claude mcp add --scope user multimediagrep \
-  -e MMGREP_ASR_PROVIDER=elevenlabs \
-  -e MMGREP_ELEVENLABS_API_KEY=sk-你的key \
-  -- npx -y multimediagrep-mcp
-
-# 项目级（写进项目里的 .mcp.json，随仓库走）
-claude mcp add --scope project multimediagrep -- npx -y multimediagrep-mcp
-```
-
-`.mcp.json` 片段（`claude mcp add --scope project` 生成的就是这个形状）：
+在支持 MCP 的客户端中添加如下配置即可使用（完整环境变量模板见 [examples/mcp-config.json](examples/mcp-config.json)）：
 
 ```json
 {
   "mcpServers": {
     "multimediagrep": {
       "command": "npx",
-      "args": ["-y", "multimediagrep-mcp"],
-      "env": {
-        "MMGREP_ASR_PROVIDER": "elevenlabs",
-        "MMGREP_ELEVENLABS_API_KEY": "sk-替换成你的key",
-        "MMGREP_OCR_PROVIDER": "mineru",
-        "MMGREP_TYPESET_PROVIDER": "builtin",
-        "MMGREP_MINERU_API_KEY": "替换成你的token"
-      }
+      "args": ["-y", "github:flmaximwang/MultiMediaGrep"]
     }
   }
 }
 ```
 
-### Hermes
+需要多客户端共享或远程访问时，可通过 `--http` 启动 Streamable HTTP 服务（默认监听 `127.0.0.1:3927/mcp`，支持 `--port`、`--token` 以及 `x-mmgrep-*` 每请求凭据头）。如需对无字幕音视频进行转写或对扫描件 PDF 进行识别，可在环境中配置 ASR（支持 `elevenlabs`、`openai-compatible`、`deepseek`）与文档解析（OCR 支持 `mineru`，排版解析默认本地 `builtin`）。
 
-Hermes 用同名的 `hermes mcp add` 流程（stdio server）：
+完整的系统依赖安装、各宿主接入方式、HTTP 反向代理配置及全量环境变量说明，请参阅 [docs/install.md](docs/install.md)。
 
-```bash
-hermes mcp add multimediagrep \
-  --command npx \
-  --env MMGREP_ASR_PROVIDER=elevenlabs MMGREP_ELEVENLABS_API_KEY=sk-你的key \
-  --args -y multimediagrep-mcp
-```
+## 使用方式
 
-它会先连一次、列出工具让你勾选，然后写进 `~/.hermes/config.yaml` 的 `mcp_servers:`。
-加完用 `hermes mcp test multimediagrep` 验连通，用 `/reload-mcp` 让**已经开着**的会话也加载上。
+面对一个本地媒体文件（例如 `/abs/path/demo.mp4`），推荐按从轻到重的顺序渐进读取：
 
-> `--args` 之后的参数原样透传给命令，所以 `--args` 必须放在最后。
-
-### 其它 MCP client
-
-任何吃标准 MCP client 配置的宿主都用同一段 JSON（键名通常是 `mcpServers`）：
-可复制的一份见 [`examples/mcp-config.json`](examples/mcp-config.json)，
-各宿主的完整写法见 [`docs/install.md`](docs/install.md) §2。
-
-### 每请求凭据（仅 HTTP 模式）
-
-HTTP 端点常被多个调用方共用，provider 的 key 不必都写死在 server 的环境变量里：
-每个请求可以在头里临时覆盖 ASR / 文档 provider 的角色、key、基址和模型。
-
-| 请求头 | 作用 | 对应环境变量 |
-|---|---|---|
-| `x-mmgrep-asr-provider` | 本次请求用哪个 ASR provider：`elevenlabs` / `openai-compatible` / `deepseek` | `MMGREP_ASR_PROVIDER` |
-| `x-mmgrep-elevenlabs-api-key` | ElevenLabs key | `MMGREP_ELEVENLABS_API_KEY` |
-| `x-mmgrep-elevenlabs-base-url` | ElevenLabs 基址 | `MMGREP_ELEVENLABS_BASE_URL` |
-| `x-mmgrep-elevenlabs-model` | ElevenLabs 模型 | `MMGREP_ELEVENLABS_MODEL` |
-| `x-mmgrep-openai-compatible-api-key` | OpenAI 兼容服务的 key | `MMGREP_OPENAI_COMPATIBLE_API_KEY` |
-| `x-mmgrep-openai-compatible-base-url` | OpenAI 兼容服务的基址 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` |
-| `x-mmgrep-openai-compatible-model` | OpenAI 兼容服务的模型 | `MMGREP_OPENAI_COMPATIBLE_MODEL` |
-| `x-mmgrep-deepseek-api-key` | DeepSeek key | `MMGREP_DEEPSEEK_API_KEY` |
-| `x-mmgrep-deepseek-base-url` | DeepSeek 基址 | `MMGREP_DEEPSEEK_BASE_URL` |
-| `x-mmgrep-deepseek-model` | DeepSeek 模型（可空；`/tools/asr` 不接受 model 字段，只用于回填） | `MMGREP_DEEPSEEK_MODEL` |
-| `x-mmgrep-asr-api-key` | 通用兜底 key（旧共用变量语义） | `MMGREP_ASR_API_KEY` |
-| `x-mmgrep-ocr-provider` | 本次请求的 OCR 角色 provider：`mineru` / `none` | `MMGREP_OCR_PROVIDER` |
-| `x-mmgrep-typeset-provider` | 本次请求的 typeset 角色 provider：`builtin` / `mineru` / `none` | `MMGREP_TYPESET_PROVIDER` |
-| `x-mmgrep-mineru-api-key` | MinerU token（两个角色共用） | `MMGREP_MINERU_API_KEY` |
-| `x-mmgrep-mineru-base-url` | MinerU 基址（两个角色共用） | `MMGREP_MINERU_BASE_URL` |
-| `x-mmgrep-mineru-model` | MinerU 模型（两个角色共用） | `MMGREP_MINERU_MODEL` |
-| `x-mmgrep-max-text-inline-chars` | 本次请求的内联文本上限（设置头，不是凭据）：正整数，硬上限 `200000` | `MMGREP_MAX_TEXT_INLINE_CHARS` |
-
-优先级（逐字段）：该 provider 的专属请求头 > 该 provider 的环境变量 >
-服务器启动配置（仅当 provider 相同）> provider 内置默认值。ASR 仍保留通用
-`x-mmgrep-asr-api-key` 兜底；文档角色已删除通用 key 头。
-请求头切换 provider 后只读新 provider 的变量组，不会借用另一个 provider 的 key；
-头里写了未知的 provider id → HTTP 400（JSON-RPC `-32602`）。空头（空串 / 全空白）等于没带。
-
-要让某个 provider 的专属头生效，得先用 `x-mmgrep-asr-provider` /
-`x-mmgrep-ocr-provider` / `x-mmgrep-typeset-provider` 选中它（或服务器本身就选了同一个）。
-只带 provider 专属 key 头、provider 仍是 `none` 时，
-这个头不会自动启用 provider；**provider 的选择只对当前请求生效**。
-
-**安全**：这些头的值只活在本次请求里——不写日志、不进缓存、不出现在响应里。server 会把本次请求
-带过的所有凭据头值从日志里替换成 `[redacted]`。不要把真实 key 写进多人共享的客户端配置：
-更稳妥的做法是让宿主连一个你自己控制的代理，由代理注入凭据头。
-
----
-
-## 给第一次来的 agent：5 分钟上手
-
-给一个**没有上下文**、只想「看看这个工具能干什么」的 agent：
-
-1. **装起来**（宿主负责拉起它，不用自己开端口）：
-   - Claude Code：`claude mcp add --scope user multimediagrep -- npx -y github:flmaximwang/MultiMediaGrep`
-   - 其它 client：把 [`examples/mcp-config.json`](examples/mcp-config.json) 里的 `command` / `args` 换成上面那条命令即可。
-2. **确认环境**：宿主里需要 `ffmpeg` + `ffprobe` 在 PATH 上；读 PDF 还要 `poppler` / `mutool` / `gs` 任意一个；
-   写 PDF 的目录 / 批注、读 PDF 批注还要 `mutool`（mupdf-tools）。缺了会返回 `TOOL_NOT_FOUND`，不会静默出错。
-3. **先探后看**（省图片 token）：
-   - `media_probe({ path })` → 类型、时长、有没有字幕轨、能不能 ASR/OCR。**不花任何图片 token**，先做这一步。
-   - `media_overview({ path })` → 视频出分镜宫格图 + 时间对齐文本；录音出带时间轴转写；文档出页图 + 每页文字。
-   - 文档的文字层可能是坏的（早先劣质 OCR 写进去的）：probe 会给出 `text layer: looks unreliable (...)`，这时用 `media_overview({ path, pages, ocr: "force" })` / `media_locate({ path, query, ocr: "force" })` 要求重新识别（需要已配置 OCR provider）。
-   - `media_zoom({ path, at })` → 只在「画面上有字要读」时用，最贵（约 1900 token/张）。
-   - `media_locate({ path, query })` → 「那句话在哪说的」，纯文本、零图片。
-   - 想指定字幕来源时给 `media_probe` / `media_overview` / `media_locate` 传 `subtitle`：本地字幕文件绝对路径、字幕轨 index（非负整数），或语言码（如 `zh` / `en`）；显式指定不可用会直接报错，不会静默换成别的来源。
-   - 要**写**目录 / 批注时才用 `media_bookmark({ path, add: [...] })` / `media_annotate({ path, add: [...] })`：PDF 原地改，视频 / 录音只写同名 VTT，所有类型都在源文件旁写 `*.mmgrep.*` sidecar。
-4. **记住四件事**：
-   - 只吃**本地绝对路径**，它不下载任何东西；
-   - server 自己不调 LLM，理解由你的模型完成；
-   - **字幕优先于 ASR**：字幕通常比 ASR 准，但**可能是自动生成的**（专名、数字要核对画面）；ASR 是机器转写（人名、数字容易错，别当原话引用）；
-   - **写工具会改文件**：动原件前先 `git commit`（或备份）；sidecar 一旦存在就是唯一真相源。
-5. **长素材先收窄**：视频/录音用 `start`/`end`，文档用 `pages`（如 `"3-10,15"`），再跟着结果里的 `continuation` 往下走。
-
-没有 ASR key 也能用：只是拿不到文字层（文件自带字幕就照样出文本）。
-
-## 环境变量
-
-全部前缀 `MMGREP_`，用 `env | grep MMGREP_` 查看当前值。**key 只写在你自己的配置文件里，
-server 不会打印它**（日志与错误里只出现 `set` / `unset`）。
-
-| 变量 | 默认值 | 作用 |
-|---|---|---|
-| `MMGREP_TRANSPORT` | `stdio` | 传输方式：`stdio`（默认）或 `http`。`http` 时监听 `POST /mcp`；写错回落 `stdio` 并记 warning |
-| `MMGREP_HTTP_HOST` | `127.0.0.1` | HTTP 监听地址。非回环地址必须配令牌；没配时只记 warning，端点仍会接受未认证请求 |
-| `MMGREP_HTTP_PORT` | `3927` | HTTP 监听端口（1–65535；非法值回落 `3927`） |
-| `MMGREP_HTTP_TOKEN` | 空 | Bearer 令牌。设置后每个请求必须带 `Authorization: Bearer <令牌>`；不接受 query string。令牌可以是任意 UTF-8 字符串 |
-| `MMGREP_CACHE_DIR` | `~/.cache/multimediagrep` | 缓存根目录（抽帧、页图、转写、全文落盘都在这）。`~` 会展开；相对路径按 cwd 解析 |
-| `MMGREP_CACHE_MAX_BYTES` | `10737418240`（10 GiB） | 缓存上限，支持 `512MB` / `10GB` / 纯字节数；超出按 LRU 淘汰 |
-| `MMGREP_ASR_PROVIDER` | `none` | ASR 后端：`none`（不转写）/ `elevenlabs` / `openai-compatible` / `deepseek`。选定后只读该 provider 自己那组变量 |
-| `MMGREP_ELEVENLABS_API_KEY` | 空 | ElevenLabs 的 API key（`MMGREP_ASR_PROVIDER=elevenlabs` 时**必填**） |
-| `MMGREP_ELEVENLABS_BASE_URL` | `https://api.elevenlabs.io/v1` | ElevenLabs 的 API 基址 |
-| `MMGREP_ELEVENLABS_MODEL` | `scribe_v1` | ElevenLabs 转写模型名 |
-| `MMGREP_OPENAI_COMPATIBLE_API_KEY` | 空 | OpenAI 兼容服务的 API key（`MMGREP_ASR_PROVIDER=openai-compatible` 时**必填**；自建本地服务也要填非空占位值，如 `local`） |
-| `MMGREP_OPENAI_COMPATIBLE_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容服务的 API 基址；自建服务填自己的地址 |
-| `MMGREP_OPENAI_COMPATIBLE_MODEL` | `whisper-1` | OpenAI 兼容服务的转写模型名 |
-| `MMGREP_DEEPSEEK_API_KEY` | 空 | DeepSeek 的 API key（`MMGREP_ASR_PROVIDER=deepseek` 时**必填**） |
-| `MMGREP_DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | DeepSeek 的 API 基址；实际端点是 `POST {baseUrl}/tools/asr` |
-| `MMGREP_DEEPSEEK_MODEL` | 空 | DeepSeek 模型名。**默认留空是对的**：`/tools/asr` 没有 model 参数，填了只用于回填 `model`，不会发给服务 |
-| `MMGREP_ASR_LANGUAGE` | `auto` | 强制语言（BCP-47，如 `zh` / `en`）；`auto` = 让服务自己判断。DeepSeek 一律自动判定，这个值只回填不发送 |
-| `MMGREP_ASR_TIMEOUT_MS` | `120000` | ASR 单次请求超时 |
-| `MMGREP_OCR_PROVIDER` | `none` | OCR 角色：只处理没有文字层的页，以及工具参数 `ocr: "force"` 指定的页。`none` / `mineru` |
-| `MMGREP_TYPESET_PROVIDER` | `builtin` | typeset 角色：只处理有文字层的页，恢复结构、不重识别字符。`builtin` / `mineru` / `none` |
-| `MMGREP_TYPESET_SKIP_SIMPLE` | `true` | 外部 typeset provider 只收双栏 / 复杂页，简单页交给本地 builtin |
-| `MMGREP_MINERU_API_KEY` | 空 | MinerU 的 token（两个角色共用；<https://mineru.net/apiManage/token>） |
-| `MMGREP_MINERU_BASE_URL` | `https://mineru.net/api/v4` | MinerU 的 API 基址（两个角色共用） |
-| `MMGREP_MINERU_MODEL` | 空 | 解析模型名；留空 = 用服务端默认（MinerU 可选 `pipeline` / `vlm` / `MinerU-HTML`） |
-| `MMGREP_DOC_TIMEOUT_MS` | `180000` | 文档解析单次请求超时（3 分钟）。MinerU 是「上传 → 排队 → 解析 → 下载」整段墙钟时间，排队久就调大 |
-| `MMGREP_MAX_IMAGE_TOKENS` | `4000` | 单次调用的图片 token **软预算**。超了自动模式会降形，显式模式只警告 |
-| `MMGREP_MAX_IMAGE_EDGE` | `1600` | 单张图最长边的全局上限（px）。请求超过 → `BUDGET_EXCEEDED` |
-| `MMGREP_LOG_LEVEL` | `info` | 日志级别：`error` / `warn` / `info` / `debug`。日志**一律走 stderr**（stdout 是协议通道） |
-| `MMGREP_MAX_TEXT_INLINE_CHARS` | `24000` | 内联文本预览上限；HTTP 模式可被 `x-mmgrep-max-text-inline-chars` 按客户端覆盖（硬上限 `200000`），全文始终落盘、不受限制 |
-| `MMGREP_MAX_CONCURRENCY` | `2` | 单次调用的并行任务数 |
-
-传输相关的命令行开关（`--http` / `--host` / `--port` / `--token`）优先于上表的环境变量。
-
-> 旧的 `MMGREP_ASR_API_KEY` / `MMGREP_ASR_BASE_URL` / `MMGREP_ASR_MODEL` 仍会在
-> 对应的 provider 专属变量未设置时兜底，但启动时会记一条弃用 warning。
-> **0.2.0 已删除** `MMGREP_DOC_PROVIDER` / `MMGREP_DOC_API_KEY` / `MMGREP_DOC_BASE_URL` /
-> `MMGREP_DOC_MODEL`：设置这些变量不会再生效，启动时会 warn 并指出新变量名。
-> 同一进程里可以同时存在多家 provider 的 key，server 只读当前选中 provider 的那一组。
-
-另有 `MMGREP_FFMPEG_PATH` / `MMGREP_FFPROBE_PATH`（默认按 `PATH` 查找）、
-`MMGREP_AUDIO_MIN_DBFS` / `MMGREP_AUDIO_MIN_SPEECH_RATIO`（音频体检阈值）、
-`MMGREP_PROGRESS_NOTIFICATIONS`（默认 `true`）等，完整清单见
-[`docs/install.md` §3.6](docs/install.md) 与 [`docs/mcp-contract.md` §12](docs/mcp-contract.md)。
-
-> **DeepSeek 的两个「反直觉」点**：`MMGREP_DEEPSEEK_MODEL` 默认**空**是对的——`/tools/asr`
-> 不接受 model 字段，填了只用于回填 `model` / `describe()`；`MMGREP_ASR_MAX_BYTES` 在 `deepseek`
-> 下默认是 **8 MiB**（不是 100 MiB），因为服务端单请求就只收这么大，调大没用，该做的是让上层
-> 切成 ≤45 秒的片段。格式上它只收 **16-bit PCM WAV**（采样率 8000 / 16000 / 22050 / 24000 /
-> 32000 / 44100 / 48000 Hz，单/双声道，双声道只识别左声道）或 **Ogg Opus**，单段最长 **120 秒**，
-> 语言自动判定（`MMGREP_ASR_LANGUAGE` 只回填、不发送）。
-
----
-
-## 第一次跑一遍
-
-假设有一个本地视频 `/abs/path/demo.mp4`：
-
-**1. 探（不花图片 token，几毫秒返回）**
-
-```json
-{ "path": "/abs/path/demo.mp4" }
-```
-
-返回里看五件事：媒体类型、时长、有没有字幕轨、`capabilities.asr.available` / `capabilities.ocr.available`，以及文件自带的目录（PDF 书签 / 章节）。
-录音还会给一段 `audioHealth` 体检——如果结论是 `too-quiet` / `silent`，
-**转写会故意是空的**（避免 ASR 编出一整段幻觉台词），这时该做的是换一份清楚的录音，而不是继续追问。
-
-**2. 总览（主体动作）**
-
-```json
-{ "path": "/abs/path/demo.mp4", "cells": 9, "images": 2 }
-```
-
-出 2 张 3×3 的分镜宫格图 + 一份按格对齐的文本清单（每行末尾标了来源：`subtitle` / `text` / `ocr` / `asr` / `none`；整份文档来源不一致时 header 是 `mixed`）。
-**全文不内联**，而是落盘成三个主文件（另加可选的 `document.json`）并把路径返回给你：
-
-| 文件 | 内容 |
-|---|---|
-| `content.md` | 人读 Markdown，按时间区间分节 |
-| `segments.jsonl` | 一行一个 segment（JSON），机器读 |
-| `manifest.json` | 工具、窗口、转写来源、图片描述、警告、计数 |
-
-读这些文件要**自己分块总结**，不要为了拿更多内联文本反复调工具。
-
-**3. 特写（贵，只在「这里有事」时用）**
-
-```json
-{ "path": "/abs/path/demo.mp4", "at": 72.5 }
-```
-
-宫格一格只有几百像素，里面的字基本看不清；**要读画面上的字必须 zoom**，
-必要时再加 `crop`（`{x, y, width, height}`，全是 0..1 的比例，原点左上）裁出那块区域。
-
-**4. 定位（纯文本，零图片）**
-
-```json
-{ "path": "/abs/path/demo.mp4", "query": "那句话是在哪说的" }
-```
-
-返回它在视频 / 录音里的时间戳（毫秒 + 秒两种表示）；文档返回页码、命中次数与命中附近的片段——不会把整页正文倒出来。
-
-> **长素材先收窄。** 超过 30 分钟的视频、超过 30 页的文档，先用 `start`/`end`（视频、录音）或
-> `pages`（文档，如 `"3-10,15"`）取一小段，再跟着结果里的 `continuation` 提示一页页往下走。
-> 一次 overview 硬上限是 4 张图、每张 16 格、单次共 64 格、单图最长边 1600px——
-> 一张「两小时电影的大宫格」既看不清又剧透。
-
-**5. 写（可选，会修改文件）**
-
-```json
-{ "path": "/abs/path/demo.mp4", "add": [{ "title": "Opening", "start": 0, "end": 12 }] }
-```
-
-写入 sidecar `<file>.mmgrep.bookmark.json` 与 `<file>.mmgrep.bookmark.vtt`；之后 probe / overview / locate
-的目录都来自 sidecar（末行 `full detail: <sidecar 路径>`）。批注同理用 `media_annotate` 写
-`<file>.mmgrep.annotation.json` / `.annotation.vtt`。PDF 会原地改写 outline / 批注对象，视频 / 录音文件本身不动。
-
----
-
-## 依赖、许可与上游致谢
-
-- **运行时依赖**：`@modelcontextprotocol/sdk`（MIT）、`zod`（MIT）。没有构建步骤，纯 ESM。
-- **系统依赖**：ffmpeg / ffprobe（不打包、不链接，按独立子进程调用）、poppler 或 mutool 或 gs（只读 PDF 时用）；
-  mutool（mupdf-tools）还用于原地写 PDF 的 outline / 批注、以及读取 PDF 批注；qpdf 可选，用于读 PDF 书签与写入后校验。
-- **可选外部服务**：ElevenLabs / DeepSeek（ASR）、MinerU（文档解析）。都是用户自备 key，代码里不含它们的凭据
-  （DeepSeek 的 `MMGREP_DEEPSEEK_MODEL` 可以留空：`/tools/asr` 没有模型选择参数）。
-- **许可**：本项目 **Apache-2.0**（[`LICENSE`](LICENSE)）。
-- **派生源码**：`src/backend/video/` 下的 `geometry.js`、`frames.js`、`sheet.js`、`shots.js`
-  以及 `storyboard.js` 的 `mapPool` 派生自 Apache-2.0 的
-  [dsh-video-storyboard](https://github.com/SAOS-3624/dsh-video-storyboard) v0.5.9（已修改）。
-  被改动的文件顶部都有 `Modifications:` 段落（Apache-2.0 §4(b)）。
-  完整署名见 [`NOTICE`](NOTICE) 与 [`CREDITS.md`](CREDITS.md)。
-
----
+1. **探测信息**：先调用 `media_probe` 检查文件时长或页数、可用字幕轨、文字层质量以及 ASR/OCR 配置状态，避免盲目拉取图片。
+2. **获取总览**：调用 `media_overview`（如视频可指定 `cells: 9, images: 2`）获取分镜或页面缩略图与对齐的文本预览。当文本较长时，内联返回仅作预览，完整文本会写入磁盘上的 `content.md`、`segments.jsonl` 与 `manifest.json`，直接分块读取文件即可。对于超过 30 分钟的视频或 30 页的文档，建议通过 `start`/`end` 或 `pages` 分段读取。
+3. **检索与特写**：需要查找具体内容位置时使用纯文本的 `media_locate`；只有在必须看清画面细节或屏幕文字时，再对目标时间点或页码调用 `media_zoom`（可配合 `crop` 参数局部放大）。涉及语音内容时，优先采信人工字幕而非机器转写（ASR 对专有名词和数字并不可靠）。
+4. **写入标记**：定位完成后，可按需使用 `media_bookmark` 或 `media_annotate` 持久化章节与批注；一旦生成 sidecar 文件，后续读取将以 sidecar 作为唯一数据源。
 
 ## 开发
 
-纯 ESM JavaScript（Node ≥20），零构建步骤。规格与决策只在 beads（`bd`），不在本仓库写交接文档。
+本项目采用纯 ESM 编写，无构建步骤，运行时仅依赖 `@modelcontextprotocol/sdk` 与 `zod`。
 
 ```bash
 npm install
-npm run check        # 语法检查（src/、test/、scripts/、fixtures/ 全量 node --check）
-npm test             # node --test
-npm run fixtures     # 生成测试素材（ffmpeg 脚本生成，仓库不含任何第三方媒体）
+npm run check      # 全量语法检查
+npm test           # 运行测试套件（node --test）
+npm run fixtures   # 通过 ffmpeg 脚本生成本地测试素材
 ```
 
-工具契约（参数、返回结构、错误码、图片预算）见 [`docs/mcp-contract.md`](docs/mcp-contract.md)；
-安装、provider 配置、排障与验证清单见 [`docs/install.md`](docs/install.md)。
+## 许可与致谢
+
+本项目基于 Apache-2.0 协议开源（见 [LICENSE](LICENSE)）。`src/backend/video/` 目录下的 `geometry.js`、`frames.js`、`sheet.js`、`shots.js` 以及 `storyboard.js` 中的 `mapPool` 改写自 Apache-2.0 协议的 [dsh-video-storyboard](https://github.com/SAOS-3624/dsh-video-storyboard) v0.5.9，完整署名信息见 [NOTICE](NOTICE) 与 [CREDITS.md](CREDITS.md)。

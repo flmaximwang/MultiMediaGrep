@@ -280,7 +280,7 @@ curl -sS -X POST http://127.0.0.1:3927/mcp \
 
 检查顺序是：先看路径（不是 `/mcp` → 404），再验令牌（配了令牌时 → 401），最后看方法（→ 405）。
 
-每请求凭据头（`x-mmgrep-*`）见 README 的「每请求凭据」与契约 §12.7。
+每请求凭据头（`x-mmgrep-*`）见 [§2.7](#27-每请求凭据与设置头仅-http) 与契约 §12.7。
 
 **按客户端覆盖内联上限。** 同一个 HTTP 端点可能被输出上限不同的宿主共用：客户端可以在
 MCP 配置里加请求头 `x-mmgrep-max-text-inline-chars`，只对带了该头的请求生效。优先级是
@@ -288,6 +288,46 @@ MCP 配置里加请求头 `x-mmgrep-max-text-inline-chars`，只对带了该头�
 `200000` 时按 `200000` 截断并记 warning，非法值记 warning 后回落到环境变量 / 默认值（请求
 不会失败），空头等于没带。stdio 没有请求头，仍然只读环境变量；也**没有**按调用的工具参数，
 agent 不能自己调大。完整语义见契约 §12.5。
+
+### 2.7 每请求凭据与设置头（仅 HTTP）
+
+HTTP 端点常被多个调用方共用，provider 的 key 不必都写死在 server 的环境变量里：
+每个请求可以在头里临时覆盖 ASR / 文档 provider 的角色、key、基址和模型。
+
+| 请求头 | 作用 | 对应环境变量 |
+|---|---|---|
+| `x-mmgrep-asr-provider` | 本次请求用哪个 ASR provider：`elevenlabs` / `openai-compatible` / `deepseek` | `MMGREP_ASR_PROVIDER` |
+| `x-mmgrep-elevenlabs-api-key` | ElevenLabs key | `MMGREP_ELEVENLABS_API_KEY` |
+| `x-mmgrep-elevenlabs-base-url` | ElevenLabs 基址 | `MMGREP_ELEVENLABS_BASE_URL` |
+| `x-mmgrep-elevenlabs-model` | ElevenLabs 模型 | `MMGREP_ELEVENLABS_MODEL` |
+| `x-mmgrep-openai-compatible-api-key` | OpenAI 兼容服务的 key | `MMGREP_OPENAI_COMPATIBLE_API_KEY` |
+| `x-mmgrep-openai-compatible-base-url` | OpenAI 兼容服务的基址 | `MMGREP_OPENAI_COMPATIBLE_BASE_URL` |
+| `x-mmgrep-openai-compatible-model` | OpenAI 兼容服务的模型 | `MMGREP_OPENAI_COMPATIBLE_MODEL` |
+| `x-mmgrep-deepseek-api-key` | DeepSeek key | `MMGREP_DEEPSEEK_API_KEY` |
+| `x-mmgrep-deepseek-base-url` | DeepSeek 基址 | `MMGREP_DEEPSEEK_BASE_URL` |
+| `x-mmgrep-deepseek-model` | DeepSeek 模型（可空；`/tools/asr` 不接受 model 字段，只用于回填） | `MMGREP_DEEPSEEK_MODEL` |
+| `x-mmgrep-asr-api-key` | 通用兜底 key（旧共用变量语义） | `MMGREP_ASR_API_KEY` |
+| `x-mmgrep-ocr-provider` | 本次请求的 OCR 角色 provider：`mineru` / `none` | `MMGREP_OCR_PROVIDER` |
+| `x-mmgrep-typeset-provider` | 本次请求的 typeset 角色 provider：`builtin` / `mineru` / `none` | `MMGREP_TYPESET_PROVIDER` |
+| `x-mmgrep-mineru-api-key` | MinerU token（两个角色共用） | `MMGREP_MINERU_API_KEY` |
+| `x-mmgrep-mineru-base-url` | MinerU 基址（两个角色共用） | `MMGREP_MINERU_BASE_URL` |
+| `x-mmgrep-mineru-model` | MinerU 模型（两个角色共用） | `MMGREP_MINERU_MODEL` |
+| `x-mmgrep-max-text-inline-chars` | 本次请求的内联文本上限（设置头，不是凭据）：正整数，硬上限 `200000` | `MMGREP_MAX_TEXT_INLINE_CHARS` |
+
+优先级（逐字段）：该 provider 的专属请求头 > 该 provider 的环境变量 >
+服务器启动配置（仅当 provider 相同）> provider 内置默认值。ASR 仍保留通用
+`x-mmgrep-asr-api-key` 兜底；文档角色已删除通用 key 头。
+请求头切换 provider 后只读新 provider 的变量组，不会借用另一个 provider 的 key；
+头里写了未知的 provider id → HTTP 400（JSON-RPC `-32602`）。空头（空串 / 全空白）等于没带。
+
+要让某个 provider 的专属头生效，得先用 `x-mmgrep-asr-provider` /
+`x-mmgrep-ocr-provider` / `x-mmgrep-typeset-provider` 选中它（或服务器本身就选了同一个）。
+只带 provider 专属 key 头、provider 仍是 `none` 时，
+这个头不会自动启用 provider；**provider 的选择只对当前请求生效**。
+
+**安全**：这些头的值只活在本次请求里——不写日志、不进缓存、不出现在响应里。server 会把本次请求
+带过的所有凭据头值从日志里替换成 `[redacted]`。不要把真实 key 写进多人共享的客户端配置：
+更稳妥的做法是让宿主连一个你自己控制的代理，由代理注入凭据头。
 
 ---
 
@@ -374,7 +414,7 @@ multipart 请求体里**只有 `file` 一个字段**。
   毫秒时长。转写结果因此退化成一个 segment（`startMs: 0`）；想要逐句时间轴请换 provider，
   别假装有时间码。
 - HTTP 模式下，这三项都可以按请求覆盖：`x-mmgrep-deepseek-api-key` /
-  `x-mmgrep-deepseek-base-url` / `x-mmgrep-deepseek-model`（见 README「每请求凭据」与契约 §12.7）。
+  `x-mmgrep-deepseek-base-url` / `x-mmgrep-deepseek-model`（见 [§2.7](#27-每请求凭据与设置头仅-http) 与契约 §12.7）。
 
 到 <https://platform.deepseek.com/api_keys> 取 key。
 
@@ -438,7 +478,7 @@ provider 的解析结果**按页缓存**（键含源文件内容 sha256 + provid
 - key 只写在**你自己的**宿主配置或环境变量里，**不要提交进仓库**。
 - server 从不打印 key：日志和错误里只会出现 `set` / `unset`，返回值里的 `describe()` 也不含 key。
 - 错误信息里的 `sk-…` / `Bearer …` 会被脱敏成 `sk-***` / `Bearer ***`。
-- HTTP 模式下，provider key 也可以放在 `x-mmgrep-*` 请求头里（见 README「每请求凭据」）：
+- HTTP 模式下，provider key 也可以放在 `x-mmgrep-*` 请求头里（见 [§2.7](#27-每请求凭据与设置头仅-http)）：
   只对该请求生效，不缓存、不落盘、不出现在响应里；日志中出现的头值统一替换成 `[redacted]`。
   多人共享的端点不要让大家把真实 key 写进客户端配置——优先让宿主连一个你自己控制的代理，
   由代理注入凭据头。
